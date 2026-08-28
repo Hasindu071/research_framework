@@ -1,7 +1,9 @@
 import { simpleGit } from "simple-git";
 import { analyzeSymbol } from "./symbol-analyzer.js";
 import { analyzeDependencyChanges } from "./dependencyAnalyzer.js";
+import { analyzeTests } from "./test-analyzer.js";
 import type { DependencyChange } from "./dependencyAnalyzer.js";
+import type { TestAnalysisResult } from "./test-analyzer.js";
 
 // ======================================================
 // TYPES
@@ -62,6 +64,8 @@ interface CommitAnalysis {
 
   dependencyChanges: DependencyChange[];
 
+  testAnalysis: TestAnalysisResult;
+
   rawDiff: string;
 }
 
@@ -118,6 +122,11 @@ export async function analyzeCommit(
 
   const changes = parseDiff(rawDiff);
   const dependencyChanges = analyzeDependencyChanges(rawDiff);
+
+  const testAnalysis = analyzeTests(
+    changes,
+    repositoryPath
+  );
 
   console.log(
     `Files changed: ${changes.length}`
@@ -226,6 +235,7 @@ export async function analyzeCommit(
     symbolChanges,
     symbolAnalysis,
     dependencyChanges,
+    testAnalysis,
     rawDiff,
   };
 }
