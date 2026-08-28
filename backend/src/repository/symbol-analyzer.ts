@@ -1,13 +1,34 @@
-import { Project, SyntaxKind, Node } from "ts-morph";
+import {
+  Project,
+  SyntaxKind,
+  Node,
+} from "ts-morph";
+
 import path from "path";
+
+// ======================================================
+// TYPES
+// ======================================================
 
 export interface SymbolInfo {
   name: string;
-  type: "function" | "variable" | "method" | "class";
+
+  type:
+    | "function"
+    | "variable"
+    | "method"
+    | "class";
+
   file: string;
+
   line: number;
-  role: "definition" | "usage";
-  containingFunction?: string | undefined;
+
+  role:
+    | "definition"
+    | "usage";
+
+  containingFunction?:
+    string | undefined;
 }
 
 export interface SymbolAnalysis {
@@ -16,7 +37,7 @@ export interface SymbolAnalysis {
 }
 
 // ======================================================
-// Analyze a symbol
+// ANALYZE SYMBOL
 // ======================================================
 
 export function analyzeSymbol(
@@ -24,124 +45,238 @@ export function analyzeSymbol(
   symbolName: string
 ): SymbolAnalysis {
 
-  console.log(`Analyzing symbol: ${symbolName}`);
+  console.log(
+    `Analyzing symbol: ${symbolName}`
+  );
 
-  const project = new Project({
-    skipAddingFilesFromTsConfig: true,
-  });
+  // ==================================================
+  // Create TypeScript project
+  // ==================================================
 
-  // --------------------------------------------------
-  // Load repository source files
-  // --------------------------------------------------
+  const project =
+    new Project({
+      skipAddingFilesFromTsConfig: true,
+    });
+
+  // ==================================================
+  // Load source files
+  // ==================================================
 
   project.addSourceFilesAtPaths([
-    path.join(repositoryPath, "**/*.ts"),
-    path.join(repositoryPath, "**/*.tsx"),
-    path.join(repositoryPath, "**/*.js"),
-    path.join(repositoryPath, "**/*.jsx"),
 
-    // Exclude dependencies/build output
-    `!${path.join(repositoryPath, "node_modules/**")}`,
-    `!${path.join(repositoryPath, ".git/**")}`,
-    `!${path.join(repositoryPath, "dist/**")}`,
-    `!${path.join(repositoryPath, "build/**")}`,
-    `!${path.join(repositoryPath, ".next/**")}`,
-    `!${path.join(repositoryPath, "coverage/**")}`,
+    path.join(
+      repositoryPath,
+      "**/*.ts"
+    ),
+
+    path.join(
+      repositoryPath,
+      "**/*.tsx"
+    ),
+
+    path.join(
+      repositoryPath,
+      "**/*.js"
+    ),
+
+    path.join(
+      repositoryPath,
+      "**/*.jsx"
+    ),
+
+    // Exclude dependencies
+
+    `!${path.join(
+      repositoryPath,
+      "node_modules/**"
+    )}`,
+
+    // Exclude Git
+
+    `!${path.join(
+      repositoryPath,
+      ".git/**"
+    )}`,
+
+    // Exclude build output
+
+    `!${path.join(
+      repositoryPath,
+      "dist/**"
+    )}`,
+
+    `!${path.join(
+      repositoryPath,
+      "build/**"
+    )}`,
+
+    `!${path.join(
+      repositoryPath,
+      ".next/**"
+    )}`,
+
+    `!${path.join(
+      repositoryPath,
+      "coverage/**"
+    )}`,
   ]);
 
-  const definitions: SymbolInfo[] = [];
-  const usages: SymbolInfo[] = [];
+  // ==================================================
+  // Result arrays
+  // ==================================================
 
-  // --------------------------------------------------
-  // Analyze files
-  // --------------------------------------------------
+  const definitions:
+    SymbolInfo[] = [];
 
-  for (const sourceFile of project.getSourceFiles()) {
+  const usages:
+    SymbolInfo[] = [];
 
-    const filePath = sourceFile.getFilePath();
+  // ==================================================
+  // Prevent duplicate usages
+  // ==================================================
 
-    const relativeFile = path.relative(
-      repositoryPath,
-      filePath
-    );
+  const seenUsages =
+    new Set<string>();
+
+  // ==================================================
+  // Analyze every source file
+  // ==================================================
+
+  for (
+    const sourceFile
+    of project.getSourceFiles()
+  ) {
+
+    const filePath =
+      sourceFile.getFilePath();
+
+    const relativeFile =
+      path.relative(
+        repositoryPath,
+        filePath
+      );
 
     // ==================================================
-    // 1. Function declarations
+    // 1. Function definitions
     // ==================================================
 
-    for (const fn of sourceFile.getFunctions()) {
+    for (
+      const fn
+      of sourceFile.getFunctions()
+    ) {
 
-      if (fn.getName() !== symbolName) {
+      if (
+        fn.getName() !== symbolName
+      ) {
         continue;
       }
 
       definitions.push({
         name: symbolName,
+
         type: "function",
+
         file: relativeFile,
-        line: fn.getStartLineNumber(),
+
+        line:
+          fn.getStartLineNumber(),
+
         role: "definition",
       });
     }
 
     // ==================================================
-    // 2. Variable declarations
+    // 2. Variable definitions
     // ==================================================
 
-    for (const variable of sourceFile.getVariableDeclarations()) {
+    for (
+      const variable
+      of sourceFile.getVariableDeclarations()
+    ) {
 
-      if (variable.getName() !== symbolName) {
+      if (
+        variable.getName() !== symbolName
+      ) {
         continue;
       }
 
       definitions.push({
         name: symbolName,
+
         type: "variable",
+
         file: relativeFile,
-        line: variable.getStartLineNumber(),
+
+        line:
+          variable.getStartLineNumber(),
+
         role: "definition",
       });
     }
 
     // ==================================================
-    // 3. Class declarations
+    // 3. Class definitions
     // ==================================================
 
-    for (const cls of sourceFile.getClasses()) {
+    for (
+      const cls
+      of sourceFile.getClasses()
+    ) {
 
-      if (cls.getName() === symbolName) {
+      // ------------------------------------------------
+      // Class itself
+      // ------------------------------------------------
+
+      if (
+        cls.getName() === symbolName
+      ) {
 
         definitions.push({
           name: symbolName,
+
           type: "class",
+
           file: relativeFile,
-          line: cls.getStartLineNumber(),
+
+          line:
+            cls.getStartLineNumber(),
+
           role: "definition",
         });
       }
 
       // ------------------------------------------------
-      // Class methods
+      // Methods inside class
       // ------------------------------------------------
 
-      for (const method of cls.getMethods()) {
+      for (
+        const method
+        of cls.getMethods()
+      ) {
 
-        if (method.getName() !== symbolName) {
+        if (
+          method.getName() !== symbolName
+        ) {
           continue;
         }
 
         definitions.push({
           name: symbolName,
+
           type: "method",
+
           file: relativeFile,
-          line: method.getStartLineNumber(),
+
+          line:
+            method.getStartLineNumber(),
+
           role: "definition",
         });
       }
     }
 
     // ==================================================
-    // 4. Find usages
+    // 4. Find all identifier occurrences
     // ==================================================
 
     const identifiers =
@@ -149,15 +284,23 @@ export function analyzeSymbol(
         SyntaxKind.Identifier
       );
 
-    for (const identifier of identifiers) {
+    for (
+      const identifier
+      of identifiers
+    ) {
 
-      if (identifier.getText() !== symbolName) {
+      // Not our symbol
+
+      if (
+        identifier.getText() !==
+        symbolName
+      ) {
         continue;
       }
 
-      // ------------------------------------------------
-      // Skip variable declaration itself
-      // ------------------------------------------------
+      // ==================================================
+      // Ignore variable definition
+      // ==================================================
 
       const variableDeclaration =
         identifier.getFirstAncestorByKind(
@@ -166,14 +309,15 @@ export function analyzeSymbol(
 
       if (
         variableDeclaration &&
-        variableDeclaration.getNameNode() === identifier
+        variableDeclaration.getNameNode() ===
+          identifier
       ) {
         continue;
       }
 
-      // ------------------------------------------------
-      // Skip function declaration itself
-      // ------------------------------------------------
+      // ==================================================
+      // Ignore function definition
+      // ==================================================
 
       const functionDeclaration =
         identifier.getFirstAncestorByKind(
@@ -182,14 +326,15 @@ export function analyzeSymbol(
 
       if (
         functionDeclaration &&
-        functionDeclaration.getNameNode() === identifier
+        functionDeclaration.getNameNode() ===
+          identifier
       ) {
         continue;
       }
 
-      // ------------------------------------------------
-      // Skip class declaration itself
-      // ------------------------------------------------
+      // ==================================================
+      // Ignore class definition
+      // ==================================================
 
       const classDeclaration =
         identifier.getFirstAncestorByKind(
@@ -198,14 +343,15 @@ export function analyzeSymbol(
 
       if (
         classDeclaration &&
-        classDeclaration.getNameNode() === identifier
+        classDeclaration.getNameNode() ===
+          identifier
       ) {
         continue;
       }
 
-      // ------------------------------------------------
-      // Skip method declaration itself
-      // ------------------------------------------------
+      // ==================================================
+      // Ignore method definition
+      // ==================================================
 
       const methodDeclaration =
         identifier.getFirstAncestorByKind(
@@ -214,29 +360,77 @@ export function analyzeSymbol(
 
       if (
         methodDeclaration &&
-        methodDeclaration.getNameNode() === identifier
+        methodDeclaration.getNameNode() ===
+          identifier
       ) {
         continue;
       }
 
-      // ------------------------------------------------
+      // ==================================================
       // Find containing function
-      // ------------------------------------------------
+      // ==================================================
 
       const containingFunction =
-        findContainingFunction(identifier);
+        findContainingFunction(
+          identifier
+        );
+
+      // ==================================================
+      // Create unique usage ID
+      // ==================================================
+
+      const usageKey =
+        [
+          relativeFile,
+
+          identifier.getStartLineNumber(),
+
+          identifier.getStart(),
+
+          symbolName,
+        ].join(":");
+
+      // ==================================================
+      // Skip duplicate occurrence
+      // ==================================================
+
+      if (
+        seenUsages.has(usageKey)
+      ) {
+        continue;
+      }
+
+      seenUsages.add(
+        usageKey
+      );
+
+      // ==================================================
+      // Save usage
+      // ==================================================
 
       usages.push({
         name: symbolName,
-        type: containingFunction?.type ?? "function",
+
+        type:
+          containingFunction?.type ??
+          "function",
+
         file: relativeFile,
-        line: identifier.getStartLineNumber(),
+
+        line:
+          identifier.getStartLineNumber(),
+
         role: "usage",
+
         containingFunction:
           containingFunction?.name,
       });
     }
   }
+
+  // ==================================================
+  // Return result
+  // ==================================================
 
   return {
     definitions,
@@ -245,7 +439,7 @@ export function analyzeSymbol(
 }
 
 // ======================================================
-// Find containing function
+// FIND CONTAINING FUNCTION
 // ======================================================
 
 function findContainingFunction(
@@ -253,13 +447,16 @@ function findContainingFunction(
 ):
   | {
       name: string;
-      type: "function" | "method";
+
+      type:
+        | "function"
+        | "method";
     }
   | undefined {
 
-  // --------------------------------------------------
+  // ==================================================
   // Normal function
-  // --------------------------------------------------
+  // ==================================================
 
   const functionDeclaration =
     node.getFirstAncestorByKind(
@@ -277,9 +474,9 @@ function findContainingFunction(
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // Class method
-  // --------------------------------------------------
+  // ==================================================
 
   const methodDeclaration =
     node.getFirstAncestorByKind(
@@ -297,9 +494,9 @@ function findContainingFunction(
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // Arrow function
-  // --------------------------------------------------
+  // ==================================================
 
   const arrowFunction =
     node.getFirstAncestorByKind(
@@ -311,23 +508,31 @@ function findContainingFunction(
     const parent =
       arrowFunction.getParent();
 
-    if (Node.isVariableDeclaration(parent)) {
+    if (
+      Node.isVariableDeclaration(
+        parent
+      )
+    ) {
 
       return {
-        name: parent.getName(),
+        name:
+          parent.getName(),
+
         type: "function",
       };
     }
 
     return {
-      name: "<anonymous arrow function>",
+      name:
+        "<anonymous arrow function>",
+
       type: "function",
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // Function expression
-  // --------------------------------------------------
+  // ==================================================
 
   const functionExpression =
     node.getFirstAncestorByKind(
@@ -339,19 +544,32 @@ function findContainingFunction(
     const parent =
       functionExpression.getParent();
 
-    if (Node.isVariableDeclaration(parent)) {
+    if (
+      Node.isVariableDeclaration(
+        parent
+      )
+    ) {
 
       return {
-        name: parent.getName(),
+        name:
+          parent.getName(),
+
         type: "function",
       };
     }
 
     return {
-      name: "<anonymous function>",
+      name:
+        "<anonymous function>",
+
       type: "function",
     };
   }
 
+  // ==================================================
+  // No containing function
+  // ==================================================
+
   return undefined;
 }
+

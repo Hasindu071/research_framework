@@ -119,18 +119,18 @@ export async function analyzeCommit(
   );
 
   // ==================================================
-  // 4. Detect symbol renames
+  // 4. Detect REAL symbol renames
   // ==================================================
 
   const symbolChanges =
     detectSymbolRenames(changes);
 
   console.log(
-    `Unique symbol renames detected: ${symbolChanges.length}`
+    `Symbol renames detected: ${symbolChanges.length}`
   );
 
   // ==================================================
-  // 5. Analyze symbols
+  // 5. Analyze renamed symbols
   // ==================================================
 
   const symbolAnalysis: {
@@ -139,8 +139,7 @@ export async function analyzeCommit(
   }[] = [];
 
   // --------------------------------------------------
-  // IMPORTANT:
-  // Keep track of symbols already analyzed.
+  // Prevent analyzing the same new symbol repeatedly
   // --------------------------------------------------
 
   const analyzedSymbols =
@@ -150,10 +149,6 @@ export async function analyzeCommit(
 
     const symbolName =
       symbolChange.newName;
-
-    // ------------------------------------------------
-    // Don't analyze same symbol multiple times
-    // ------------------------------------------------
 
     if (analyzedSymbols.has(symbolName)) {
 
@@ -209,7 +204,6 @@ export async function analyzeCommit(
   console.log("======================================");
 
   return {
-
     commit: {
       hash: latestCommit.hash || "",
       message: latestCommit.message || "",
@@ -247,9 +241,7 @@ function parseDiff(
     return changes;
   }
 
-  // --------------------------------------------------
-  // Git separates files using diff --git
-  // --------------------------------------------------
+  // Git separates each file with "diff --git"
 
   const fileDiffs =
     diff
@@ -261,15 +253,14 @@ function parseDiff(
     const lines =
       fileDiff.split("\n");
 
-    // ==================================================
-    // Get file path
-    // ==================================================
-
     const firstLine = lines[0];
 
     if (!firstLine) {
       continue;
     }
+
+    // Example:
+    // a/apps/file.tsx b/apps/file.tsx
 
     const fileMatch =
       firstLine.match(
@@ -346,9 +337,7 @@ function parseDiff(
 
     for (const line of lines) {
 
-      // ------------------------------------------------
-      // Ignore metadata
-      // ------------------------------------------------
+      // Ignore Git metadata
 
       if (
         line.startsWith("+++ ") ||
@@ -361,13 +350,10 @@ function parseDiff(
         line.startsWith("rename from") ||
         line.startsWith("rename to")
       ) {
-
         continue;
       }
 
-      // ------------------------------------------------
       // Added line
-      // ------------------------------------------------
 
       if (line.startsWith("+")) {
 
@@ -379,9 +365,7 @@ function parseDiff(
         });
       }
 
-      // ------------------------------------------------
       // Deleted line
-      // ------------------------------------------------
 
       else if (line.startsWith("-")) {
 
@@ -408,7 +392,28 @@ function parseDiff(
 }
 
 // ======================================================
-// DETECT SYMBOL RENAMES
+// DETECT REAL SYMBOL RENAMES
+// ======================================================
+//
+// We DO NOT do:
+//
+// old symbols × new symbols
+//
+// Instead:
+//
+// deleted line
+//      ↓
+// find a very similar added line
+//      ↓
+// check whether only the symbol name changed
+//
+// Example:
+//
+// - getEventLocationType(location.type)
+// + getLocationByType(location.type)
+//
+// This is a rename.
+//
 // ======================================================
 
 function detectSymbolRenames(
@@ -417,102 +422,91 @@ function detectSymbolRenames(
 
   const symbolChanges: SymbolChange[] = [];
 
-  // --------------------------------------------------
-  // Prevent duplicates
-  // --------------------------------------------------
+  // Prevent duplicate records
 
   const detected =
     new Set<string>();
 
   for (const change of changes) {
 
-    // Don't try to detect symbols
-    // inside binary files.
+    // Don't analyze binary files
 
     if (change.binary) {
       continue;
     }
 
     const deletedLines =
-      change.changedLines
-        .filter(
-          (line) =>
-            line.type === "deleted"
-        )
-        .map(
-          (line) =>
-            line.content
-        );
+      change.changedLines.filter(
+        (line) =>
+          line.type === "deleted"
+      );
 
     const addedLines =
-      change.changedLines
-        .filter(
-          (line) =>
-            line.type === "added"
-        )
-        .map(
-          (line) =>
-            line.content
-        );
+      change.changedLines.filter(
+        (line) =>
+          line.type === "added"
+      );
 
     // ==================================================
-    // Find old declarations
+    // Compare deleted lines with added lines
     // ==================================================
 
-    const oldSymbols =
-      new Set<string>();
+    for (const deleted of deletedLines) {
 
-    for (const deletedLine of deletedLines) {
-
-      const oldMatch =
-        extractSymbolName(
-          deletedLine
+      const oldSymbol =
+        extractChangedSymbol(
+          deleted.content
         );
 
-      if (oldMatch) {
-        oldSymbols.add(oldMatch);
+      if (!oldSymbol) {
+        continue;
       }
-    }
 
-    // ==================================================
-    // Find new declarations
-    // ==================================================
+      for (const added of addedLines) {
 
-    const newSymbols =
-      new Set<string>();
+        const newSymbol =
+          extractChangedSymbol(
+            added.content
+          );
 
-    for (const addedLine of addedLines) {
-
-      const newMatch =
-        extractSymbolName(
-          addedLine
-        );
-
-      if (newMatch) {
-        newSymbols.add(newMatch);
-      }
-    }
-
-    // ==================================================
-    // Compare old/new symbols
-    // ==================================================
-
-    for (const oldName of oldSymbols) {
-
-      for (const newName of newSymbols) {
-
-        // Same name = not a rename
-
-        if (oldName === newName) {
+        if (!newSymbol) {
           continue;
         }
 
-        // Create unique identifier
+        if (oldSymbol === newSymbol) {
+          continue;
+        }
+
+        // ==================================================
+        // Normalize both lines
+        // ==================================================
+
+        const normalizedOld =
+          normalizeSymbolLine(
+            deleted.content,
+            oldSymbol
+          );
+
+        const normalizedNew =
+          normalizeSymbolLine(
+            added.content,
+            newSymbol
+          );
+
+        // If the lines become identical after replacing
+        // the symbol names with __SYMBOL__, then the only
+        // meaningful change is the symbol name.
+        //
+        // Therefore this is a strong rename candidate.
+
+        if (
+          normalizedOld !== normalizedNew
+        ) {
+          continue;
+        }
 
         const key =
-          `${change.file}:${oldName}->${newName}`;
-
-        // Skip duplicates
+          `${change.file}:${oldSymbol}->${newSymbol}`;
 
         if (detected.has(key)) {
           continue;
@@ -521,8 +515,8 @@ function detectSymbolRenames(
         detected.add(key);
 
         symbolChanges.push({
-          oldName,
-          newName,
+          oldName: oldSymbol,
+          newName: newSymbol,
           file: change.file,
           type: "rename",
         });
@@ -534,33 +528,34 @@ function detectSymbolRenames(
 }
 
 // ======================================================
-// Extract symbol name from a changed line
+// EXTRACT SYMBOL FROM CHANGED LINE
 // ======================================================
 
-function extractSymbolName(
+function extractChangedSymbol(
   line: string
 ): string | undefined {
 
-  // --------------------------------------------------
-  // function foo()
+  // ==================================================
+  // Function / variable declaration
+  //
   // const foo =
   // let foo =
   // var foo =
-  // --------------------------------------------------
+  // function foo()
+  // ==================================================
 
   const declarationMatch =
     line.match(
-      /(?:export\s+)?(?:async\s+)?(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/
+      /(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/
     );
 
   if (declarationMatch) {
-
     return declarationMatch[1];
   }
 
-  // --------------------------------------------------
-  // class Foo
-  // --------------------------------------------------
+  // ==================================================
+  // Class
+  // ==================================================
 
   const classMatch =
     line.match(
@@ -568,9 +563,71 @@ function extractSymbolName(
     );
 
   if (classMatch) {
-
     return classMatch[1];
+  }
+
+  // ==================================================
+  // Import
+  //
+  // import { foo } from ...
+  // ==================================================
+
+  const namedImportMatch =
+    line.match(
+      /import\s*\{\s*([A-Za-z_$][\w$]*)/
+    );
+
+  if (namedImportMatch) {
+    return namedImportMatch[1];
+  }
+
+  // ==================================================
+  // Function call
+  //
+  // foo(...)
+  // ==================================================
+
+  const callMatch =
+    line.match(
+      /\b([A-Za-z_$][\w$]*)\s*\(/
+    );
+
+  if (callMatch) {
+    return callMatch[1];
   }
 
   return undefined;
 }
+
+// ======================================================
+// NORMALIZE SYMBOL LINE
+// ======================================================
+
+function normalizeSymbolLine(
+  line: string,
+  symbol: string
+): string {
+
+  // Escape special regex characters
+
+  const escapedSymbol =
+    symbol.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
+
+  return line
+    .replace(
+      new RegExp(
+        `\\b${escapedSymbol}\\b`,
+        "g"
+      ),
+      "__SYMBOL__"
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
