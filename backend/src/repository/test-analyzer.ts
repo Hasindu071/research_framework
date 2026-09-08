@@ -33,10 +33,15 @@ export type TestRelationship =
  * changed, it exercises the specific piece of behavior the commit
  * modified.
  */
-export interface UsedSymbol {
-  name: string;
-  changed: boolean;
-}
+/**
+ * Whether a symbol-usage match exercises behavior the commit actually
+ * changed ("direct") or merely calls some other, unmodified export
+ * from the same file ("indirect") — e.g. shared setup/helper methods
+ * on the same repository class. This is the distinction that matters
+ * for "what does this commit impact", as opposed to "what shares a
+ * file with something that changed".
+ */
+export type SymbolImpact = "direct" | "indirect";
 
 export interface TestMatch {
   testFile: string;
@@ -49,7 +54,21 @@ export interface TestMatch {
    * changed file that the test actually calls (AST-verified), not
    * just the first one found.
    */
-  symbols?: UsedSymbol[];
+  symbols?: string[];
+  /**
+   * Subset of `symbols` that the commit's diff actually touched.
+   * Empty (not omitted) when the test uses the changed file but none
+   * of the specific symbols it calls were modified — that emptiness
+   * is itself meaningful, so callers shouldn't have to distinguish
+   * "empty array" from "field absent".
+   */
+  changedSymbolsUsed?: string[];
+  /**
+   * "direct": at least one invoked symbol was changed by this commit.
+   * "indirect": the test invokes symbols from the changed file, but
+   * none of those specific symbols were themselves modified.
+   */
+  impact?: SymbolImpact;
 }
 
 export interface TestAnalysisResult {
@@ -686,49 +705,67 @@ function findFilesImportingPackage(
 }
 
 /**
- * Build the human-readable reason + confidence for a symbol-usage
- * match, given every symbol the test calls and which of those the
- * commit actually changed.
+ * Build the human-readable reason, confidence, and impact
+ * classification for a symbol-usage match, given every symbol the
+ * test calls and which of those the commit actually changed.
  *
- * Changed symbols are surfaced first and drive the confidence bump —
- * "the test calls the function this commit modified" is materially
- * stronger evidence than "the test calls some other function that
- * happens to live in the same file" — but we still report every
- * symbol used so nothing is silently dropped.
+ * This is the direct/indirect split: a test that calls a symbol the
+ * commit modified is evidence the test exercises the changed
+ * behavior ("direct impact"). A test that merely calls other,
+ * unmodified exports from the same file — e.g. shared setup methods
+ * on the same repository class — has a real relationship to the file
+ * but not to the change itself ("indirect"), and its confidence
+ * should reflect that rather than being conflated with the direct
+ * case. Previously both cases were reported as flat "symbol-usage"
+ * at ~0.98 confidence, which overstated how relevant a
+ * same-class-different-method test actually was to the commit.
  */
 function describeSymbolUsage(
   usedSymbols: string[],
   changedSymbolNames: Set<string>
-): { reason: string; confidence: number; symbols: UsedSymbol[] } {
-  const symbols: UsedSymbol[] = usedSymbols.map((name) => ({
-    name,
-    changed: changedSymbolNames.has(name),
-  }));
+): {
+  reason: string;
+  confidence: number;
+  symbols: string[];
+  changedSymbolsUsed: string[];
+  impact: SymbolImpact;
+} {
+  const changedSymbolsUsed = usedSymbols.filter((name) =>
+    changedSymbolNames.has(name)
+  );
 
-  const changedNames = symbols.filter((s) => s.changed).map((s) => s.name);
-  const unchangedNames = symbols.filter((s) => !s.changed).map((s) => s.name);
+  if (changedSymbolsUsed.length > 0) {
+    const changedList = changedSymbolsUsed.map((n) => `${n}()`).join(", ");
+    const unchangedUsed = usedSymbols.filter(
+      (name) => !changedSymbolNames.has(name)
+    );
 
-  if (changedNames.length > 0) {
-    const changedList = changedNames.map((n) => `${n}()`).join(", ");
     let reason = `Test directly invokes ${changedList}, ${
-      changedNames.length === 1 ? "which was" : "which were"
+      changedSymbolsUsed.length === 1 ? "which was" : "which were"
     } introduced or modified by this commit`;
 
-    if (unchangedNames.length > 0) {
-      reason += ` (also exercises pre-existing ${unchangedNames
+    if (unchangedUsed.length > 0) {
+      reason += ` (also exercises pre-existing ${unchangedUsed
         .map((n) => `${n}()`)
         .join(", ")})`;
     }
 
-    return { reason, confidence: 0.99, symbols };
+    return {
+      reason,
+      confidence: 0.99,
+      symbols: usedSymbols,
+      changedSymbolsUsed,
+      impact: "direct",
+    };
   }
 
-  const usedList = usedSymbols.map((n) => `${n}()`).join(", ");
-
   return {
-    reason: `Test directly invokes ${usedList}, defined in the changed source file`,
-    confidence: 0.98,
-    symbols,
+    reason:
+      "Test invokes symbols defined in the changed source file, but none of the invoked symbols were modified by this commit",
+    confidence: 0.65,
+    symbols: usedSymbols,
+    changedSymbolsUsed: [],
+    impact: "indirect",
   };
 }
 
@@ -842,10 +879,8 @@ function findTestsForSourceFile(
     const usedSymbols = findUsedSymbols(testFileAbsolute, exportedSymbols);
 
     if (usedSymbols.length > 0) {
-      const { reason, confidence, symbols } = describeSymbolUsage(
-        usedSymbols,
-        changedSymbolNames
-      );
+      const { reason, confidence, symbols, changedSymbolsUsed, impact } =
+        describeSymbolUsage(usedSymbols, changedSymbolNames);
 
       match = {
         ...match,
@@ -853,6 +888,8 @@ function findTestsForSourceFile(
         reason,
         confidence,
         symbols,
+        changedSymbolsUsed,
+        impact,
       };
     }
 
