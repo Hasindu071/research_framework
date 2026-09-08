@@ -39,7 +39,7 @@ interface FileChange {
   changedLines: ChangedLine[];
 }
 
-interface CommitAnalysis {
+export interface CommitAnalysis {
   commit: {
     hash: string;
     message: string;

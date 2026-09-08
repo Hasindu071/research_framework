@@ -1,0 +1,74 @@
+{
+  "info": {
+    "_postman_id": "research-framework-api",
+    "name": "Research Framework API",
+    "description": "Test prioritization API using commit analysis and LLM",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "health"
+          ]
+        },
+        "description": "Check if the API is running"
+      },
+      "response": []
+    },
+    {
+      "name": "Analyze Commit",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"repositoryPath\": \"D:/MY 4th yr Research/Final 36/my_research_framework/research_framework\",\n  \"commitHash\": \"HEAD\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/analyze-commit",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "analyze-commit"
+          ]
+        },
+        "description": "Analyze a commit and get prioritized tests from LLM"
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:5000",
+      "type": "string"
+    },
+    {
+      "key": "repo_path",
+      "value": "D:/MY 4th yr Research/Final 36/my_research_framework/research_framework",
+      "type": "string"
+    },
+    {
+      "key": "commit_hash",
+      "value": "HEAD",
+      "type": "string"
+    }
+  ]
+}
