@@ -2,9 +2,11 @@ import {
   Project,
   SyntaxKind,
   Node,
+  SourceFile,
 } from "ts-morph";
 
 import path from "path";
+import { glob } from "glob";
 
 // ======================================================
 // TYPES
@@ -50,78 +52,6 @@ export function analyzeSymbol(
   );
 
   // ==================================================
-  // Create TypeScript project
-  // ==================================================
-
-  const project =
-    new Project({
-      skipAddingFilesFromTsConfig: true,
-    });
-
-  // ==================================================
-  // Load source files
-  // ==================================================
-
-  project.addSourceFilesAtPaths([
-
-    path.join(
-      repositoryPath,
-      "**/*.ts"
-    ),
-
-    path.join(
-      repositoryPath,
-      "**/*.tsx"
-    ),
-
-    path.join(
-      repositoryPath,
-      "**/*.js"
-    ),
-
-    path.join(
-      repositoryPath,
-      "**/*.jsx"
-    ),
-
-    // Exclude dependencies
-
-    `!${path.join(
-      repositoryPath,
-      "node_modules/**"
-    )}`,
-
-    // Exclude Git
-
-    `!${path.join(
-      repositoryPath,
-      ".git/**"
-    )}`,
-
-    // Exclude build output
-
-    `!${path.join(
-      repositoryPath,
-      "dist/**"
-    )}`,
-
-    `!${path.join(
-      repositoryPath,
-      "build/**"
-    )}`,
-
-    `!${path.join(
-      repositoryPath,
-      ".next/**"
-    )}`,
-
-    `!${path.join(
-      repositoryPath,
-      "coverage/**"
-    )}`,
-  ]);
-
-  // ==================================================
   // Result arrays
   // ==================================================
 
@@ -139,123 +69,65 @@ export function analyzeSymbol(
     new Set<string>();
 
   // ==================================================
-  // Analyze every source file
+  // Find source files to analyze
   // ==================================================
 
-  for (
-    const sourceFile
-    of project.getSourceFiles()
-  ) {
+  const patterns = [
+    path.join(repositoryPath, "**/*.ts"),
+    path.join(repositoryPath, "**/*.tsx"),
+    path.join(repositoryPath, "**/*.js"),
+    path.join(repositoryPath, "**/*.jsx"),
+  ];
 
-    const filePath =
-      sourceFile.getFilePath();
+  const ignorePatterns = [
+    path.join(repositoryPath, "node_modules/**"),
+    path.join(repositoryPath, ".git/**"),
+    path.join(repositoryPath, "dist/**"),
+    path.join(repositoryPath, "build/**"),
+    path.join(repositoryPath, ".next/**"),
+    path.join(repositoryPath, "coverage/**"),
+  ];
 
-    const relativeFile =
-      path.relative(
-        repositoryPath,
-        filePath
-      );
+  const files = glob.sync(patterns, {
+    ignore: ignorePatterns,
+  });
 
-    // ==================================================
-    // 1. Function definitions
-    // ==================================================
+  console.log(
+    `Found ${files.length} source files to analyze`
+  );
 
-    for (
-      const fn
-      of sourceFile.getFunctions()
-    ) {
+  // ==================================================
+  // Process files incrementally to avoid memory issues
+  // ==================================================
 
-      if (
-        fn.getName() !== symbolName
-      ) {
-        continue;
-      }
+  for (const filePath of files) {
 
-      definitions.push({
-        name: symbolName,
+    // Create a fresh project for each file
+    const project = new Project({
+      skipAddingFilesFromTsConfig: true,
+    });
 
-        type: "function",
+    try {
 
-        file: relativeFile,
+      const sourceFile = project.addSourceFileAtPath(filePath);
 
-        line:
-          fn.getStartLineNumber(),
+      const relativeFile =
+        path.relative(
+          repositoryPath,
+          filePath
+        );
 
-        role: "definition",
-      });
-    }
-
-    // ==================================================
-    // 2. Variable definitions
-    // ==================================================
-
-    for (
-      const variable
-      of sourceFile.getVariableDeclarations()
-    ) {
-
-      if (
-        variable.getName() !== symbolName
-      ) {
-        continue;
-      }
-
-      definitions.push({
-        name: symbolName,
-
-        type: "variable",
-
-        file: relativeFile,
-
-        line:
-          variable.getStartLineNumber(),
-
-        role: "definition",
-      });
-    }
-
-    // ==================================================
-    // 3. Class definitions
-    // ==================================================
-
-    for (
-      const cls
-      of sourceFile.getClasses()
-    ) {
-
-      // ------------------------------------------------
-      // Class itself
-      // ------------------------------------------------
-
-      if (
-        cls.getName() === symbolName
-      ) {
-
-        definitions.push({
-          name: symbolName,
-
-          type: "class",
-
-          file: relativeFile,
-
-          line:
-            cls.getStartLineNumber(),
-
-          role: "definition",
-        });
-      }
-
-      // ------------------------------------------------
-      // Methods inside class
-      // ------------------------------------------------
+      // ==================================================
+      // 1. Function definitions
+      // ==================================================
 
       for (
-        const method
-        of cls.getMethods()
+        const fn
+        of sourceFile.getFunctions()
       ) {
 
         if (
-          method.getName() !== symbolName
+          fn.getName() !== symbolName
         ) {
           continue;
         }
@@ -263,169 +135,263 @@ export function analyzeSymbol(
         definitions.push({
           name: symbolName,
 
-          type: "method",
+          type: "function",
 
           file: relativeFile,
 
           line:
-            method.getStartLineNumber(),
+            fn.getStartLineNumber(),
 
           role: "definition",
         });
       }
+
+      // ==================================================
+      // 2. Variable definitions
+      // ==================================================
+
+      for (
+        const variable
+        of sourceFile.getVariableDeclarations()
+      ) {
+
+        if (
+          variable.getName() !== symbolName
+        ) {
+          continue;
+        }
+
+        definitions.push({
+          name: symbolName,
+
+          type: "variable",
+
+          file: relativeFile,
+
+          line:
+            variable.getStartLineNumber(),
+
+          role: "definition",
+        });
+      }
+
+      // ==================================================
+      // 3. Class definitions
+      // ==================================================
+
+      for (
+        const cls
+        of sourceFile.getClasses()
+      ) {
+
+        // ------------------------------------------------
+        // Class itself
+        // ------------------------------------------------
+
+        if (
+          cls.getName() === symbolName
+        ) {
+
+          definitions.push({
+            name: symbolName,
+
+            type: "class",
+
+            file: relativeFile,
+
+            line:
+              cls.getStartLineNumber(),
+
+            role: "definition",
+          });
+        }
+
+        // ------------------------------------------------
+        // Methods inside class
+        // ------------------------------------------------
+
+        for (
+          const method
+          of cls.getMethods()
+        ) {
+
+          if (
+            method.getName() !== symbolName
+          ) {
+            continue;
+          }
+
+          definitions.push({
+            name: symbolName,
+
+            type: "method",
+
+            file: relativeFile,
+
+            line:
+              method.getStartLineNumber(),
+
+            role: "definition",
+          });
+        }
+      }
+
+      // ==================================================
+      // 4. Find all identifier occurrences
+      // ==================================================
+
+      const identifiers =
+        sourceFile.getDescendantsOfKind(
+          SyntaxKind.Identifier
+        );
+
+      for (
+        const identifier
+        of identifiers
+      ) {
+
+        // Not our symbol
+
+        if (
+          identifier.getText() !==
+          symbolName
+        ) {
+          continue;
+        }
+
+        // ==================================================
+        // Ignore variable definition
+        // ==================================================
+
+        const variableDeclaration =
+          identifier.getFirstAncestorByKind(
+            SyntaxKind.VariableDeclaration
+          );
+
+        if (
+          variableDeclaration &&
+          variableDeclaration.getNameNode() ===
+            identifier
+        ) {
+          continue;
+        }
+
+        // ==================================================
+        // Ignore function definition
+        // ==================================================
+
+        const functionDeclaration =
+          identifier.getFirstAncestorByKind(
+            SyntaxKind.FunctionDeclaration
+          );
+
+        if (
+          functionDeclaration &&
+          functionDeclaration.getNameNode() ===
+            identifier
+        ) {
+          continue;
+        }
+
+        // ==================================================
+        // Ignore class definition
+        // ==================================================
+
+        const classDeclaration =
+          identifier.getFirstAncestorByKind(
+            SyntaxKind.ClassDeclaration
+          );
+
+        if (
+          classDeclaration &&
+          classDeclaration.getNameNode() ===
+            identifier
+        ) {
+          continue;
+        }
+
+        // ==================================================
+        // Ignore method definition
+        // ==================================================
+
+        const methodDeclaration =
+          identifier.getFirstAncestorByKind(
+            SyntaxKind.MethodDeclaration
+          );
+
+        if (
+          methodDeclaration &&
+          methodDeclaration.getNameNode() ===
+            identifier
+        ) {
+          continue;
+        }
+
+        // ==================================================
+        // Find containing function
+        // ==================================================
+
+        const containingFunction =
+          findContainingFunction(
+            identifier
+          );
+
+        // ==================================================
+        // Create unique usage ID
+        // ==================================================
+
+        const usageKey =
+          [
+            relativeFile,
+
+            identifier.getStartLineNumber(),
+
+            identifier.getStart(),
+
+            symbolName,
+          ].join(":");
+
+        // ==================================================
+        // Skip duplicate occurrence
+        // ==================================================
+
+        if (
+          seenUsages.has(usageKey)
+        ) {
+          continue;
+        }
+
+        seenUsages.add(
+          usageKey
+        );
+
+        // ==================================================
+        // Save usage
+        // ==================================================
+
+        usages.push({
+          name: symbolName,
+
+          type:
+            containingFunction?.type ??
+            "function",
+
+          file: relativeFile,
+
+          line:
+            identifier.getStartLineNumber(),
+
+          role: "usage",
+
+          containingFunction:
+            containingFunction?.name,
+        });
+      }
+
+    } catch (error) {
+      console.warn(`Failed to analyze file ${filePath}:`, error);
     }
-
-    // ==================================================
-    // 4. Find all identifier occurrences
-    // ==================================================
-
-    const identifiers =
-      sourceFile.getDescendantsOfKind(
-        SyntaxKind.Identifier
-      );
-
-    for (
-      const identifier
-      of identifiers
-    ) {
-
-      // Not our symbol
-
-      if (
-        identifier.getText() !==
-        symbolName
-      ) {
-        continue;
-      }
-
-      // ==================================================
-      // Ignore variable definition
-      // ==================================================
-
-      const variableDeclaration =
-        identifier.getFirstAncestorByKind(
-          SyntaxKind.VariableDeclaration
-        );
-
-      if (
-        variableDeclaration &&
-        variableDeclaration.getNameNode() ===
-          identifier
-      ) {
-        continue;
-      }
-
-      // ==================================================
-      // Ignore function definition
-      // ==================================================
-
-      const functionDeclaration =
-        identifier.getFirstAncestorByKind(
-          SyntaxKind.FunctionDeclaration
-        );
-
-      if (
-        functionDeclaration &&
-        functionDeclaration.getNameNode() ===
-          identifier
-      ) {
-        continue;
-      }
-
-      // ==================================================
-      // Ignore class definition
-      // ==================================================
-
-      const classDeclaration =
-        identifier.getFirstAncestorByKind(
-          SyntaxKind.ClassDeclaration
-        );
-
-      if (
-        classDeclaration &&
-        classDeclaration.getNameNode() ===
-          identifier
-      ) {
-        continue;
-      }
-
-      // ==================================================
-      // Ignore method definition
-      // ==================================================
-
-      const methodDeclaration =
-        identifier.getFirstAncestorByKind(
-          SyntaxKind.MethodDeclaration
-        );
-
-      if (
-        methodDeclaration &&
-        methodDeclaration.getNameNode() ===
-          identifier
-      ) {
-        continue;
-      }
-
-      // ==================================================
-      // Find containing function
-      // ==================================================
-
-      const containingFunction =
-        findContainingFunction(
-          identifier
-        );
-
-      // ==================================================
-      // Create unique usage ID
-      // ==================================================
-
-      const usageKey =
-        [
-          relativeFile,
-
-          identifier.getStartLineNumber(),
-
-          identifier.getStart(),
-
-          symbolName,
-        ].join(":");
-
-      // ==================================================
-      // Skip duplicate occurrence
-      // ==================================================
-
-      if (
-        seenUsages.has(usageKey)
-      ) {
-        continue;
-      }
-
-      seenUsages.add(
-        usageKey
-      );
-
-      // ==================================================
-      // Save usage
-      // ==================================================
-
-      usages.push({
-        name: symbolName,
-
-        type:
-          containingFunction?.type ??
-          "function",
-
-        file: relativeFile,
-
-        line:
-          identifier.getStartLineNumber(),
-
-        role: "usage",
-
-        containingFunction:
-          containingFunction?.name,
-      });
-    }
+    // Project goes out of scope and gets garbage collected
   }
 
   // ==================================================
