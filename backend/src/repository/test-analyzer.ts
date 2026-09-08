@@ -1,11 +1,55 @@
 import fs from "fs";
 import path from "path";
+import { Project, SyntaxKind, Node, type SourceFile } from "ts-morph";
+
+/**
+ * How a test was linked to a changed file, ordered here roughly by
+ * strength of evidence (weakest to strongest):
+ *   - "same-directory": co-located + related filename, positional only
+ *   - "same-name": exact base filename match
+ *   - "import": test resolvably imports the changed file
+ *   - "symbol-usage": test calls a symbol actually defined in the
+ *     changed file (AST-verified, not text search) — this is
+ *     causal/behavioral evidence, not just naming/location
+ *   - "locale-import": test imports a changed locale/translation file
+ *   - "dependency": test covers a source file that imports a changed
+ *     npm dependency
+ */
+export type TestRelationship =
+  | "same-directory"
+  | "same-name"
+  | "import"
+  | "symbol-usage"
+  | "locale-import"
+  | "dependency";
+
+/**
+ * A symbol (function/method/exported binding) that a test was found
+ * to invoke, along with whether the commit's diff actually touched
+ * that symbol's declaration line.
+ *
+ * `changed: true` is the strongest signal in this whole analyzer —
+ * it means the test doesn't just happen to reference the file that
+ * changed, it exercises the specific piece of behavior the commit
+ * modified.
+ */
+export interface UsedSymbol {
+  name: string;
+  changed: boolean;
+}
 
 export interface TestMatch {
   testFile: string;
   changedFile: string;
   reason: string;
   confidence: number;
+  relationship: TestRelationship;
+  /**
+   * Populated only for "symbol-usage" matches. Every symbol from the
+   * changed file that the test actually calls (AST-verified), not
+   * just the first one found.
+   */
+  symbols?: UsedSymbol[];
 }
 
 export interface TestAnalysisResult {
@@ -152,6 +196,13 @@ function normalizePath(filePath: string): string {
 }
 
 /**
+ * Escape a string for safe interpolation into a RegExp source.
+ */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
  * Get a file name without its extension and without any
  * test-related suffix.
  *
@@ -220,7 +271,7 @@ function sourceImportsPackage(
   content: string,
   packageName: string
 ): boolean {
-  const escapedPackage = packageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedPackage = escapeRegExp(packageName);
 
   const importRegex = new RegExp(
     `(?:from\\s+|import\\s*\\(|import\\s+|require\\s*\\()\\s*["']${escapedPackage}["']`,
@@ -360,6 +411,248 @@ function testImportsFile(
 }
 
 /**
+ * Shared ts-morph project used for AST-based (symbol-level) matching.
+ * Created lazily and reused for the lifetime of the process: parsing
+ * is the expensive part, and the same source/test files tend to get
+ * looked at repeatedly across rules, so we cache parsed SourceFile
+ * nodes on the project instead of re-parsing per call.
+ *
+ * NOTE: this caches by file path. If you run analyzeTests() as a
+ * long-lived server process against a repo whose files change on
+ * disk between calls, call resetSymbolAnalysisCache() first —
+ * otherwise you'll get stale ASTs. For a one-shot CLI/CI analysis
+ * this is not a concern.
+ */
+let sharedProject: Project | null = null;
+
+function getProject(): Project {
+  if (!sharedProject) {
+    sharedProject = new Project({
+      useInMemoryFileSystem: false,
+      skipAddingFilesFromTsConfig: true,
+      compilerOptions: {
+        allowJs: true,
+        // 4 === ts.JsxEmit.ReactJSX — hardcoded to avoid an extra
+        // dependency on the `typescript` package just for one enum.
+        jsx: 4,
+      },
+    });
+  }
+
+  return sharedProject;
+}
+
+export function resetSymbolAnalysisCache(): void {
+  sharedProject = null;
+}
+
+/**
+ * Get (or lazily parse) the ts-morph SourceFile node for a path.
+ * Returns undefined for anything ts-morph can't parse (e.g. a
+ * genuinely malformed file) rather than throwing — symbol-usage
+ * matching is a bonus signal, not something the rest of the pipeline
+ * should fail without.
+ */
+function getSourceFileNode(filePath: string): SourceFile | undefined {
+  const project = getProject();
+
+  const existing = project.getSourceFile(filePath);
+
+  if (existing) {
+    return existing;
+  }
+
+  try {
+    return project.addSourceFileAtPath(filePath);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extract the names of symbols a source file exports that a test
+ * could plausibly call directly: exported function declarations,
+ * exported const/let bindings (arrow functions etc.), and methods on
+ * exported classes.
+ *
+ * This is an AST walk, not a regex over the text — we only want real
+ * declarations, not every substring in the file that looks like an
+ * identifier. That distinction is exactly what fixed the earlier
+ * false positives (a locale string or an unrelated identifier
+ * shouldn't count as a "symbol").
+ *
+ * Known limitation: this doesn't currently resolve re-exports
+ * (`export { listUsers } from "./other-file"`) back to their
+ * original declaration — it only sees symbols declared directly in
+ * this file.
+ */
+function extractExportedSymbolNames(sourceFileAbsolute: string): string[] {
+  const sourceFile = getSourceFileNode(sourceFileAbsolute);
+
+  if (!sourceFile) {
+    return [];
+  }
+
+  const names = new Set<string>();
+
+  try {
+    for (const fn of sourceFile.getFunctions()) {
+      const name = fn.getName();
+
+      if (fn.isExported() && name) {
+        names.add(name);
+      }
+    }
+
+    for (const variableStatement of sourceFile.getVariableStatements()) {
+      if (!variableStatement.isExported()) {
+        continue;
+      }
+
+      for (const declaration of variableStatement.getDeclarations()) {
+        names.add(declaration.getName());
+      }
+    }
+
+    for (const cls of sourceFile.getClasses()) {
+      if (!cls.isExported()) {
+        continue;
+      }
+
+      const className = cls.getName();
+
+      if (className) {
+        names.add(className);
+      }
+
+      for (const method of cls.getMethods()) {
+        names.add(method.getName());
+      }
+    }
+  } catch {
+    // Best-effort AST walk — fall back to whatever we collected
+    // before hitting whatever caused the failure.
+  }
+
+  return Array.from(names);
+}
+
+/**
+ * Check whether a test file contains real call expressions invoking
+ * any of `symbolNames` — e.g. `repository.listUsers(...)` or
+ * `listUsers(...)`. Walking call expressions (rather than searching
+ * the raw text for the symbol name) means a symbol name that merely
+ * appears in a comment, a string literal, or as an unrelated
+ * identifier does not count as usage.
+ *
+ * Returns every distinct symbol name that is actually called, not
+ * just the first one found — a test commonly exercises several
+ * methods/functions from the same changed file (e.g. both `create()`
+ * and `listUsers()`), and stopping at the first match was silently
+ * dropping evidence for the rest.
+ */
+function findUsedSymbols(
+  testFileAbsolute: string,
+  symbolNames: string[]
+): string[] {
+  if (symbolNames.length === 0) {
+    return [];
+  }
+
+  const testSourceFile = getSourceFileNode(testFileAbsolute);
+
+  if (!testSourceFile) {
+    return [];
+  }
+
+  const symbolSet = new Set(symbolNames);
+  const used = new Set<string>();
+
+  try {
+    for (const call of testSourceFile.getDescendantsOfKind(
+      SyntaxKind.CallExpression
+    )) {
+      const expression = call.getExpression();
+
+      let calledName: string | undefined;
+
+      if (Node.isPropertyAccessExpression(expression)) {
+        // e.g. `new UserRepository(prismock).listUsers(...)`
+        calledName = expression.getName();
+      } else if (Node.isIdentifier(expression)) {
+        // e.g. `listUsers(...)` called directly (named export)
+        calledName = expression.getText();
+      }
+
+      if (calledName && symbolSet.has(calledName)) {
+        used.add(calledName);
+      }
+    }
+  } catch {
+    // Best-effort — return whatever we collected before the failure.
+    return Array.from(used);
+  }
+
+  return Array.from(used);
+}
+
+/**
+ * Given the diff for the changed source file, determine which of its
+ * exported symbol names were actually touched by the commit — i.e.
+ * the symbol's name appears on an added line, which for a new or
+ * modified function/method/const declaration will include the
+ * signature line itself.
+ *
+ * This is a line-level heuristic, not a full AST diff: it checks for
+ * a whole-word match of the symbol name on any added line, rather
+ * than confirming that line is specifically the *declaration* line.
+ * That means a symbol whose body was edited (declaration untouched,
+ * but an added line inside it happens to reference the symbol name
+ * again, e.g. in a recursive call or a log message) can also be
+ * flagged as "changed" — which is still a reasonable signal ("this
+ * function's implementation changed"), just slightly broader than
+ * "this function's signature changed". Good enough for ranking
+ * behavioral relevance; not a substitute for a real diff-to-AST
+ * mapping if that precision is ever needed.
+ */
+function extractChangedSymbolNames(
+  changedLines: {
+    type: string;
+    content: string;
+  }[],
+  candidateNames: string[]
+): Set<string> {
+  const changed = new Set<string>();
+
+  if (candidateNames.length === 0 || changedLines.length === 0) {
+    return changed;
+  }
+
+  const remaining = new Set(candidateNames);
+
+  for (const line of changedLines) {
+    if (remaining.size === 0) {
+      break;
+    }
+
+    if (line.type !== "added") {
+      continue;
+    }
+
+    for (const name of Array.from(remaining)) {
+      const wordBoundaryRegex = new RegExp(`\\b${escapeRegExp(name)}\\b`);
+
+      if (wordBoundaryRegex.test(line.content)) {
+        changed.add(name);
+        remaining.delete(name);
+      }
+    }
+  }
+
+  return changed;
+}
+
+/**
  * Find source files that import a specific dependency.
  */
 function findFilesImportingPackage(
@@ -393,12 +686,73 @@ function findFilesImportingPackage(
 }
 
 /**
+ * Build the human-readable reason + confidence for a symbol-usage
+ * match, given every symbol the test calls and which of those the
+ * commit actually changed.
+ *
+ * Changed symbols are surfaced first and drive the confidence bump —
+ * "the test calls the function this commit modified" is materially
+ * stronger evidence than "the test calls some other function that
+ * happens to live in the same file" — but we still report every
+ * symbol used so nothing is silently dropped.
+ */
+function describeSymbolUsage(
+  usedSymbols: string[],
+  changedSymbolNames: Set<string>
+): { reason: string; confidence: number; symbols: UsedSymbol[] } {
+  const symbols: UsedSymbol[] = usedSymbols.map((name) => ({
+    name,
+    changed: changedSymbolNames.has(name),
+  }));
+
+  const changedNames = symbols.filter((s) => s.changed).map((s) => s.name);
+  const unchangedNames = symbols.filter((s) => !s.changed).map((s) => s.name);
+
+  if (changedNames.length > 0) {
+    const changedList = changedNames.map((n) => `${n}()`).join(", ");
+    let reason = `Test directly invokes ${changedList}, ${
+      changedNames.length === 1 ? "which was" : "which were"
+    } introduced or modified by this commit`;
+
+    if (unchangedNames.length > 0) {
+      reason += ` (also exercises pre-existing ${unchangedNames
+        .map((n) => `${n}()`)
+        .join(", ")})`;
+    }
+
+    return { reason, confidence: 0.99, symbols };
+  }
+
+  const usedList = usedSymbols.map((n) => `${n}()`).join(", ");
+
+  return {
+    reason: `Test directly invokes ${usedList}, defined in the changed source file`,
+    confidence: 0.98,
+    symbols,
+  };
+}
+
+/**
  * Find tests associated with a source file.
+ *
+ * Rules 1–3 establish that a test is *plausibly* related, from
+ * weakest positional evidence to strongest resolvable-path evidence.
+ * Whichever rule fires, we then separately check for symbol-usage
+ * evidence and upgrade the match if the test actually calls something
+ * the changed file exports — that's stronger than any name/path
+ * coincidence, regardless of which rule found the candidate. If any
+ * of the used symbols were themselves changed by this commit, that's
+ * upgraded again, since it's evidence the test exercises the specific
+ * behavior the commit modified, not just some other export nearby.
  */
 function findTestsForSourceFile(
   sourceFile: string,
   testFiles: string[],
-  repositoryRoot: string
+  repositoryRoot: string,
+  changedLines: {
+    type: string;
+    content: string;
+  }[] = []
 ): TestMatch[] {
   const matches: TestMatch[] = [];
 
@@ -406,81 +760,103 @@ function findTestsForSourceFile(
     path.relative(repositoryRoot, sourceFile)
   );
 
+  /**
+   * Computed once per changed source file — doesn't depend on which
+   * test file we're looking at.
+   */
+  const exportedSymbols = extractExportedSymbolNames(sourceFile);
+  const changedSymbolNames = extractChangedSymbolNames(
+    changedLines,
+    exportedSymbols
+  );
+
   for (const testFileAbsolute of testFiles) {
     const testFile = normalizePath(
       path.relative(repositoryRoot, testFileAbsolute)
     );
 
+    let match: TestMatch | undefined;
+
     /**
-     * RULE 1:
+     * RULE 1: Same filename.
      *
-     * Same filename.
-     *
-     * Example:
-     *
-     * Locations.tsx
-     * Locations.test.tsx
+     * Example: Locations.tsx / Locations.test.tsx
      */
     if (hasMatchingTestName(normalizedSourceFile, testFile)) {
-      matches.push({
+      match = {
         testFile,
         changedFile: normalizedSourceFile,
+        relationship: "same-name",
         reason: "Test has the same base filename as the affected source file",
         confidence: 0.95,
-      });
-
-      continue;
-    }
-
-    /**
-     * RULE 2:
-     *
-     * Test actually imports the changed file. This is real evidence
-     * (a resolved import path), not a text-mention heuristic, so it
-     * gets the same top confidence as an exact filename match.
-     */
-    if (testImportsFile(testFileAbsolute, sourceFile)) {
-      matches.push({
+      };
+    } else if (testImportsFile(testFileAbsolute, sourceFile)) {
+      /**
+       * RULE 2: Test actually imports the changed file. Real
+       * resolved-path evidence, not a text-mention heuristic.
+       */
+      match = {
         testFile,
         changedFile: normalizedSourceFile,
+        relationship: "import",
         reason: "Test actually imports the affected source file",
         confidence: 0.95,
-      });
-
-      continue;
-    }
-
-    /**
-     * RULE 3:
-     *
-     * Same directory + similar filename. Positional/naming evidence,
-     * weaker than an actual import, so it sits below the two rules
-     * above.
-     */
-    if (
+      };
+    } else if (
       isSameDirectory(normalizedSourceFile, testFile) &&
       getBaseName(testFile)
         .toLowerCase()
         .includes(getBaseName(normalizedSourceFile).toLowerCase())
     ) {
-      matches.push({
+      /**
+       * RULE 3: Same directory + similar filename. Positional/naming
+       * evidence, weaker than an actual import.
+       */
+      match = {
         testFile,
         changedFile: normalizedSourceFile,
-        reason:
-          "Test is in the same directory and has a related filename",
+        relationship: "same-directory",
+        reason: "Test is in the same directory and has a related filename",
         confidence: 0.8,
-      });
+      };
+    }
 
+    /**
+     * There is deliberately no Rule 4 fallback here. We used to check
+     * "does the test's text merely contain the source file's base
+     * name" — that's how a locale string like "common" or a common
+     * word in a filename produced unrelated matches. No evidence
+     * beyond Rules 1–3 means no match.
+     */
+    if (!match) {
       continue;
     }
 
     /**
-     * There is deliberately no Rule 4 here. We used to fall back to
-     * "does the test's text merely contain the source file's base
-     * name" — that's how a locale string like "common" or a common
-     * word in a source filename produced unrelated matches. No
-     * evidence beyond Rules 1–3 means no match.
+     * SYMBOL-USAGE UPGRADE: if the test actually calls one or more
+     * symbols defined in the changed file, that's causal/behavioral
+     * evidence — stronger than any name or path coincidence — so we
+     * upgrade the match regardless of which rule above found it.
+     * Symbols the commit itself changed push confidence higher still.
      */
+    const usedSymbols = findUsedSymbols(testFileAbsolute, exportedSymbols);
+
+    if (usedSymbols.length > 0) {
+      const { reason, confidence, symbols } = describeSymbolUsage(
+        usedSymbols,
+        changedSymbolNames
+      );
+
+      match = {
+        ...match,
+        relationship: "symbol-usage",
+        reason,
+        confidence,
+        symbols,
+      };
+    }
+
+    matches.push(match);
   }
 
   return matches;
@@ -520,6 +896,7 @@ function findTestsForLocaleFile(
     matches.push({
       testFile,
       changedFile: normalizedLocaleFile,
+      relationship: "locale-import",
       reason: "Test directly imports the changed locale/translation file",
       confidence: 0.9,
     });
@@ -621,7 +998,8 @@ export function analyzeTests(
       matches = findTestsForSourceFile(
         changedAbsolutePath,
         testFiles,
-        repositoryRoot
+        repositoryRoot,
+        change.changedLines
       );
     } else if (category === "locale") {
       matches = findTestsForLocaleFile(
@@ -699,16 +1077,27 @@ export function analyzeTests(
       );
 
       for (const sourceFile of affectedSourceFiles) {
+        /**
+         * Symbol-usage evidence from these tests isn't meaningful
+         * for a dependency-driven match: the "commit" here is a
+         * package.json bump, not an edit to `sourceFile` itself, so
+         * there's no diff to check for changed symbols. We still
+         * call findTestsForSourceFile() to reuse Rules 1–3, but the
+         * resulting relationship/reason below is deliberately
+         * overwritten to "dependency" rather than "symbol-usage".
+         */
         const tests = findTestsForSourceFile(
           sourceFile,
           testFiles,
-          repositoryRoot
+          repositoryRoot,
+          []
         );
 
         for (const test of tests) {
           relatedTests.push({
             testFile: test.testFile,
             changedFile: changedFile,
+            relationship: "dependency",
             reason:
               `Test covers source file that imports dependency "${dependency}"`,
             confidence: 0.8,
