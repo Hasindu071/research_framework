@@ -1,4 +1,3 @@
-
 import fs from "fs";
 import path from "path";
 
@@ -20,6 +19,14 @@ const SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 
 /**
  * Check whether a file is a test file.
+ *
+ * Handles all naming conventions found in the repo:
+ *   - *.test.ts(x) / *.spec.ts(x)
+ *   - *.timezone.test.ts   (still ends in ".test.ts", already covered)
+ *   - *.integration-test.ts   (NOTE: hyphen before "test", not a dot —
+ *     needs its own pattern, the old regex never matched this)
+ *   - *.e2e.ts(x)   (was completely unhandled before)
+ *   - anything inside a __tests__/ directory
  */
 function isTestFile(filePath: string): boolean {
   const normalized = filePath.replace(/\\/g, "/");
@@ -27,6 +34,8 @@ function isTestFile(filePath: string): boolean {
   return (
     /\.test\.(ts|tsx|js|jsx)$/.test(normalized) ||
     /\.spec\.(ts|tsx|js|jsx)$/.test(normalized) ||
+    /\.e2e\.(ts|tsx|js|jsx)$/.test(normalized) ||
+    /\.integration-test\.(ts|tsx|js|jsx)$/.test(normalized) ||
     /(^|\/)__tests__(\/|$)/.test(normalized)
   );
 }
@@ -36,6 +45,60 @@ function isTestFile(filePath: string): boolean {
  */
 function isSourceFile(filePath: string): boolean {
   return SOURCE_EXTENSIONS.some((extension) => filePath.endsWith(extension));
+}
+
+/**
+ * Check whether a file is a localization/translation file.
+ *
+ * These are JSON files, but they are NOT "source code" in the sense
+ * that matters for our matching rules: they aren't imported the way
+ * a .ts module is, they don't have a natural "test with the same
+ * basename", and their content is just translation strings — running
+ * them through the code-matching rules is what produced false
+ * positives like `common.json` matching `next-i18next.config.test.ts`
+ * purely because the word "common" appears somewhere in that file.
+ */
+function isLocaleFile(filePath: string): boolean {
+  const normalized = normalizePath(filePath);
+
+  return (
+    /\.json$/.test(normalized) &&
+    /(^|\/)(locales?|i18n|translations)(\/|$)/.test(normalized)
+  );
+}
+
+type FileCategory = "code" | "locale" | "dependency" | "unknown";
+
+const DEPENDENCY_FILES = new Set([
+  "package.json",
+  "yarn.lock",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+]);
+
+/**
+ * Route a changed file to the right analysis strategy instead of
+ * shoving everything through the code-matching path. This is the
+ * fix for CASE 1 previously calling findTestsForSourceFile() on
+ * every non-package changed file, including JSON locale files,
+ * markdown, YAML, etc.
+ */
+function categorizeFile(filePath: string): FileCategory {
+  const normalized = normalizePath(filePath);
+
+  if (DEPENDENCY_FILES.has(normalized)) {
+    return "dependency";
+  }
+
+  if (isLocaleFile(normalized)) {
+    return "locale";
+  }
+
+  if (isSourceFile(normalized)) {
+    return "code";
+  }
+
+  return "unknown";
 }
 
 /**
@@ -89,19 +152,31 @@ function normalizePath(filePath: string): string {
 }
 
 /**
- * Get a file name without its extension.
+ * Get a file name without its extension and without any
+ * test-related suffix.
  *
  * Examples:
  *
- * Locations.tsx       -> Locations
- * Locations.test.tsx -> Locations
- * Locations.spec.tsx -> Locations
+ * Locations.tsx                    -> Locations
+ * Locations.test.tsx               -> Locations
+ * Locations.spec.tsx               -> Locations
+ * Locations.e2e.ts                 -> Locations
+ * handleNewBooking.integration-test.ts -> handleNewBooking
+ * Locations.timezone.test.tsx      -> Locations
+ *
+ * NOTE: order matters here. The more specific "compound" suffixes
+ * (".integration-test.", ".timezone.test.") must be stripped BEFORE
+ * the generic ".test./.spec./.e2e." pattern, otherwise the generic
+ * pattern only strips the trailing ".test.ts" and leaves a mismatched
+ * base name like "Locations.timezone".
  */
 function getBaseName(filePath: string): string {
   const fileName = path.basename(filePath);
 
   return fileName
-    .replace(/\.(test|spec)\.(ts|tsx|js|jsx)$/, "")
+    .replace(/\.integration-test\.(ts|tsx|js|jsx)$/, "")
+    .replace(/\.timezone\.test\.(ts|tsx|js|jsx)$/, "")
+    .replace(/\.(test|spec|e2e)\.(ts|tsx|js|jsx)$/, "")
     .replace(/\.(ts|tsx|js|jsx)$/, "");
 }
 
@@ -134,8 +209,9 @@ function isSameDirectory(
  * Examples:
  *
  * import x from "i18next-fs-backend"
- *
+ * import "i18next-fs-backend"          (side-effect import — was missing)
  * require("i18next-fs-backend")
+ * import("i18next-fs-backend")
  *
  * @scope/package
  * package
@@ -147,7 +223,7 @@ function sourceImportsPackage(
   const escapedPackage = packageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   const importRegex = new RegExp(
-    `(?:from\\s+|import\\s*\\(|require\\s*\\()\\s*["']${escapedPackage}["']`,
+    `(?:from\\s+|import\\s*\\(|import\\s+|require\\s*\\()\\s*["']${escapedPackage}["']`,
     "m"
   );
 
@@ -200,6 +276,87 @@ function extractChangedDependencies(
   }
 
   return Array.from(dependencies);
+}
+
+/**
+ * Extract relative import/require specifiers from a file's content.
+ *
+ * We only care about relative specifiers (starting with "." or "/")
+ * because those are the ones that can point at another file inside
+ * the repo — package imports like "react" or "i18next-fs-backend"
+ * are handled separately by sourceImportsPackage().
+ */
+function extractRelativeImportSpecifiers(content: string): string[] {
+  const specifiers: string[] = [];
+
+  const importRegex =
+    /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["'](\.[^"']+)["']/g;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = importRegex.exec(content)) !== null) {
+    if (match[1]) {
+      specifiers.push(match[1]);
+    }
+  }
+
+  return specifiers;
+}
+
+/**
+ * Resolve a relative import specifier found inside `fromFileAbsolute`
+ * to the set of absolute paths it could plausibly point at, mirroring
+ * how bundlers/TS resolve extensionless and index imports.
+ */
+function resolveImportCandidates(
+  fromFileAbsolute: string,
+  specifier: string
+): string[] {
+  const resolvedBase = path.resolve(path.dirname(fromFileAbsolute), specifier);
+
+  const candidates = [resolvedBase];
+
+  for (const extension of [...SOURCE_EXTENSIONS, ".json"]) {
+    candidates.push(`${resolvedBase}${extension}`);
+    candidates.push(path.join(resolvedBase, `index${extension}`));
+  }
+
+  return candidates;
+}
+
+/**
+ * Real evidence check: does `testFileAbsolute` actually import
+ * `targetFileAbsolute`, based on resolving its relative import
+ * specifiers — not just on the target's basename appearing as text
+ * somewhere in the test file.
+ */
+function testImportsFile(
+  testFileAbsolute: string,
+  targetFileAbsolute: string
+): boolean {
+  let content: string;
+
+  try {
+    content = fs.readFileSync(testFileAbsolute, "utf8");
+  } catch {
+    return false;
+  }
+
+  const normalizedTarget = normalizePath(path.normalize(targetFileAbsolute));
+
+  for (const specifier of extractRelativeImportSpecifiers(content)) {
+    const candidates = resolveImportCandidates(testFileAbsolute, specifier);
+
+    if (
+      candidates.some(
+        (candidate) => normalizePath(path.normalize(candidate)) === normalizedTarget
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -278,7 +435,27 @@ function findTestsForSourceFile(
     /**
      * RULE 2:
      *
-     * Same directory + similar filename.
+     * Test actually imports the changed file. This is real evidence
+     * (a resolved import path), not a text-mention heuristic, so it
+     * gets the same top confidence as an exact filename match.
+     */
+    if (testImportsFile(testFileAbsolute, sourceFile)) {
+      matches.push({
+        testFile,
+        changedFile: normalizedSourceFile,
+        reason: "Test actually imports the affected source file",
+        confidence: 0.95,
+      });
+
+      continue;
+    }
+
+    /**
+     * RULE 3:
+     *
+     * Same directory + similar filename. Positional/naming evidence,
+     * weaker than an actual import, so it sits below the two rules
+     * above.
      */
     if (
       isSameDirectory(normalizedSourceFile, testFile) &&
@@ -291,44 +468,61 @@ function findTestsForSourceFile(
         changedFile: normalizedSourceFile,
         reason:
           "Test is in the same directory and has a related filename",
-        confidence: 0.85,
+        confidence: 0.8,
       });
 
       continue;
     }
 
     /**
-     * RULE 3:
-     *
-     * Test imports the affected source file.
+     * There is deliberately no Rule 4 here. We used to fall back to
+     * "does the test's text merely contain the source file's base
+     * name" — that's how a locale string like "common" or a common
+     * word in a source filename produced unrelated matches. No
+     * evidence beyond Rules 1–3 means no match.
      */
-    try {
-      const content = fs.readFileSync(testFileAbsolute, "utf8");
+  }
 
-      const sourceBaseName = getBaseName(normalizedSourceFile);
+  return matches;
+}
 
-      /**
-       * We deliberately use the source filename here,
-       * rather than blindly searching for "package.json".
-       */
-      const sourceFileName = path.basename(
-        normalizedSourceFile
-      ).replace(/\.(ts|tsx|js|jsx)$/, "");
+/**
+ * Find tests related to a changed localization/translation file.
+ *
+ * Locale JSON files aren't "imported" the way TS modules are in most
+ * i18next setups (they're loaded by namespace/path at runtime), and
+ * they don't have a natural same-named test file. Rather than fall
+ * back to scanning test file text for the namespace name (which is
+ * exactly the false-positive source — "common" appearing anywhere),
+ * we only report a match when a test file demonstrably imports the
+ * JSON file directly. No import evidence => no match, on purpose.
+ */
+function findTestsForLocaleFile(
+  localeFile: string,
+  testFiles: string[],
+  repositoryRoot: string
+): TestMatch[] {
+  const matches: TestMatch[] = [];
 
-      if (
-        content.includes(sourceBaseName) ||
-        content.includes(sourceFileName)
-      ) {
-        matches.push({
-          testFile,
-          changedFile: normalizedSourceFile,
-          reason: "Test references the affected source module",
-          confidence: 0.75,
-        });
-      }
-    } catch {
-      // Ignore unreadable files.
+  const normalizedLocaleFile = normalizePath(
+    path.relative(repositoryRoot, localeFile)
+  );
+
+  for (const testFileAbsolute of testFiles) {
+    if (!testImportsFile(testFileAbsolute, localeFile)) {
+      continue;
     }
+
+    const testFile = normalizePath(
+      path.relative(repositoryRoot, testFileAbsolute)
+    );
+
+    matches.push({
+      testFile,
+      changedFile: normalizedLocaleFile,
+      reason: "Test directly imports the changed locale/translation file",
+      confidence: 0.9,
+    });
   }
 
   return matches;
@@ -393,31 +587,59 @@ export function analyzeTests(
     const changedFile = normalizePath(change.file);
 
     /**
-     * Skip package manager files here.
-     * They are handled separately below.
+     * A changed TEST file is not a production file that itself needs
+     * tests. Without this guard, a changed UserRepository.test.ts
+     * gets run through findTestsForSourceFile() like it was source
+     * code, matching other tests that merely share its base name
+     * (e.g. UserRepository.integration-test.ts) — and in the worst
+     * case matching itself (testFile === changedFile). We still want
+     * to know a test changed; we just don't go looking for "tests
+     * for the test".
      */
-    if (
-      changedFile === "package.json" ||
-      changedFile === "yarn.lock" ||
-      changedFile === "package-lock.json" ||
-      changedFile === "pnpm-lock.yaml"
-    ) {
+    if (isTestFile(changedFile)) {
       continue;
     }
 
+    const category = categorizeFile(changedFile);
+
     /**
-     * Find tests for the changed source file.
+     * Dependency files (package.json, lockfiles) are handled
+     * separately below via dependency analysis.
      */
+    if (category === "dependency") {
+      continue;
+    }
+
     const changedAbsolutePath = path.resolve(
       repositoryRoot,
       changedFile
     );
 
-    const matches = findTestsForSourceFile(
-      changedAbsolutePath,
-      testFiles,
-      repositoryRoot
-    );
+    let matches: TestMatch[];
+
+    if (category === "code") {
+      matches = findTestsForSourceFile(
+        changedAbsolutePath,
+        testFiles,
+        repositoryRoot
+      );
+    } else if (category === "locale") {
+      matches = findTestsForLocaleFile(
+        changedAbsolutePath,
+        testFiles,
+        repositoryRoot
+      );
+    } else {
+      /**
+       * "unknown" — markdown, YAML, images, config files with no
+       * dedicated analysis strategy, etc. There is no evidence-based
+       * way to match these to tests yet, so we skip them rather than
+       * falling back to the code-matching heuristics (which is how
+       * a README or a .env.example used to pick up unrelated test
+       * matches).
+       */
+      continue;
+    }
 
     for (const match of matches) {
       relatedTests.push({
@@ -532,4 +754,3 @@ export function analyzeTests(
     relatedTests: result,
   };
 }
-
