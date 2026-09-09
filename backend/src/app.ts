@@ -219,6 +219,8 @@ app.post("/api/analyze-and-run", async (req, res) => {
             passed: 0,
             failed: 0,
             errors: 0,
+            not_found: 0,
+            skipped: 0,
             stoppedEarly: false,
           },
           testExecution: [],
@@ -249,6 +251,12 @@ app.post("/api/analyze-and-run", async (req, res) => {
     const errorCount = testRunResults.testExecution.filter(
       (t) => t.status === "error"
     ).length;
+    const notFoundCount = testRunResults.testExecution.filter(
+      (t) => t.status === "not_found"
+    ).length;
+    const skippedCount = testRunResults.testExecution.filter(
+      (t) => t.status === "skipped"
+    ).length;
 
     // Step 5: Return complete result
     console.log("[Step 4] Test execution completed");
@@ -277,6 +285,8 @@ app.post("/api/analyze-and-run", async (req, res) => {
           passed: passedCount,
           failed: failedCount,
           errors: errorCount,
+          not_found: notFoundCount,
+          skipped: skippedCount,
           stoppedEarly: testRunResults.stoppedEarly,
         },
         testExecution: testRunResults.testExecution,

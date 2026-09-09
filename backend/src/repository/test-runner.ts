@@ -3,12 +3,17 @@ import path from "path";
 import { spawn } from "child_process";
 
 import type { TestFramework } from "./frameworks.js";
+import {
+  resolveFramework,
+  buildTestCommand,
+  type FrameworkResolution,
+} from "./framework-resolver.js";
 
 // ======================================================
 // TYPES
 // ======================================================
 
-export type TestStatus = "passed" | "failed" | "error" | "skipped";
+export type TestStatus = "passed" | "failed" | "error" | "skipped" | "not_found";
 
 export interface PrioritizedTestInput {
   testFile: string;
@@ -28,6 +33,8 @@ export interface TestExecutionResult {
   stderr: string;
   /** Set when status is "skipped" — explains why nothing ran. */
   notes?: string;
+  /** Resolution with confidence and evidence trail. */
+  resolution?: FrameworkResolution;
 }
 
 export interface TestRunnerOptions {
@@ -63,9 +70,18 @@ const MAX_OUTPUT_CHARS = 20_000;
 const NO_TESTS_RUN_PATTERNS: Partial<Record<TestFramework, RegExp[]>> = {
   vitest: [/No test files found/i],
   jest: [/No tests found/i, /Your test suite must contain at least one test/i],
-  playwright: [/No tests found/i],
+  playwright: [/No tests found/i, /Error: No tests found/i],
   mocha: [/0 passing/i, /No test files found/i],
 };
+
+const IMPORT_ERROR_PATTERNS = [
+  /Failed to resolve import/i,
+  /Cannot find module/i,
+  /Module not found/i,
+  /SyntaxError/i,
+  /ERR_MODULE_NOT_FOUND/i,
+  /Error: Could not resolve/i,
+];
 
 function detectNoTestsExecuted(
   framework: TestFramework | null,
@@ -79,148 +95,9 @@ function detectNoTestsExecuted(
   return patterns.some((pattern) => pattern.test(combined));
 }
 
-// ======================================================
-// FRAMEWORK DETECTION PER TEST FILE
-// ======================================================
-
-interface FrameworkDetector {
-  name: TestFramework;
-  deps: string[];
-}
-
-const FRAMEWORK_DETECTORS: FrameworkDetector[] = [
-  { name: "playwright", deps: ["@playwright/test", "playwright"] },
-  { name: "vitest", deps: ["vitest"] },
-  { name: "jest", deps: ["jest"] },
-  { name: "mocha", deps: ["mocha"] },
-];
-
-/**
- * Find the workspace/package directory for a test file by looking for package.json.
- */
-function findWorkspaceDir(
-  testFile: string,
-  repositoryRoot: string
-): string {
-  let currentDir = path.dirname(path.resolve(repositoryRoot, testFile));
-
-  while (currentDir.startsWith(repositoryRoot)) {
-    const packageJsonPath = path.join(currentDir, "package.json");
-
-    if (fs.existsSync(packageJsonPath)) {
-      return currentDir;
-    }
-
-    const parent = path.dirname(currentDir);
-    if (parent === currentDir) break;
-    currentDir = parent;
-  }
-
-  // Fallback to repository root
-  return repositoryRoot;
-}
-
-/**
- * Detect framework for a specific test file by checking:
- * 1. The actual imports in the test file (most reliable)
- * 2. Then the package.json of the workspace it belongs to
- */
-function detectFrameworkForTest(
-  testFile: string,
-  repositoryRoot: string
-): TestFramework | null {
-  const absolutePath = path.resolve(repositoryRoot, testFile);
-
-  // Step 1: Check the test file's actual imports
-  try {
-    const content = fs.readFileSync(absolutePath, "utf8");
-
-    // Check imports/requires in the file
-    if (
-      content.includes("import * as test from 'vitest'") ||
-      content.includes('import { test') ||
-      content.includes("import { describe, it, expect") ||
-      content.includes("from 'vitest'") ||
-      content.includes('from "vitest"') ||
-      content.includes("import { render") && content.includes("from 'vitest'")
-    ) {
-      return "vitest";
-    }
-
-    if (
-      content.includes("import { test") && content.includes("from '@playwright/test'") ||
-      content.includes('from "@playwright/test"')
-    ) {
-      return "playwright";
-    }
-
-    if (
-      content.includes("import { describe, it") && content.includes("from 'jest'") ||
-      content.includes('from "jest"')
-    ) {
-      return "jest";
-    }
-
-    if (
-      content.includes("import { describe, it") && content.includes("from 'mocha'") ||
-      content.includes('from "mocha"')
-    ) {
-      return "mocha";
-    }
-  } catch {
-    // Fall through to package.json detection
-  }
-
-  // Step 2: Fall back to package.json detection
-  let currentDir = path.dirname(absolutePath);
-
-  while (currentDir.startsWith(repositoryRoot)) {
-    const packageJsonPath = path.join(currentDir, "package.json");
-
-    if (fs.existsSync(packageJsonPath)) {
-      try {
-        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-        const allDeps = {
-          ...pkg.dependencies,
-          ...pkg.devDependencies,
-        };
-
-        for (const detector of FRAMEWORK_DETECTORS) {
-          if (detector.deps.some((dep) => dep in allDeps)) {
-            return detector.name;
-          }
-        }
-      } catch {
-        // Continue up the tree
-      }
-    }
-
-    const parent = path.dirname(currentDir);
-    if (parent === currentDir) break;
-    currentDir = parent;
-  }
-
-  // Step 3: Check root package.json
-  try {
-    const rootPackageJson = path.join(repositoryRoot, "package.json");
-    if (fs.existsSync(rootPackageJson)) {
-      const pkg = JSON.parse(fs.readFileSync(rootPackageJson, "utf8"));
-      const allDeps = {
-        ...pkg.dependencies,
-        ...pkg.devDependencies,
-      };
-
-      for (const detector of FRAMEWORK_DETECTORS) {
-        if (detector.deps.some((dep) => dep in allDeps)) {
-          return detector.name;
-        }
-      }
-    }
-  } catch {
-    // Ignore
-  }
-
-  return null;
+function detectImportOrSetupError(stdout: string, stderr: string): boolean {
+  const combined = `${stdout}\n${stderr}`;
+  return IMPORT_ERROR_PATTERNS.some((pattern) => pattern.test(combined));
 }
 
 /**
@@ -256,84 +133,6 @@ function isFrameworkInstalled(
 
   return false;
 }
-/**
- * Determine package manager to use (npm, yarn, pnpm, or npx).
- * Check for lock files in the repository.
- */
-function detectPackageManager(
-  repositoryRoot: string
-): "npm" | "yarn" | "pnpm" | "npx" {
-  if (fs.existsSync(path.join(repositoryRoot, "yarn.lock"))) {
-    return "yarn";
-  }
-  if (fs.existsSync(path.join(repositoryRoot, "pnpm-lock.yaml"))) {
-    return "pnpm";
-  }
-  if (fs.existsSync(path.join(repositoryRoot, "package-lock.json"))) {
-    return "npm";
-  }
-  // Default fallback
-  return "npx";
-}
-
-/**
- * Build the test command for a specific framework.
- */
-function buildTestCommand(
-  framework: TestFramework,
-  testFile: string,
-  packageManager: string
-): { command: string; args: string[] } {
-  // Different package managers have different ways to invoke binaries:
-  // - yarn: use "yarn exec" or directly invoke with yarn
-  // - pnpm: use "pnpm exec" for workspace binaries
-  // - npm: use "npx" for binaries
-  
-  const isYarn = packageManager === "yarn";
-  const isPnpm = packageManager === "pnpm";
-  
-  switch (framework) {
-    case "vitest":
-      if (isYarn) {
-        return { command: "yarn", args: ["exec", "vitest", "run", testFile] };
-      } else if (isPnpm) {
-        return { command: "pnpm", args: ["exec", "vitest", "run", testFile] };
-      }
-      return { command: "npx", args: ["vitest", "run", testFile] };
-
-    case "jest":
-      if (isYarn) {
-        return { command: "yarn", args: ["exec", "jest", testFile] };
-      } else if (isPnpm) {
-        return { command: "pnpm", args: ["exec", "jest", testFile] };
-      }
-      return { command: "npx", args: ["jest", testFile] };
-
-    case "playwright":
-      if (isYarn) {
-        return { command: "yarn", args: ["exec", "playwright", "test", testFile] };
-      } else if (isPnpm) {
-        return { command: "pnpm", args: ["exec", "playwright", "test", testFile] };
-      }
-      return { command: "npx", args: ["playwright", "test", testFile] };
-
-    case "mocha":
-      if (isYarn) {
-        return { command: "yarn", args: ["exec", "mocha", testFile] };
-      } else if (isPnpm) {
-        return { command: "pnpm", args: ["exec", "mocha", testFile] };
-      }
-      return { command: "npx", args: ["mocha", testFile] };
-
-    default:
-      if (isYarn) {
-        return { command: "yarn", args: ["exec", "test", testFile] };
-      } else if (isPnpm) {
-        return { command: "pnpm", args: ["test", testFile] };
-      }
-      return { command: "npm", args: ["run", "test", "--", testFile] };
-  }
-}
 
 // ======================================================
 // RUN PRIORITIZED TESTS
@@ -344,14 +143,13 @@ export async function runPrioritizedTests(
   options: TestRunnerOptions
 ): Promise<TestRunSummary> {
   const ordered = [...tests].sort((a, b) => a.priority - b.priority);
-  const packageManager = detectPackageManager(options.repositoryRoot);
 
   const testExecution: TestExecutionResult[] = [];
   let failureCount = 0;
   let stoppedEarly = false;
 
   for (const test of ordered) {
-    const result = await runSingleTest(test, options, packageManager);
+    const result = await runSingleTest(test, options);
     testExecution.push(result);
 
     if (result.status !== "passed") {
@@ -395,48 +193,65 @@ export function toPrioritizedTestInputs(
 
 function runSingleTest(
   test: PrioritizedTestInput,
-  options: TestRunnerOptions,
-  packageManager: string
+  options: TestRunnerOptions
 ): Promise<TestExecutionResult> {
-  const framework = detectFrameworkForTest(
-    test.testFile,
-    options.repositoryRoot
-  );
+  const testFileAbs = path.resolve(options.repositoryRoot, test.testFile);
 
-  // Find the workspace directory for this test
-  // But prefer the repository root for running commands
-  let workspaceDir = findWorkspaceDir(test.testFile, options.repositoryRoot);
-  
-  // For yarn/npm/pnpm, always run from repo root where package manager is set up
-  if (packageManager !== "npx") {
-    workspaceDir = options.repositoryRoot;
-  }
-
-  // Check if framework is installed
-  if (framework && !isFrameworkInstalled(framework, workspaceDir)) {
+  // Check if the test file actually exists — catch candidate-generation issues
+  if (!fs.existsSync(testFileAbs)) {
     return Promise.resolve({
       testFile: test.testFile,
       priority: test.priority,
-      framework,
-      command: `[SKIPPED] ${framework} not installed`,
+      framework: null,
+      command: "[SKIPPED] file not found",
       status: "skipped",
       duration: 0,
       exitCode: null,
       stdout: "",
-      stderr: `Framework not installed in workspace: ${framework}`,
-      notes: `${framework} not installed in workspace`,
+      stderr: `Test file does not exist: ${testFileAbs}`,
+      notes: "File does not exist — candidate generation error (file may have been deleted or glob pattern was incorrect)",
     });
   }
-  
-  // Make test file path relative to repository root for running
-  const testFileRelative = path.relative(options.repositoryRoot, path.resolve(options.repositoryRoot, test.testFile));
-  
-  const { command, args } = framework
-    ? buildTestCommand(framework, testFileRelative, packageManager)
-    : { command: packageManager, args: ["test", testFileRelative] };
+
+  const resolution = resolveFramework(test.testFile, options.repositoryRoot);
+
+  if (!resolution.framework) {
+    return Promise.resolve({
+      testFile: test.testFile,
+      priority: test.priority,
+      framework: null,
+      command: "[SKIPPED] no test framework could be resolved for this file",
+      status: "skipped",
+      duration: 0,
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      notes: resolution.evidence.join("; "),
+      resolution,
+    });
+  }
+
+  // Check if framework is installed
+  if (!isFrameworkInstalled(resolution.framework, resolution.workspaceDir)) {
+    return Promise.resolve({
+      testFile: test.testFile,
+      priority: test.priority,
+      framework: resolution.framework,
+      command: `[SKIPPED] ${resolution.framework} not installed`,
+      status: "skipped",
+      duration: 0,
+      exitCode: null,
+      stdout: "",
+      stderr: `Framework not installed in workspace: ${resolution.framework}`,
+      notes: `${resolution.framework} not installed in workspace`,
+      resolution,
+    });
+  }
+
+  const { command, args } = buildTestCommand(resolution);
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const commandLabel = `${command} ${args.join(" ")}`;
+  const commandLabel = `(cwd: ${resolution.workspaceRelative}) ${command} ${args.join(" ")}`;
 
   return new Promise((resolve) => {
     const start = Date.now();
@@ -446,7 +261,10 @@ function runSingleTest(
     let timedOut = false;
 
     const child = spawn(command, args, {
-      cwd: options.repositoryRoot,
+      // Run from the resolved workspace, not the repo root — config
+      // include/exclude patterns (and relative paths inside the config
+      // itself) are resolved relative to this directory.
+      cwd: resolution.workspaceDir,
       shell: process.platform === "win32",
     });
 
@@ -478,13 +296,18 @@ function runSingleTest(
 
       if (timedOut) {
         status = "error";
+      } else if (detectImportOrSetupError(stdout, stderr)) {
+        // Test couldn't execute due to import/setup/environment error
+        status = "error";
+        notes = "Test execution failed during import/setup phase — test environment or dependencies could not be resolved";
+      } else if (detectNoTestsExecuted(resolution.framework, stdout, stderr)) {
+        // Framework ran but found no matching test files
+        status = "not_found";
+        notes = resolution.configVerified
+          ? `${resolution.framework} reported no test files matched the configured pattern`
+          : `${resolution.framework} reported no test files matched; the resolved config was not verified against this test file's path`;
       } else if (exitCode === 0) {
-        if (detectNoTestsExecuted(framework, stdout, stderr)) {
-          status = "skipped";
-          notes = `${framework} reported no test files matched — nothing was actually executed`;
-        } else {
-          status = "passed";
-        }
+        status = "passed";
       } else if (exitCode === 127) {
         status = "error"; // Command not found
       }
@@ -492,7 +315,7 @@ function runSingleTest(
       const result: TestExecutionResult = {
         testFile: test.testFile,
         priority: test.priority,
-        framework,
+        framework: resolution.framework,
         command: commandLabel,
         status,
         duration,
@@ -501,6 +324,7 @@ function runSingleTest(
         stderr: timedOut
           ? `${truncate(stderr)}\n[killed: exceeded ${timeoutMs}ms timeout]`
           : truncate(stderr),
+        resolution,
       };
 
       if (notes !== undefined) {
@@ -518,13 +342,14 @@ function runSingleTest(
       resolve({
         testFile: test.testFile,
         priority: test.priority,
-        framework,
+        framework: resolution.framework,
         command: commandLabel,
         status: "error",
         duration,
         exitCode: null,
         stdout: truncate(stdout),
         stderr: `${truncate(stderr)}\n${error.message}`,
+        resolution,
       });
     });
   });
