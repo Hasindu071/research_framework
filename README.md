@@ -63,8 +63,72 @@ for (const test of result.tests) {
   Gemini's `responseMimeType: "application/json"` does the structured-output
   enforcement instead of regex/markdown-fence stripping.
 
+## Full pipeline, including the test runner
+
+```ts
+import { analyzeCommit } from "./repository/analyzer.js";
+import { buildLLMContext } from "./llm/context-builder.js";
+import { LLMClient } from "./llm/llm-client.js";
+import { prioritizeTests } from "./llm/test-prioritizer.js";
+import {
+  runPrioritizedTests,
+  toPrioritizedTestInputs,
+} from "./testing/test-runner.js";
+
+const analysis = await analyzeCommit(repositoryPath, commitHash);
+const context = buildLLMContext(analysis, repositoryPath);
+
+const llmClient = new LLMClient();
+const prioritization = await prioritizeTests(context, llmClient);
+
+const { testExecution, stoppedEarly } = await runPrioritizedTests(
+  toPrioritizedTestInputs(prioritization.tests),
+  { repositoryRoot: repositoryPath }
+);
+
+for (const result of testExecution) {
+  console.log(
+    `${result.priority}. ${result.testFile} — ${result.status} (${result.duration}s)`
+  );
+}
+```
+
+## Test runner (`testing/`)
+
+- **`frameworks.ts`** — detects the test framework from the repo's root
+  `package.json` (checks for `vitest`, `@playwright/test`/`playwright`,
+  `jest`, `mocha` in that order — Playwright first since a repo can have
+  both an e2e and a unit framework installed) and maps `(framework,
+  testFile)` to the shell command that runs it. Pass `{ framework }`
+  explicitly to `runPrioritizedTests` to skip detection, or add a case
+  here for a framework not yet supported.
+- **`test-runner.ts`** — runs the prioritized tests **sequentially, one at
+  a time, in priority order** (not in parallel, not "run everything at
+  once") — that ordering is the thing being evaluated. For each test it
+  records `status`, `duration`, `exitCode`, `command`, and truncated
+  `stdout`/`stderr`, matching the design doc's execution schema.
+  - **Mode A (default):** runs every prioritized test regardless of
+    failures, since evaluation needs complete results, not just "where did
+    it stop".
+  - **Mode B:** pass `{ stopOnFailure: true }` to stop at the first
+    non-passing test.
+  - **Mode C:** pass `{ maxFailures: N }` to stop after N non-passing
+    tests. Ignored if `stopOnFailure` is set.
+  - `toPrioritizedTestInputs()` adapts `test-prioritizer.ts`'s output
+    directly into what the runner expects, so no manual mapping is needed
+    at the call site.
+
 ## Not yet built (per the design doc's phasing)
 
-Phase 2 — test *generation* from changed code + existing tests + repo
-conventions — is deliberately out of scope here so prioritization can be
-evaluated on its own first.
+- **Test generation** (changed code + existing tests + repo conventions →
+  new test scenarios) — deliberately out of scope until prioritization and
+  execution are evaluated on their own.
+- **`testing/test-discovery.ts`** — a standalone "list all test files in
+  this repo" module. Right now `analyzeTests()` in `test-analyzer.ts`
+  already does its own file-walking (`getAllFiles`/`isTestFile`); a
+  separate discovery module only becomes worth extracting if the runner or
+  something else needs test-file listing independent of that analysis.
+- **Evaluation/baseline harness** (design doc steps ⑥–⑧: run against
+  Cal.com, then Ghost, then compare against "run all tests" as a
+  baseline) — this is the next real step once the runner has been
+  exercised manually on at least one real commit.
