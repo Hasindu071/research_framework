@@ -611,44 +611,43 @@ export function resolveFramework(
   }
 
   // Strategy 3: Test script in package.json
-  // ONLY if no config candidate exists nearby. If a config exists but doesn't
-  // match, that's evidence the test may belong to a different framework/workspace.
-  // Guessing from a package script in that case is unreliable.
-  if (!framework && !firstUnverifiedCandidate) {
+  if (!framework) {
     for (const dir of [nearestWorkspace, repoRoot]) {
       const fromScripts = frameworkFromScripts(readPkgJson(dir));
       if (fromScripts) {
         framework = fromScripts.framework;
-        evidence.push(
-          `package.json script "${fromScripts.script}" in ${path.relative(repoRoot, dir) || "."} invokes ${fromScripts.framework}`
-        );
+        if (firstUnverifiedCandidate) {
+          evidence.push(
+            `config "${firstUnverifiedCandidate.file}" found but didn't match; ` +
+            `falling back to package.json script "${fromScripts.script}"`
+          );
+        } else {
+          evidence.push(
+            `package.json script "${fromScripts.script}" in ${path.relative(repoRoot, dir) || "."} invokes ${fromScripts.framework}`
+          );
+        }
         confidence = 0.55;
         break;
       }
     }
   }
 
-  // If a config existed but didn't match, and we still have no framework,
-  // this is likely a missing-framework situation, not a guessable one.
-  // Mark it as such rather than falling back to deps.
-  if (!framework && firstUnverifiedCandidate) {
-    evidence.push(
-      `config existed nearby but test does not match — treating as unresolved ` +
-        `rather than guessing from package-level evidence`
-    );
-  }
-
   // Strategy 4: Framework dependency
-  // ONLY if no config candidate exists. If a config was found, the absence of
-  // a matching pattern likely means this test belongs to something else.
-  if (!framework && !firstUnverifiedCandidate) {
+  if (!framework) {
     for (const dir of ancestorDirs) {
       const fromDeps = frameworkFromDeps(readPkgJson(dir));
       if (fromDeps) {
         framework = fromDeps;
-        evidence.push(
-          `${fromDeps} listed as dependency in ${path.relative(repoRoot, dir) || "."}/package.json`
-        );
+        if (firstUnverifiedCandidate) {
+          evidence.push(
+            `config "${firstUnverifiedCandidate.file}" found but didn't match; ` +
+            `falling back to dependency: ${fromDeps} in ${path.relative(repoRoot, dir) || "."}/package.json`
+          );
+        } else {
+          evidence.push(
+            `${fromDeps} listed as dependency in ${path.relative(repoRoot, dir) || "."}/package.json`
+          );
+        }
         confidence = 0.45;
         break;
       }

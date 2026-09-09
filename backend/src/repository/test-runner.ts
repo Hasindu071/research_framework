@@ -83,6 +83,12 @@ const IMPORT_ERROR_PATTERNS = [
   /Error: Could not resolve/i,
 ];
 
+const CONFIG_ERROR_PATTERNS = [
+  /Timed out waiting.*from config\./i, // Playwright webServer or other config timeout
+  /Error: Can't resolve config/i,
+  /Invalid config/i,
+];
+
 function detectNoTestsExecuted(
   framework: TestFramework | null,
   stdout: string,
@@ -98,6 +104,11 @@ function detectNoTestsExecuted(
 function detectImportOrSetupError(stdout: string, stderr: string): boolean {
   const combined = `${stdout}\n${stderr}`;
   return IMPORT_ERROR_PATTERNS.some((pattern) => pattern.test(combined));
+}
+
+function detectConfigError(stdout: string, stderr: string): boolean {
+  const combined = `${stdout}\n${stderr}`;
+  return CONFIG_ERROR_PATTERNS.some((pattern) => pattern.test(combined));
 }
 
 /**
@@ -296,6 +307,10 @@ function runSingleTest(
 
       if (timedOut) {
         status = "error";
+      } else if (detectConfigError(stdout, stderr)) {
+        // Configuration/environment error (e.g., Playwright webServer timeout)
+        status = "error";
+        notes = "Test execution failed due to configuration or environment error — no actual test assertions ran";
       } else if (detectImportOrSetupError(stdout, stderr)) {
         // Test couldn't execute due to import/setup/environment error
         status = "error";
