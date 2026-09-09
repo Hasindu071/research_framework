@@ -40,14 +40,39 @@ app.post("/api/analyze-commit", async (req, res) => {
       const llmClient = new LLMClient();
       const prompts = getPrompts();
 
+      console.log("[Step 3] LLM client created successfully");
+      console.log("[Step 3] Prompts loaded");
+
       llmResponse = await llmClient.generateJSON(
         prompts.systemPrompt,
         prompts.getUserPrompt(llmContext)
       );
-      console.log("[Step 3] LLM response received successfully");
+      console.log("[Step 3] ✓ LLM response received successfully");
     } catch (llmErr) {
       llmError = llmErr instanceof Error ? llmErr.message : String(llmErr);
-      console.error("[Step 3] LLM error:", llmError);
+      console.error("[Step 3] ❌ LLM ERROR OCCURRED");
+      console.error(`[Step 3] Error message: ${llmError}`);
+      
+      // Detailed error diagnosis
+      if (llmError.includes("429")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: QUOTA EXCEEDED / RATE LIMITED");
+        console.error("[Step 3] Action: Wait a few minutes before retrying");
+      } else if (llmError.includes("403")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: PERMISSION DENIED");
+        console.error("[Step 3] Action: Check API key validity and billing status");
+      } else if (llmError.includes("401")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: UNAUTHORIZED");
+        console.error("[Step 3] Action: Verify GEMINI_API_KEY is set correctly");
+      } else if (llmError.includes("fetch failed") || llmError.includes("Network error")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: NETWORK/CONNECTION ERROR");
+        console.error("[Step 3] Action: Check internet connection and Gemini API availability");
+      } else if (llmError.includes("parse") || llmError.includes("JSON")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: RESPONSE PARSING ERROR");
+        console.error("[Step 3] Action: Model may have returned invalid JSON");
+      } else {
+        console.error("[Step 3] 🚨 ERROR TYPE: UNKNOWN");
+        console.error("[Step 3] Please check the error message above");
+      }
     }
 
     const responseData: any = {
@@ -120,20 +145,51 @@ app.post("/api/analyze-and-run", async (req, res) => {
       const llmClient = new LLMClient();
       const prompts = getPrompts();
 
+      console.log("[Step 3] LLM client created successfully");
+      console.log(`[Step 3] Prompts loaded`);
+
       llmResponse = await llmClient.generateJSON(
         prompts.systemPrompt,
         prompts.getUserPrompt(llmContext)
       );
-      console.log("[Step 3] LLM response received successfully");
+      console.log("[Step 3] ✓ LLM response received successfully");
     } catch (llmErr) {
       llmError = llmErr instanceof Error ? llmErr.message : String(llmErr);
-      console.error("[Step 3] LLM error:", llmError);
+      console.error("[Step 3] ❌ LLM ERROR OCCURRED");
+      console.error(`[Step 3] Error message: ${llmError}`);
+      
+      // Detailed error diagnosis
+      if (llmError.includes("429")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: QUOTA EXCEEDED / RATE LIMITED");
+        console.error("[Step 3] Action: Wait a few minutes before retrying");
+      } else if (llmError.includes("403")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: PERMISSION DENIED");
+        console.error("[Step 3] Action: Check API key validity and billing status");
+      } else if (llmError.includes("401")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: UNAUTHORIZED");
+        console.error("[Step 3] Action: Verify GEMINI_API_KEY is set correctly");
+      } else if (llmError.includes("fetch failed") || llmError.includes("Network error")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: NETWORK/CONNECTION ERROR");
+        console.error("[Step 3] Action: Check internet connection and Gemini API availability");
+      } else if (llmError.includes("parse") || llmError.includes("JSON")) {
+        console.error("[Step 3] 🚨 ERROR TYPE: RESPONSE PARSING ERROR");
+        console.error("[Step 3] Action: Model may have returned invalid JSON");
+      } else {
+        console.error("[Step 3] 🚨 ERROR TYPE: UNKNOWN");
+        console.error("[Step 3] Please check the error message above");
+      }
     }
 
     if (llmError || !llmResponse) {
+      console.error(`[Step 3] LLM prioritization failed, aborting test execution`);
       return res.status(500).json({
         error: "Failed to get LLM prioritization",
         details: llmError,
+        errorType: llmError?.includes("429") ? "QUOTA_EXCEEDED" : 
+                   llmError?.includes("403") ? "PERMISSION_DENIED" :
+                   llmError?.includes("401") ? "UNAUTHORIZED" :
+                   llmError?.includes("Network") ? "NETWORK_ERROR" :
+                   llmError?.includes("parse") ? "PARSE_ERROR" : "UNKNOWN",
       });
     }
 

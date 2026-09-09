@@ -51,39 +51,100 @@ export class LLMClient {
   async generateJSON<T>(systemPrompt: string, userPrompt: string): Promise<T> {
     const url = `${API_BASE}/${this.model}:generateContent?key=${this.apiKey}`;
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: systemPrompt }],
-        },
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: userPrompt }],
+    console.log("[LLM-Client] Sending request to Gemini API");
+    console.log(`[LLM-Client] Model: ${this.model}`);
+    console.log(`[LLM-Client] URL: ${url.replace(this.apiKey, "***REDACTED***")}`);
+    console.log(`[LLM-Client] Temperature: ${this.temperature}`);
+    console.log(`[LLM-Client] User prompt length: ${userPrompt.length} characters`);
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemPrompt }],
           },
-        ],
-        generationConfig: {
-          responseMimeType: "application/json",
-          temperature: this.temperature,
-        },
-      }),
-    });
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: userPrompt }],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: this.temperature,
+          },
+        }),
+      });
+    } catch (fetchError) {
+      const errorMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      const errorName = fetchError instanceof Error ? fetchError.name : 'Unknown';
+      console.error("[LLM-Client] ❌ Fetch failed (network error)");
+      console.error(`[LLM-Client] Error name: ${errorName}`);
+      console.error(`[LLM-Client] Error message: ${errorMsg}`);
+      console.error(`[LLM-Client] 📋 Diagnostic info:`);
+      console.error(`[LLM-Client]   - Check internet connection`);
+      console.error(`[LLM-Client]   - Verify firewall/proxy settings`);
+      console.error(`[LLM-Client]   - Ensure DNS can resolve generativelanguage.googleapis.com`);
+      console.error(`[LLM-Client]   - Check if Gemini API is accessible: curl https://generativelanguage.googleapis.com`);
+      throw new Error(`Network error during Gemini API request: ${errorMsg}`);
+    }
+
+    console.log(`[LLM-Client] Response status: ${response.status} ${response.statusText}`);
+
+    // Log quota-related headers
+    const quotaLimit = response.headers.get("x-goog-quota-project-id");
+    const quotaUser = response.headers.get("x-goog-user-project");
+    const rateLimit = response.headers.get("x-ratelimit-limit-requests-per-minute");
+    const rateLimitRemaining = response.headers.get("x-ratelimit-remaining-requests-per-minute");
+    const rateLimitReset = response.headers.get("x-ratelimit-reset-requests-per-minute");
+
+    if (quotaLimit) console.log(`[LLM-Client] Quota project: ${quotaLimit}`);
+    if (quotaUser) console.log(`[LLM-Client] User project: ${quotaUser}`);
+    if (rateLimit) console.log(`[LLM-Client] Rate limit (requests/min): ${rateLimit}`);
+    if (rateLimitRemaining) console.log(`[LLM-Client] Remaining requests/min: ${rateLimitRemaining}`);
+    if (rateLimitReset) console.log(`[LLM-Client] Rate limit reset in: ${rateLimitReset}s`);
 
     if (!response.ok) {
       const errorBody = await safeReadText(response);
+      console.error(`[LLM-Client] API request failed (${response.status})`);
+      console.error(`[LLM-Client] Error body: ${errorBody}`);
+
+      // Check for quota exceeded error
+      if (response.status === 429) {
+        console.error("[LLM-Client] ⚠️ QUOTA EXCEEDED or RATE LIMITED");
+        console.error(`[LLM-Client] Remaining: ${rateLimitRemaining || 'unknown'}`);
+        console.error(`[LLM-Client] Reset in: ${rateLimitReset || 'unknown'} seconds`);
+      }
+
+      if (response.status === 403) {
+        console.error("[LLM-Client] ⚠️ PERMISSION DENIED - Check API key and billing");
+      }
+
       throw new Error(
         `Gemini API request failed (${response.status} ${response.statusText}): ${errorBody}`
       );
     }
 
-    const data = (await response.json()) as GeminiResponse;
+    console.log("[LLM-Client] Response received, parsing JSON...");
+    let data: GeminiResponse;
+    try {
+      data = (await response.json()) as GeminiResponse;
+    } catch (parseError) {
+      const parseMsg = parseError instanceof Error ? parseError.message : String(parseError);
+      console.error("[LLM-Client] Failed to parse response as JSON");
+      console.error(`[LLM-Client] Parse error: ${parseMsg}`);
+      throw parseError;
+    }
 
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!text) {
       const finishReason = data.candidates?.[0]?.finishReason;
+      console.warn(`[LLM-Client] Response contained no text content`);
+      console.warn(`[LLM-Client] Finish reason: ${finishReason || 'unknown'}`);
       throw new Error(
         `Gemini response contained no text content${
           finishReason ? ` (finishReason: ${finishReason})` : ""
@@ -91,13 +152,19 @@ export class LLMClient {
       );
     }
 
+    console.log(`[LLM-Client] Text content received (${text.length} characters)`);
+
     try {
-      return JSON.parse(text) as T;
+      const parsed = JSON.parse(text) as T;
+      console.log("[LLM-Client] JSON parsing successful ✓");
+      return parsed;
     } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error("[LLM-Client] Failed to parse Gemini response as JSON");
+      console.error(`[LLM-Client] JSON parse error: ${errorMsg}`);
+      console.error(`[LLM-Client] Raw response preview: ${text.substring(0, 200)}...`);
       throw new Error(
-        `Failed to parse Gemini response as JSON: ${
-          (error as Error).message
-        }\n---\nRaw response:\n${text}`
+        `Failed to parse Gemini response as JSON: ${errorMsg}\n---\nRaw response:\n${text}`
       );
     }
   }

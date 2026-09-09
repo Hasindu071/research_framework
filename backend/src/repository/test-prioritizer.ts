@@ -39,17 +39,42 @@ export async function prioritizeTests(
   // Nothing to rank — skip the LLM call entirely rather than paying
   // for a round trip that can only return an empty list.
   if (context.candidateTests.length === 0) {
+    console.log("[Test-Prioritizer] No candidate tests to rank, skipping LLM call");
     return { tests: [] };
   }
 
+  console.log(`[Test-Prioritizer] Starting prioritization for ${context.candidateTests.length} candidate tests`);
+
   const userPrompt = buildTestPrioritizerUserPrompt(context);
+  console.log(`[Test-Prioritizer] User prompt prepared (${userPrompt.length} characters)`);
 
-  const raw = await llmClient.generateJSON<RawLLMResponse>(
-    TEST_PRIORITIZER_SYSTEM_PROMPT,
-    userPrompt
-  );
+  try {
+    console.log("[Test-Prioritizer] Calling LLM to generate JSON...");
+    const raw = await llmClient.generateJSON<RawLLMResponse>(
+      TEST_PRIORITIZER_SYSTEM_PROMPT,
+      userPrompt
+    );
+    console.log("[Test-Prioritizer] LLM response received successfully ✓");
 
-  return validateAndNormalize(raw, context);
+    return validateAndNormalize(raw, context);
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error("[Test-Prioritizer] ⚠️ LLM prioritization failed");
+    console.error(`[Test-Prioritizer] Error: ${errorMsg}`);
+    
+    // Check for specific error types
+    if (errorMsg.includes("429") || errorMsg.includes("quota") || errorMsg.includes("rate limit")) {
+      console.error("[Test-Prioritizer] 🚨 QUOTA EXCEEDED or RATE LIMITED detected");
+    }
+    if (errorMsg.includes("403") || errorMsg.includes("unauthorized") || errorMsg.includes("permission")) {
+      console.error("[Test-Prioritizer] 🚨 AUTHENTICATION/PERMISSION ERROR detected");
+    }
+    if (errorMsg.includes("fetch failed") || errorMsg.includes("Network error")) {
+      console.error("[Test-Prioritizer] 🚨 NETWORK ERROR detected - check connectivity");
+    }
+    
+    throw error;
+  }
 }
 
 // ======================================================
