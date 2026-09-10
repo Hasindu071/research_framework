@@ -118,6 +118,44 @@ const CONFIG_ERROR_PATTERNS = [
 // ======================================================
 
 /**
+ * Rewrite relative import paths from the original test directory to the generated test directory.
+ * 
+ * Example:
+ * - Original test at: apps/admin/src/editor/card-config.test.ts
+ * - Generated test at: apps/admin/src/editor/__generated__/generated_xxx.test.ts
+ * - Original import: import { foo } from './card-config'
+ * - Rewritten import: import { foo } from '../card-config'
+ */
+function rewriteRelativeImports(
+  content: string,
+  originalTestPath: string,
+  generatedTestPath: string
+): string {
+  const originalTestDir = path.dirname(originalTestPath);
+  const generatedTestDir = path.dirname(generatedTestPath);
+
+  return content.replace(
+    /((?:from\s+|import\s*)['"])(\.{1,2}\/[^'"]+)(['"])/g,
+    (match, prefix, importPath, suffix) => {
+      const absoluteTarget = path.resolve(originalTestDir, importPath);
+      let newRelativePath = path.relative(generatedTestDir, absoluteTarget);
+      
+      // Convert Windows backslashes to forward slashes for TypeScript/ESM
+      newRelativePath = newRelativePath.replace(/\\/g, "/");
+      
+      // Ensure it starts with ./ or ../
+      if (!newRelativePath.startsWith("./") && !newRelativePath.startsWith("../")) {
+        newRelativePath = "./" + newRelativePath;
+      }
+      
+      console.log(`[Import-Rewrite] ${importPath} -> ${newRelativePath}`);
+      
+      return `${prefix}${newRelativePath}${suffix}`;
+    }
+  );
+}
+
+/**
  * Takes a generated test code snippet and materializes it into a real test file.
  * Strategy: copy the target test file, append the generated test to it,
  * write to a __generated__/ subdirectory beside the original test file,
@@ -154,8 +192,15 @@ function materializeGeneratedTest(
   fs.mkdirSync(generatedDir, { recursive: true });
   const tempPath = path.join(generatedDir, tempFileName);
 
+  // Rewrite imports based on the new generated test location
+  const rewrittenContent = rewriteRelativeImports(
+    originalContent,
+    originalPath,
+    tempPath
+  );
+
   // Append the generated test to the original file content
-  const combined = `${originalContent}\n\n// ============ GENERATED TEST ============\n${generated.testCode}\n`;
+  const combined = `${rewrittenContent}\n\n// ============ GENERATED TEST ============\n${generated.testCode}\n`;
 
   fs.writeFileSync(tempPath, combined, "utf8");
 

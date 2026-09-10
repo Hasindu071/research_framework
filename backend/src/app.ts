@@ -160,53 +160,11 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     }
 
     if (!prioritizationResult.tests || prioritizationResult.tests.length === 0) {
-      console.log("[Step 3/5] No tests to prioritize, returning early");
-      // Even with no prioritized tests, run gap analysis for audit purposes
-      console.log("[Step 4/5] Building gap analyses anyway for audit...");
-      const { gapAnalyses } = buildGenerationTargets(
-        [],
-        llmContext,
-        analysis.rawDiff,
-        { topN: 5 }
-      );
-      return res.json({
-        success: true,
-        commit: {
-          hash: analysis.commit.hash,
-          message: analysis.commit.message,
-          author: analysis.commit.author,
-          date: analysis.commit.date,
-        },
-        analysis: {
-          filesChanged: analysis.summary.filesChanged,
-          totalInsertions: analysis.summary.totalInsertions,
-          totalDeletions: analysis.summary.totalDeletions,
-          changedSymbols: llmContext.changedSymbols,
-          candidateTests: prioritizationResult.tests,
-        },
-        prioritization: {
-          candidateTests: llmContext.candidateTests.length,
-          prioritizedTests: prioritizationResult.tests,
-        },
-        gapAnalysis: {
-          results: gapAnalyses,
-          summary: {
-            analyzedSymbols: gapAnalyses.length,
-            totalChangedBehaviors: gapAnalyses.reduce((sum, g) => sum + g.changedBehaviors.length, 0),
-            totalVerifiedGaps: gapAnalyses.reduce((sum, g) => sum + g.coverageGaps.length, 0),
-          },
-          rawDiff: analysis.rawDiff,
-        },
-        generation: {
-          results: [],
-          summary: {
-            targetCount: 0,
-            generatedCount: 0,
-            failedCount: 0,
-            successRate: 0,
-          },
-        },
-      });
+      console.log("[Step 3/5] No tests to prioritize, continuing with gap analysis...");
+      
+      // Continue to gap analysis even with no prioritized tests
+    } else {
+      console.log(`[Step 3/5] ✓ Prioritized ${prioritizationResult.tests.length} tests`);
     }
 
     // ========================================
@@ -252,6 +210,41 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     }
 
     // ========================================
+    // Step 5.5: Run prioritized existing tests
+    // ========================================
+    console.log("[Step 5.5/6] Running prioritized existing tests...");
+
+    const prioritizedTestInputs = prioritizationResult.tests.map((test: any) => ({
+      testFile: test.testFile,
+      priority: test.priority,
+    }));
+
+    let prioritizedExecution: { testExecution: any[]; stoppedEarly: boolean } = {
+      testExecution: [],
+      stoppedEarly: false,
+    };
+
+    if (prioritizedTestInputs.length > 0) {
+      prioritizedExecution = await runPrioritizedTests(prioritizedTestInputs, {
+        repositoryRoot: repositoryPath,
+        stopOnFailure: false,
+        timeoutMs: 120_000,
+        keepGeneratedTests: false,
+      });
+
+      const prioritizedPassed = prioritizedExecution.testExecution.filter(
+        (r: any) => r.status === "passed"
+      ).length;
+      const prioritizedFailed = prioritizedExecution.testExecution.filter(
+        (r: any) => r.status === "failed"
+      ).length;
+
+      console.log(
+        `[Step 5.5/6] ✓ Executed ${prioritizedExecution.testExecution.length} prioritized test(s): ${prioritizedPassed} passed, ${prioritizedFailed} failed`
+      );
+    }
+
+    // ========================================
     // Step 6: Materialize and execute generated tests
     // ========================================
     console.log("[Step 6/6] Executing generated test cases...");
@@ -276,21 +269,28 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       `[Step 6/6] Prepared ${generatedTestInputs.length} generated test(s) for execution`
     );
 
-    let executionResult: { testExecution: any[]; stoppedEarly: boolean } = {
+    let generatedExecution: { testExecution: any[]; stoppedEarly: boolean } = {
       testExecution: [],
       stoppedEarly: false,
     };
 
     if (generatedTestInputs.length > 0) {
-      executionResult = await runPrioritizedTests(generatedTestInputs, {
+      generatedExecution = await runPrioritizedTests(generatedTestInputs, {
         repositoryRoot: repositoryPath,
         stopOnFailure: false,
         timeoutMs: 120_000,  // 2 min timeout (accounts for monorepo startup time)
         keepGeneratedTests: true,  // Keep files for inspection
       });
 
+      const generatedPassed = generatedExecution.testExecution.filter(
+        (r: any) => r.status === "passed"
+      ).length;
+      const generatedFailed = generatedExecution.testExecution.filter(
+        (r: any) => r.status === "failed"
+      ).length;
+
       console.log(
-        `[Step 6/6] ✓ Executed ${executionResult.testExecution.length} generated test(s)`
+        `[Step 6/6] ✓ Executed ${generatedExecution.testExecution.length} generated test(s): ${generatedPassed} passed, ${generatedFailed} failed`
       );
     }
 
@@ -307,6 +307,37 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
 
     console.log("========================================");
     console.log("Full pipeline completed successfully ✓");
+    console.log("========================================");
+    console.log("");
+    console.log("EXISTING TEST RESULTS");
+    console.log("========================================");
+    console.log(
+      `Selected: ${prioritizedTestInputs.length}`
+    );
+    console.log(
+      `Executed: ${prioritizedExecution.testExecution.length}`
+    );
+    console.log(
+      `Passed: ${prioritizedExecution.testExecution.filter((r: any) => r.status === "passed").length}`
+    );
+    console.log(
+      `Failed: ${prioritizedExecution.testExecution.filter((r: any) => r.status === "failed").length}`
+    );
+    console.log("");
+    console.log("GENERATED TEST RESULTS");
+    console.log("========================================");
+    console.log(
+      `Generated: ${generatedCount}`
+    );
+    console.log(
+      `Executed: ${generatedExecution.testExecution.length}`
+    );
+    console.log(
+      `Passed: ${generatedExecution.testExecution.filter((r: any) => r.status === "passed").length}`
+    );
+    console.log(
+      `Failed: ${generatedExecution.testExecution.filter((r: any) => r.status === "failed").length}`
+    );
     console.log("========================================");
 
     res.json({
@@ -350,27 +381,53 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
               : 0,
         },
       },
-      execution: {
-        results: executionResult.testExecution.map((r: any) => ({
+      existingTestExecution: {
+        results: prioritizedExecution.testExecution.map((r: any) => ({
+          testFile: r.testFile,
+          status: r.status,
+          passed: r.status === "passed",
+          failed: r.status === "failed",
+          duration: r.duration,
+          durationMs: Math.round(r.duration * 1000),
+          framework: r.framework,
+          notes: r.notes,
+          error: r.status === "error" ? r.stderr : undefined,
+        })),
+        summary: {
+          selected: prioritizedTestInputs.length,
+          executed: prioritizedExecution.testExecution.length,
+          passed: prioritizedExecution.testExecution.filter((r: any) => r.status === "passed").length,
+          failed: prioritizedExecution.testExecution.filter((r: any) => r.status === "failed").length,
+          errors: prioritizedExecution.testExecution.filter((r: any) => r.status === "error").length,
+          not_found: prioritizedExecution.testExecution.filter((r: any) => r.status === "not_found").length,
+          skipped: prioritizedExecution.testExecution.filter((r: any) => r.status === "skipped").length,
+        },
+        stoppedEarly: prioritizedExecution.stoppedEarly,
+      },
+      generatedTestExecution: {
+        results: generatedExecution.testExecution.map((r: any) => ({
           testFile: r.testFile,
           generatedTestName: r.generatedTestName,
           status: r.status,
           passed: r.status === "passed",
+          failed: r.status === "failed",
           duration: r.duration,
+          durationMs: Math.round(r.duration * 1000),
           framework: r.framework,
           notes: r.notes,
           error: r.status === "error" ? r.stderr : undefined,
           generatedFilePath: r.tempFile,
         })),
         summary: {
-          total: executionResult.testExecution.length,
-          passed: executionResult.testExecution.filter((r: any) => r.status === "passed").length,
-          failed: executionResult.testExecution.filter((r: any) => r.status === "failed").length,
-          errors: executionResult.testExecution.filter((r: any) => r.status === "error").length,
-          not_found: executionResult.testExecution.filter((r: any) => r.status === "not_found").length,
-          skipped: executionResult.testExecution.filter((r: any) => r.status === "skipped").length,
+          generated: generatedCount,
+          executed: generatedExecution.testExecution.length,
+          passed: generatedExecution.testExecution.filter((r: any) => r.status === "passed").length,
+          failed: generatedExecution.testExecution.filter((r: any) => r.status === "failed").length,
+          errors: generatedExecution.testExecution.filter((r: any) => r.status === "error").length,
+          not_found: generatedExecution.testExecution.filter((r: any) => r.status === "not_found").length,
+          skipped: generatedExecution.testExecution.filter((r: any) => r.status === "skipped").length,
         },
-        stoppedEarly: executionResult.stoppedEarly,
+        stoppedEarly: generatedExecution.stoppedEarly,
       },
     });
   } catch (error) {
