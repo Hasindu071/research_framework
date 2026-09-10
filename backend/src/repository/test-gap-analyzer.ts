@@ -200,7 +200,7 @@ function extractFallbackExpr(trimmed: string): FallbackExpr | null {
   return {
     property: m[1],
     sourceExpr: m[2].trim(),
-    operator: m[3] as "??" || "||",
+    operator: (m[3] === "??" ? "??" : "||"),
     fallbackExpr: m[4].trim(),
   };
 }

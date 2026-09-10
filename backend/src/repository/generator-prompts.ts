@@ -23,8 +23,32 @@ Hard rules:
 - Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this."
 - Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
 
-Respond with ONLY a JSON object in this exact shape, and nothing else — no markdown fences, no commentary:
+JSON formatting (CRITICAL):
+Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
 
+WRONG:
+{
+  "testCases": [
+    {
+      "name": "test 1",
+      "testCode": "it('test') { expect(true).toBe(true); }",
+    }
+  ]
+}
+
+RIGHT:
+{
+  "testCases": [
+    {
+      "name": "test 1",
+      "testCode": "it('test') { expect(true).toBe(true); }"
+    }
+  ]
+}
+
+Every array and object must have no comma after its final element. No markdown code fences around the JSON.
+
+Response format (exact shape required):
 {
   "testCases": [
     {

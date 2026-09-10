@@ -37,8 +37,35 @@ Rules:
   generic statement like "this test seems related".
 - "evidence" is a short list of concrete tags supporting the reason
   (e.g. "Direct symbol usage", "Validates pagination behavior").
-- Respond with JSON only, matching this exact shape:
 
+JSON formatting (CRITICAL):
+Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
+
+WRONG:
+{
+  "testPrioritization": {
+    "tests": [
+      {
+        "evidence": ["item1", "item2",]
+      }
+    ]
+  }
+}
+
+RIGHT:
+{
+  "testPrioritization": {
+    "tests": [
+      {
+        "evidence": ["item1", "item2"]
+      }
+    ]
+  }
+}
+
+Every array and object must have no comma after its final element.
+
+Response format (exact shape required):
 {
   "testPrioritization": {
     "tests": [

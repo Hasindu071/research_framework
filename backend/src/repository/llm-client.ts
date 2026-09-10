@@ -155,17 +155,101 @@ export class LLMClient {
     console.log(`[LLM-Client] Text content received (${text.length} characters)`);
 
     try {
-      const parsed = JSON.parse(text) as T;
+      const parsed = parseJsonResponse(text) as T;
       console.log("[LLM-Client] JSON parsing successful ✓");
       return parsed;
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error("[LLM-Client] Failed to parse Gemini response as JSON");
-      console.error(`[LLM-Client] JSON parse error: ${errorMsg}`);
-      console.error(`[LLM-Client] Raw response preview: ${text.substring(0, 200)}...`);
-      throw new Error(
-        `Failed to parse Gemini response as JSON: ${errorMsg}\n---\nRaw response:\n${text}`
-      );
+    } catch (parseError) {
+      const errorMsg = parseError instanceof Error ? parseError.message : String(parseError);
+      console.error("[LLM-Client] ❌ JSON parsing failed, attempting retry with feedback...");
+      
+      // Retry once with an error correction prompt
+      try {
+        return await this.retryWithFeedback(text, errorMsg);
+      } catch (retryError) {
+        const retryMsg = retryError instanceof Error ? retryError.message : String(retryError);
+        console.error("[LLM-Client] ❌ Retry also failed");
+        console.error(`[LLM-Client] Retry error: ${retryMsg}`);
+        throw retryError;
+      }
+    }
+  }
+
+  /**
+   * Retry JSON generation with explicit feedback about what went wrong.
+   * Sends the malformed response and the error back to the model and asks
+   * for corrected valid JSON.
+   */
+  private async retryWithFeedback<T>(malformedText: string, parseErrorMsg: string): Promise<T> {
+    const url = `${process.env.GEMINI_API_KEY ? `${API_BASE}/${this.model}:generateContent?key=${this.apiKey}` : ''}`;
+    
+    const correctionPrompt = `Your previous response had invalid JSON. Error: ${parseErrorMsg}
+
+Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
+
+WRONG:  "evidence": ["item1", "item2",]
+RIGHT:  "evidence": ["item1", "item2"]
+
+Every array and object must have no comma after its final element.
+
+Malformed response was:
+${malformedText.slice(0, 1000)}
+
+Now return ONLY corrected valid JSON:`;
+
+    console.log("[LLM-Client] Sending retry request with error feedback...");
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: "You are a JSON correction assistant. Return ONLY valid JSON." }],
+          },
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: correctionPrompt }],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.1,
+          },
+        }),
+      });
+    } catch (fetchError) {
+      const errorMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      throw new Error(`Retry request failed (network error): ${errorMsg}`);
+    }
+
+    if (!response.ok) {
+      const errorBody = await safeReadText(response);
+      throw new Error(`Retry request failed (${response.status}): ${errorBody}`);
+    }
+
+    let data: GeminiResponse;
+    try {
+      data = (await response.json()) as GeminiResponse;
+    } catch (parseError) {
+      throw parseError;
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      throw new Error("Retry response contained no text content");
+    }
+
+    console.log("[LLM-Client] Retry response received, parsing corrected JSON...");
+
+    try {
+      const parsed = parseJsonResponse(text);
+      console.log("[LLM-Client] ✓ Retry parsing successful");
+      return parsed as unknown as T;
+    } catch (secondError) {
+      const errorMsg = secondError instanceof Error ? secondError.message : String(secondError);
+      throw new Error(`Retry parsing also failed: ${errorMsg}`);
     }
   }
 }
@@ -175,6 +259,55 @@ async function safeReadText(response: Response): Promise<string> {
     return await response.text();
   } catch {
     return "<unreadable response body>";
+  }
+}
+
+/**
+ * Parse JSON with cleanup of common malformations from LLM responses.
+ * Handles:
+ * - Markdown code fences (```json ... ```)
+ * - Trailing commas before closing brackets/braces
+ * - Multi-pass cleanup for cascading comma issues
+ * 
+ * Throws with detailed diagnostics if cleanup doesn't fix the JSON.
+ */
+function parseJsonResponse(text: string): any {
+  let cleaned = text.trim();
+
+  // Strip markdown code fences (```json ... ``` or ``` ... ```)
+  cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  // Remove trailing commas before } or ], allowing whitespace/newlines between
+  cleaned = cleaned.replace(/,(\s*[}\]])/g, "$1");
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (firstError) {
+    // Second pass: sometimes a trailing comma removal cascades and exposes
+    // another trailing comma that the first regex's lookahead already consumed past.
+    // Rare, but cheap to guard against.
+    const secondPass = cleaned.replace(/,(\s*[}\]])/g, "$1");
+    try {
+      return JSON.parse(secondPass);
+    } catch (secondError) {
+      console.error("[LLM-Client] JSON parse failed after cleanup attempts");
+      console.error(
+        "[LLM-Client] Original length:",
+        text.length,
+        "| Cleaned length:",
+        cleaned.length
+      );
+      console.error(
+        "[LLM-Client] First 1000 chars of cleaned text:\n",
+        cleaned.slice(0, 1000)
+      );
+
+      throw new Error(
+        `Failed to parse Gemini response as JSON after cleanup: ${
+          secondError instanceof Error ? secondError.message : String(secondError)
+        }`
+      );
+    }
   }
 }
 

@@ -4,7 +4,7 @@ import { analyzeCommit } from "./repository/analyzer.js";
 import { buildLLMContext } from "./repository/context-builder.js";
 import { LLMClient } from "./repository/llm-client.js";
 import { getPrompts } from "./repository/prompts.js";
-import { runPrioritizedTests, toPrioritizedTestInputs } from "./repository/test-runner.js";
+import { runPrioritizedTests, toPrioritizedTestInputs, type GeneratedTestInput } from "./repository/test-runner.js";
 import { prioritizeTests } from "./repository/test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
 
@@ -252,6 +252,49 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     }
 
     // ========================================
+    // Step 6: Materialize and execute generated tests
+    // ========================================
+    console.log("[Step 6/6] Executing generated test cases...");
+
+    const generatedTestInputs: GeneratedTestInput[] = [];
+
+    for (const result of generationResult.results as any[]) {
+      if (!result.generatedTests) continue;
+
+      for (const generatedTest of result.generatedTests) {
+        generatedTestInputs.push({
+          testFile: result.testFile,  // Correct: from result.testFile, not result.existingTestFile
+          priority: 0,
+          testCode: generatedTest.testCode,
+          testName: generatedTest.name,  // Correct: from .name, not .testName
+          targetSymbol: generatedTest.targetSymbol ?? result.targetSymbol,
+        });
+      }
+    }
+
+    console.log(
+      `[Step 6/6] Prepared ${generatedTestInputs.length} generated test(s) for execution`
+    );
+
+    let executionResult: { testExecution: any[]; stoppedEarly: boolean } = {
+      testExecution: [],
+      stoppedEarly: false,
+    };
+
+    if (generatedTestInputs.length > 0) {
+      executionResult = await runPrioritizedTests(generatedTestInputs, {
+        repositoryRoot: repositoryPath,
+        stopOnFailure: false,
+        timeoutMs: 120_000,  // 2 min timeout (accounts for monorepo startup time)
+        keepGeneratedTests: true,  // Keep files for inspection
+      });
+
+      console.log(
+        `[Step 6/6] ✓ Executed ${executionResult.testExecution.length} generated test(s)`
+      );
+    }
+
+    // ========================================
     // Prepare response
     // ========================================
     const generatedCount = generationResult.results.reduce(
@@ -307,6 +350,28 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
               : 0,
         },
       },
+      execution: {
+        results: executionResult.testExecution.map((r: any) => ({
+          testFile: r.testFile,
+          generatedTestName: r.generatedTestName,
+          status: r.status,
+          passed: r.status === "passed",
+          duration: r.duration,
+          framework: r.framework,
+          notes: r.notes,
+          error: r.status === "error" ? r.stderr : undefined,
+          generatedFilePath: r.tempFile,
+        })),
+        summary: {
+          total: executionResult.testExecution.length,
+          passed: executionResult.testExecution.filter((r: any) => r.status === "passed").length,
+          failed: executionResult.testExecution.filter((r: any) => r.status === "failed").length,
+          errors: executionResult.testExecution.filter((r: any) => r.status === "error").length,
+          not_found: executionResult.testExecution.filter((r: any) => r.status === "not_found").length,
+          skipped: executionResult.testExecution.filter((r: any) => r.status === "skipped").length,
+        },
+        stoppedEarly: executionResult.stoppedEarly,
+      },
     });
   } catch (error) {
     console.error(error);
@@ -321,6 +386,75 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+app.post("/api/run-generated-tests", async (req, res) => {
+  try {
+    const { repositoryPath, generatedTests } = req.body;
+
+    if (!repositoryPath || !generatedTests || !Array.isArray(generatedTests)) {
+      return res.status(400).json({
+        error: "repositoryPath and generatedTests array are required",
+      });
+    }
+
+    console.log(`[Test Execution] Running ${generatedTests.length} generated test(s)...`);
+
+    // Convert to GeneratedTestInput format
+    const inputs = generatedTests.map((test: any) => ({
+      testFile: test.testFile,
+      priority: test.priority || 0,
+      testCode: test.testCode,
+      testName: test.testName || test.name,
+      targetSymbol: test.targetSymbol || "unknown",
+    }));
+
+    // Run the tests with materialization
+    // keepGeneratedTests: true so you can inspect the generated files
+    const results = await runPrioritizedTests(inputs, {
+      repositoryRoot: repositoryPath,
+      stopOnFailure: false,
+      timeoutMs: 120_000, // 2 min timeout (accounts for monorepo startup time)
+      keepGeneratedTests: true,  // Keep files for inspection
+    });
+
+    console.log(`[Test Execution] Completed: ${results.testExecution.length} test(s)`);
+
+    // Calculate statistics
+    const stats = {
+      total: results.testExecution.length,
+      passed: results.testExecution.filter(t => t.status === "passed").length,
+      failed: results.testExecution.filter(t => t.status === "failed").length,
+      errors: results.testExecution.filter(t => t.status === "error").length,
+      not_found: results.testExecution.filter(t => t.status === "not_found").length,
+      skipped: results.testExecution.filter(t => t.status === "skipped").length,
+    };
+
+    res.json({
+      success: true,
+      testExecution: results.testExecution.map(result => ({
+        testFile: result.testFile,
+        generatedTestName: result.generatedTestName,
+        status: result.status,
+        passed: result.status === "passed",
+        duration: result.duration,
+        framework: result.framework,
+        notes: result.notes,
+        error: result.status === "error" ? result.stderr : undefined,
+        generatedFilePath: result.tempFile,  // Include path so you know where to inspect
+      })),
+      summary: stats,
+      stoppedEarly: results.stoppedEarly,
+      note: "Generated test files are preserved in __generated__/ subdirectories for inspection",
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Failed to run generated tests",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.post("/api/analyze-and-run", async (req, res) => {

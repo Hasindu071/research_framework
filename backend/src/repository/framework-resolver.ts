@@ -707,17 +707,20 @@ function execPrefix(
  * Build the command to actually run a test.
  *
  * IMPORTANT: this assumes the caller will `spawn` with
- * `cwd: resolution.workspaceDir`. The test path argument must therefore be
- * relative to `workspaceDir`, and — when the resolved config lives inside
- * `workspaceDir` — expressed as a path relative to `workspaceDir` too, so
- * we don't re-introduce the repo-root-vs-workspace mismatch.
+ * `cwd: resolution.workspaceDir`. Test path arguments must therefore be
+ * relative to `workspaceDir`.
+ *
+ * When an explicit `targetFileRelativeToWorkspace` is provided, it overrides
+ * the `testPathRelativeToWorkspace` from the resolution. This is used when
+ * running a specific generated test file instead of the whole suite.
  *
  * When the config is workspace/projects-based, we omit --config entirely
  * and let the framework auto-discover from the workspace directory, to avoid
  * triggering root-level project glob validation errors.
  */
 export function buildTestCommand(
-  resolution: FrameworkResolution
+  resolution: FrameworkResolution,
+  targetFileRelativeToWorkspace?: string
 ): { command: string; args: string[] } {
   const {
     framework,
@@ -727,10 +730,13 @@ export function buildTestCommand(
     testPathRelativeToWorkspace,
   } = resolution;
 
+  // Use the override if provided, otherwise fall back to the resolved path
+  const testPath = targetFileRelativeToWorkspace || testPathRelativeToWorkspace;
+
   if (!framework) {
     return packageManager === "unknown"
-      ? { command: "npm", args: ["run", "test", "--", testPathRelativeToWorkspace] }
-      : { command: packageManager, args: ["test", testPathRelativeToWorkspace] };
+      ? { command: "npm", args: ["run", "test", "--", testPath] }
+      : { command: packageManager, args: ["test", testPath] };
   }
 
   // If the config is workspace/projects-based, omit --config and auto-discover
@@ -742,28 +748,28 @@ export function buildTestCommand(
         const base = execPrefix(packageManager, "vitest");
         return {
           command: base.command,
-          args: [...base.args, "run", testPathRelativeToWorkspace],
+          args: [...base.args, "run", testPath],
         };
       }
       case "jest": {
         const base = execPrefix(packageManager, "jest");
         return {
           command: base.command,
-          args: [...base.args, testPathRelativeToWorkspace],
+          args: [...base.args, testPath],
         };
       }
       case "playwright": {
         const base = execPrefix(packageManager, "playwright");
         return {
           command: base.command,
-          args: [...base.args, "test", testPathRelativeToWorkspace],
+          args: [...base.args, "test", testPath],
         };
       }
       case "mocha": {
         const base = execPrefix(packageManager, "mocha");
         return {
           command: base.command,
-          args: [...base.args, testPathRelativeToWorkspace],
+          args: [...base.args, testPath],
         };
       }
     }
@@ -794,28 +800,28 @@ export function buildTestCommand(
       const base = execPrefix(packageManager, "vitest");
       return {
         command: base.command,
-        args: [...base.args, "run", ...configArgs, testPathRelativeToWorkspace],
+        args: [...base.args, "run", ...configArgs, testPath],
       };
     }
     case "jest": {
       const base = execPrefix(packageManager, "jest");
       return {
         command: base.command,
-        args: [...base.args, ...configArgs, testPathRelativeToWorkspace],
+        args: [...base.args, ...configArgs, testPath],
       };
     }
     case "playwright": {
       const base = execPrefix(packageManager, "playwright");
       return {
         command: base.command,
-        args: [...base.args, "test", ...configArgs, testPathRelativeToWorkspace],
+        args: [...base.args, "test", ...configArgs, testPath],
       };
     }
     case "mocha": {
       const base = execPrefix(packageManager, "mocha");
       return {
         command: base.command,
-        args: [...base.args, testPathRelativeToWorkspace],
+        args: [...base.args, testPath],
       };
     }
   }
