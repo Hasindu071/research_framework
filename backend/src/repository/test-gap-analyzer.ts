@@ -132,7 +132,9 @@ export function analyzeCoverageGaps(input: GapAnalysisInput): TestGapAnalysis {
       `[GapAnalyzer] ⚠️ WARNING: Diff extracted (${input.diffText.length} chars) but no behaviors detected. ` +
         `Regex patterns may not match this diff format or structure.`
     );
-    console.warn(`[GapAnalyzer] DEBUG: Raw diffText for "${input.symbol}":\n${input.diffText}`);
+    console.warn(`[GapAnalyzer] DEBUG: Raw diffText for "${input.symbol}":\n${input.diffText.substring(0, 500)}`);
+    const addedLines = getAddedLines(input.diffText);
+    console.warn(`[GapAnalyzer] DEBUG: Added lines (${addedLines.length}): ${JSON.stringify(addedLines.slice(0, 10))}`);
   }
 
   if (fallbackBehaviors.length > 0 && coverageGaps.length === 0) {
@@ -188,11 +190,17 @@ interface FallbackExpr {
 
 function extractFallbackExpr(trimmed: string): FallbackExpr | null {
   const m = FALLBACK_ASSIGNMENT_PATTERN.exec(trimmed);
-  if (!m || !m[1] || !m[2] || !m[3] || !m[4]) return null;
+  if (!m || !m[1] || !m[2] || !m[3] || !m[4]) {
+    // Log lines that might be property assignments with ?? or || for debugging
+    if ((trimmed.includes("??") || trimmed.includes("||")) && /^\w/.test(trimmed)) {
+      console.log(`[GapAnalyzer-Fallback] Line contains ?? or || but didn't match regex: "${trimmed}"`);
+    }
+    return null;
+  }
   return {
     property: m[1],
     sourceExpr: m[2].trim(),
-    operator: m[3] as "??" | "||",
+    operator: m[3] as "??" || "||",
     fallbackExpr: m[4].trim(),
   };
 }
@@ -288,6 +296,13 @@ function extractFallbackBehaviors(
   const addedLines = getAddedLines(diffText);
   const behaviors: ChangedBehavior[] = [];
 
+  console.log(
+    `[GapAnalyzer-Fallback] Processing ${addedLines.length} added lines for symbol "${symbolName}"`
+  );
+  if (addedLines.length > 0) {
+    console.log(`[GapAnalyzer-Fallback] Added lines: ${JSON.stringify(addedLines.slice(0, 5))}`);
+  }
+
   for (const line of addedLines) {
     const fb = extractFallbackExpr(line);
     if (!fb) continue;
@@ -375,11 +390,18 @@ const ERROR_HANDLING_PATTERNS: RegExp[] = [/\btry\s*{/, /\bcatch\s*\(/, /\bthrow
 const PARAM_PATTERN = /\bfunction\s+\w+\s*\(([^)]*)\)|=>\s*\(?([^)=]*)\)?\s*=>?/;
 
 function getAddedLines(diffText: string): string[] {
-  return diffText
-    .split("\n")
-    .map((line) => ADDED_LINE.exec(line)?.[1])
-    .filter((line): line is string => typeof line === "string" && line.trim().length > 0)
-    .map((line) => line.trim());
+  const addedPattern = /^\+(?!\+\+)(.*)$/gm;
+  const results: string[] = [];
+  let match: RegExpExecArray | null;
+  
+  while ((match = addedPattern.exec(diffText)) !== null) {
+    const line = match[1]?.trim();
+    if (line && line.length > 0) {
+      results.push(line);
+    }
+  }
+  
+  return results;
 }
 
 function extractLexicalBehaviors(diffText: string): ChangedBehavior[] {
@@ -493,6 +515,8 @@ function extractFileDiffFromRaw(rawDiff: string, targetFile: string): string {
   const headerMatch = headerPattern.exec(rawDiff);
   if (!headerMatch) {
     console.warn(`[GapAnalyzer] Could not find diff section for "${targetFile}" in rawDiff.`);
+    console.warn(`[GapAnalyzer] DEBUG: First 500 chars of rawDiff:\n${rawDiff.substring(0, 500)}`);
+    console.warn(`[GapAnalyzer] DEBUG: Pattern used: ${headerPattern.source}`);
     return "";
   }
 
@@ -502,7 +526,9 @@ function extractFileDiffFromRaw(rawDiff: string, targetFile: string): string {
 
   const endIdx = nextFileMatch ? startIdx + headerMatch[0].length + nextFileMatch.index : rawDiff.length;
 
-  return rawDiff.slice(startIdx, endIdx);
+  const extracted = rawDiff.slice(startIdx, endIdx);
+  console.log(`[GapAnalyzer-Extract] Found header for "${targetFile}" at index ${startIdx}, extracted ${extracted.length} chars`);
+  return extracted;
 }
 
 /**
