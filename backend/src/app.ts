@@ -5,6 +5,8 @@ import { buildLLMContext } from "./repository/context-builder.js";
 import { LLMClient } from "./repository/llm-client.js";
 import { getPrompts } from "./repository/prompts.js";
 import { runPrioritizedTests, toPrioritizedTestInputs } from "./repository/test-runner.js";
+import { prioritizeTests } from "./repository/test-prioritizer.js";
+import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
 
 const app = express();
 
@@ -109,6 +111,209 @@ app.post("/api/analyze-commit", async (req, res) => {
       details: error instanceof Error
         ? error.message
         : String(error),
+    });
+  }
+});
+
+app.post("/api/analyze-prioritize-generate", async (req, res) => {
+  try {
+    const { repositoryPath, commitHash } = req.body;
+
+    if (!repositoryPath || !commitHash) {
+      return res.status(400).json({
+        error: "repositoryPath and commitHash are required",
+      });
+    }
+
+    // ========================================
+    // Step 1: Analyze commit
+    // ========================================
+    console.log("[Step 1/5] Analyzing commit...");
+    const analysis = await analyzeCommit(repositoryPath, commitHash);
+    console.log(`[Step 1/5] ✓ Found ${analysis.summary.filesChanged} changed files`);
+
+    // ========================================
+    // Step 2: Build LLM context
+    // ========================================
+    console.log("[Step 2/5] Building LLM context...");
+    const llmContext = buildLLMContext(analysis, repositoryPath);
+    console.log(`[Step 2/5] ✓ Context built with ${llmContext.candidateTests.length} candidate tests`);
+
+    const llmClient = new LLMClient();
+
+    // ========================================
+    // Step 3: Prioritize tests
+    // ========================================
+    console.log("[Step 3/5] Prioritizing candidate tests with LLM...");
+    let prioritizationResult: any;
+
+    try {
+      prioritizationResult = await prioritizeTests(llmContext, llmClient);
+      console.log(`[Step 3/5] ✓ Prioritized ${prioritizationResult.tests.length} tests`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[Step 3/5] ❌ Prioritization failed: ${msg}`);
+      return res.status(500).json({
+        error: "Test prioritization failed",
+        details: msg,
+      });
+    }
+
+    if (!prioritizationResult.tests || prioritizationResult.tests.length === 0) {
+      console.log("[Step 3/5] No tests to prioritize, returning early");
+      // Even with no prioritized tests, run gap analysis for audit purposes
+      console.log("[Step 4/5] Building gap analyses anyway for audit...");
+      const { gapAnalyses } = buildGenerationTargets(
+        [],
+        llmContext,
+        analysis.rawDiff,
+        { topN: 5 }
+      );
+      return res.json({
+        success: true,
+        commit: {
+          hash: analysis.commit.hash,
+          message: analysis.commit.message,
+          author: analysis.commit.author,
+          date: analysis.commit.date,
+        },
+        analysis: {
+          filesChanged: analysis.summary.filesChanged,
+          totalInsertions: analysis.summary.totalInsertions,
+          totalDeletions: analysis.summary.totalDeletions,
+          changedSymbols: llmContext.changedSymbols,
+          candidateTests: prioritizationResult.tests,
+        },
+        prioritization: {
+          candidateTests: llmContext.candidateTests.length,
+          prioritizedTests: prioritizationResult.tests,
+        },
+        gapAnalysis: {
+          results: gapAnalyses,
+          summary: {
+            analyzedSymbols: gapAnalyses.length,
+            totalChangedBehaviors: gapAnalyses.reduce((sum, g) => sum + g.changedBehaviors.length, 0),
+            totalVerifiedGaps: gapAnalyses.reduce((sum, g) => sum + g.coverageGaps.length, 0),
+          },
+          rawDiff: analysis.rawDiff,
+        },
+        generation: {
+          results: [],
+          summary: {
+            targetCount: 0,
+            generatedCount: 0,
+            failedCount: 0,
+            successRate: 0,
+          },
+        },
+      });
+    }
+
+    // ========================================
+    // Step 4: Build generation targets
+    // ========================================
+    console.log("[Step 4/5] Building generation targets...");
+    const { targets: generationTargets, gapAnalyses } = buildGenerationTargets(
+      prioritizationResult.tests,
+      llmContext,
+      analysis.rawDiff,
+      { topN: 5 }
+    );
+    console.log(`[Step 4/5] ✓ Built ${generationTargets.length} generation target(s) from ${gapAnalyses.length} analyzed symbol(s)`);
+
+    let generationResult: any = { results: [] };
+
+    if (generationTargets.length > 0) {
+      // ========================================
+      // Step 5: Generate tests
+      // ========================================
+      console.log("[Step 5/5] Generating test cases with LLM...");
+
+      try {
+        generationResult = await generateTests(generationTargets, llmClient);
+        const generatedCount = generationResult.results.reduce(
+          (sum: number, r: any) => sum + (r.generatedTests?.length ?? 0),
+          0
+        );
+        const failedCount = generationResult.results.filter(
+          (r: any) => r.error
+        ).length;
+        console.log(`[Step 5/5] ✓ Generated ${generatedCount} test cases (${failedCount} failed targets)`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[Step 5/5] ❌ Generation failed: ${msg}`);
+        return res.status(500).json({
+          error: "Test generation failed",
+          details: msg,
+        });
+      }
+    } else {
+      console.log("[Step 5/5] No generation targets, skipping generation");
+    }
+
+    // ========================================
+    // Prepare response
+    // ========================================
+    const generatedCount = generationResult.results.reduce(
+      (sum: number, r: any) => sum + (r.generatedTests?.length ?? 0),
+      0
+    );
+    const failedCount = generationResult.results.filter(
+      (r: any) => r.error
+    ).length;
+
+    console.log("========================================");
+    console.log("Full pipeline completed successfully ✓");
+    console.log("========================================");
+
+    res.json({
+      success: true,
+      commit: {
+        hash: analysis.commit.hash,
+        message: analysis.commit.message,
+        author: analysis.commit.author,
+        date: analysis.commit.date,
+      },
+      analysis: {
+        filesChanged: analysis.summary.filesChanged,
+        totalInsertions: analysis.summary.totalInsertions,
+        totalDeletions: analysis.summary.totalDeletions,
+        changedSymbols: llmContext.changedSymbols,
+      },
+      prioritization: {
+        candidateTests: llmContext.candidateTests.length,
+        prioritizedTests: prioritizationResult.tests,
+      },
+      gapAnalysis: {
+        results: gapAnalyses,
+        summary: {
+          analyzedSymbols: gapAnalyses.length,
+          totalChangedBehaviors: gapAnalyses.reduce((sum, g) => sum + g.changedBehaviors.length, 0),
+          totalVerifiedGaps: gapAnalyses.reduce((sum, g) => sum + g.coverageGaps.length, 0),
+        },
+        rawDiff: analysis.rawDiff,
+      },
+      generation: {
+        results: generationResult.results,
+        summary: {
+          targetCount: generationTargets.length,
+          generatedCount,
+          failedCount,
+          successRate:
+            generationTargets.length > 0
+              ? (((generationTargets.length - failedCount) /
+                  generationTargets.length) *
+                100).toFixed(1)
+              : 0,
+        },
+      },
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Failed to analyze, prioritize, and generate tests",
+      details: error instanceof Error ? error.message : String(error),
     });
   }
 });
