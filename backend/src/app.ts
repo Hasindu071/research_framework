@@ -254,6 +254,11 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     for (const result of generationResult.results as any[]) {
       if (!result.generatedTests) continue;
 
+      // Find the corresponding generation target to get sourceFile and isNewTestFile
+      const target = generationTargets.find(
+        (t) => t.symbol === result.targetSymbol
+      );
+
       for (const generatedTest of result.generatedTests) {
         generatedTestInputs.push({
           testFile: result.testFile,  // Correct: from result.testFile, not result.existingTestFile
@@ -261,6 +266,8 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
           testCode: generatedTest.testCode,
           testName: generatedTest.name,  // Correct: from .name, not .testName
           targetSymbol: generatedTest.targetSymbol ?? result.targetSymbol,
+          sourceFile: target?.sourceFile ?? "",  // From the generation target
+          isNewTestFile: target?.isNewTestFile ?? false,  // From the generation target
         });
       }
     }
@@ -431,7 +438,6 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
           framework: r.framework,
           notes: r.notes,
           error: r.status === "error" ? r.stderr : undefined,
-          generatedFilePath: r.tempFile,
         })),
         verdicts: generatedExecution.testExecution.map((r: any) => ({
           name: r.generatedTestName,
@@ -519,7 +525,6 @@ app.post("/api/run-generated-tests", async (req, res) => {
         framework: result.framework,
         notes: result.notes,
         error: result.status === "error" ? result.stderr : undefined,
-        generatedFilePath: result.tempFile,  // Include path so you know where to inspect
       })),
       summary: stats,
       stoppedEarly: results.stoppedEarly,

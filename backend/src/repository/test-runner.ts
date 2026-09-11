@@ -8,6 +8,11 @@ import {
   buildTestCommand,
   type FrameworkResolution,
 } from "./framework-resolver.js";
+import {
+  mergeGeneratedTests,
+  revertMerge,
+  type MergeResult,
+} from "./test-file-writer.js";
 
 // ======================================================
 // TYPES
@@ -31,6 +36,11 @@ export interface GeneratedTestInput extends PrioritizedTestInput {
   testName: string;
   /** The symbol this test was generated for. */
   targetSymbol: string;
+  /** Repo-relative path of the source file the test targets — needed to
+   * build the import statement if `testFile` doesn't exist yet. */
+  sourceFile: string;
+  /** True if `testFile` doesn't exist yet and must be scaffolded from scratch. */
+  isNewTestFile: boolean;
 }
 
 export interface TestExecutionResult {
@@ -52,8 +62,12 @@ export interface TestExecutionResult {
   generated?: boolean;
   /** The generated test name (if generated). */
   generatedTestName?: string;
-  /** Path to temporary file if materialized (for cleanup). */
-  tempFile?: string;
+  /**
+   * True if the generated test(s) were left merged into the real test file
+   * after this run (i.e. status was "passed", or keepGeneratedTests was
+   * set). False means the file was reverted to its pre-merge state.
+   */
+  keptInTestFile?: boolean;
 }
 
 export interface TestRunnerOptions {
@@ -72,8 +86,11 @@ export interface TestRunnerOptions {
   /** Per-test kill timeout, in ms. Default 2 minutes. */
   timeoutMs?: number;
   /**
-   * Keep materialized generated-test files on disk instead of deleting them
-   * after the run. Useful for debugging. Default: false.
+   * Keep a generated test merged into the real test file even if it didn't
+   * pass. Useful for debugging a failing generation. Default: false — a
+   * generated test that fails or errors is reverted out of the real file
+   * so the repository is never left with a broken/red generated test.
+   * Generated tests that pass are always kept, regardless of this flag.
    */
   keepGeneratedTests?: boolean;
 }
@@ -112,106 +129,6 @@ const CONFIG_ERROR_PATTERNS = [
   /Error: Can't resolve config/i,
   /Invalid config/i,
 ];
-
-// ======================================================
-// MATERIALIZE GENERATED TESTS
-// ======================================================
-
-/**
- * Rewrite relative import paths from the original test directory to the generated test directory.
- * 
- * Example:
- * - Original test at: apps/admin/src/editor/card-config.test.ts
- * - Generated test at: apps/admin/src/editor/__generated__/generated_xxx.test.ts
- * - Original import: import { foo } from './card-config'
- * - Rewritten import: import { foo } from '../card-config'
- */
-function rewriteRelativeImports(
-  content: string,
-  originalTestPath: string,
-  generatedTestPath: string
-): string {
-  const originalTestDir = path.dirname(originalTestPath);
-  const generatedTestDir = path.dirname(generatedTestPath);
-
-  return content.replace(
-    /((?:from\s+|import\s*)['"])(\.{1,2}\/[^'"]+)(['"])/g,
-    (match, prefix, importPath, suffix) => {
-      const absoluteTarget = path.resolve(originalTestDir, importPath);
-      let newRelativePath = path.relative(generatedTestDir, absoluteTarget);
-      
-      // Convert Windows backslashes to forward slashes for TypeScript/ESM
-      newRelativePath = newRelativePath.replace(/\\/g, "/");
-      
-      // Ensure it starts with ./ or ../
-      if (!newRelativePath.startsWith("./") && !newRelativePath.startsWith("../")) {
-        newRelativePath = "./" + newRelativePath;
-      }
-      
-      console.log(`[Import-Rewrite] ${importPath} -> ${newRelativePath}`);
-      
-      return `${prefix}${newRelativePath}${suffix}`;
-    }
-  );
-}
-
-/**
- * Takes a generated test code snippet and materializes it into a real test file.
- * Strategy: copy the target test file, append the generated test to it,
- * write to a __generated__/ subdirectory beside the original test file,
- * then execute.
- *
- * Returns the absolute path to the temporary test file so it can be
- * cleaned up after execution. The __generated__/ directory stays on disk
- * (for debris inspection if keepGeneratedTests is true); this function just
- * creates the specific file.
- *
- * Returns the temporary file path so it can be cleaned up after execution.
- */
-function materializeGeneratedTest(
-  generated: GeneratedTestInput,
-  options: TestRunnerOptions
-): string {
-  const originalPath = path.resolve(options.repositoryRoot, generated.testFile);
-
-  if (!fs.existsSync(originalPath)) {
-    throw new Error(`Cannot materialize: original test file not found: ${originalPath}`);
-  }
-
-  const originalContent = fs.readFileSync(originalPath, "utf8");
-
-  // Generate a unique temp filename with context
-  const timestamp = Date.now();
-  const safe = generated.testName.replace(/[^a-z0-9]/gi, "_").slice(0, 30);
-  const tempFileName = `generated_${timestamp}_${safe}.test.ts`;
-
-  // Write it in a __generated__/ subdirectory beside the original test file.
-  // This keeps it in the same directory tree (so relative imports still resolve)
-  // but all in one place (easy to .gitignore, easy to clean if needed).
-  const generatedDir = path.join(path.dirname(originalPath), "__generated__");
-  fs.mkdirSync(generatedDir, { recursive: true });
-  const tempPath = path.join(generatedDir, tempFileName);
-
-  // Rewrite imports based on the new generated test location
-  const rewrittenContent = rewriteRelativeImports(
-    originalContent,
-    originalPath,
-    tempPath
-  );
-
-  // Append the generated test to the original file content
-  const combined = `${rewrittenContent}\n\n// ============ GENERATED TEST ============\n${generated.testCode}\n`;
-
-  fs.writeFileSync(tempPath, combined, "utf8");
-
-  console.log("========================================");
-  console.log("[Generated Test] FILE CREATED");
-  console.log("[Generated Test] Path:", tempPath);
-  console.log("[Generated Test] Exists:", fs.existsSync(tempPath));
-  console.log("========================================");
-
-  return tempPath;
-}
 
 function detectNoTestsExecuted(
   framework: TestFramework | null,
@@ -341,27 +258,37 @@ async function runSingleTest(
 }
 
 /**
- * Execute a generated test: materialize it and run it.
- * The generated file is deleted only when keepGeneratedTests is false.
+ * Execute a generated test.
+ *
+ * Unlike the previous implementation, this does NOT materialize the
+ * generated test into a disposable `__generated__/generated_*.test.ts`
+ * copy. Instead it merges the generated `it()` block(s) directly into the
+ * real, related test file (via mergeGeneratedTests — extending it if it
+ * exists, scaffolding it if it doesn't), runs that real file in place, and:
+ *   - keeps the merge if the test passed (or keepGeneratedTests is set)
+ *   - reverts the merge (restoring the original file, or deleting a newly
+ *     created one) if the test failed/errored and keepGeneratedTests is not
+ *     set — so a broken generated test never lingers in the repository.
  */
 async function runGeneratedTest(
   generated: GeneratedTestInput,
   options: TestRunnerOptions
 ): Promise<TestExecutionResult> {
-  let tempPath: string | undefined;
+  let merge: MergeResult | undefined;
 
   try {
-    // Materialize: copy original + append generated test code
-    tempPath = materializeGeneratedTest(generated, options);
-
-    // The temp file is now at tempPath, but we need it relative to repositoryRoot
-    // for framework resolution. Since temp files are in /tmp, we need special handling.
-    const resolution = resolveFramework(
-      generated.testFile, // Use original file for framework detection
-      options.repositoryRoot
+    merge = mergeGeneratedTests(
+      options.repositoryRoot,
+      generated.testFile,
+      generated.isNewTestFile,
+      generated.sourceFile,
+      [{ name: generated.testName, testCode: generated.testCode }]
     );
 
+    const resolution = resolveFrameworkForMergedFile(generated, options);
+
     if (!resolution.framework) {
+      maybeRevert(merge, "not_found_no_framework", options);
       return {
         testFile: generated.testFile,
         priority: generated.priority,
@@ -376,12 +303,12 @@ async function runGeneratedTest(
         resolution,
         generated: true,
         generatedTestName: generated.testName,
-        tempFile: tempPath,
+        keptInTestFile: !!options.keepGeneratedTests,
       };
     }
 
-    // Check if framework is installed
     if (!isFrameworkInstalled(resolution.framework, resolution.workspaceDir)) {
+      maybeRevert(merge, "framework_missing", options);
       return {
         testFile: generated.testFile,
         priority: generated.priority,
@@ -396,12 +323,17 @@ async function runGeneratedTest(
         resolution,
         generated: true,
         generatedTestName: generated.testName,
-        tempFile: tempPath,
+        keptInTestFile: !!options.keepGeneratedTests,
       };
     }
 
-    // Execute the temp file using the same framework
-    const result = await executeTestFile(tempPath, resolution, options);
+    const result = await executeTestFile(merge.testFileAbsolute, resolution, options);
+
+    const keep = result.status === "passed" || !!options.keepGeneratedTests;
+
+    if (!keep) {
+      revertMerge(merge);
+    }
 
     return {
       ...result,
@@ -409,14 +341,18 @@ async function runGeneratedTest(
       priority: generated.priority,
       generated: true,
       generatedTestName: generated.testName,
-      tempFile: tempPath,
+      keptInTestFile: keep,
     } as TestExecutionResult;
   } catch (error) {
+    if (merge && !options.keepGeneratedTests) {
+      revertMerge(merge);
+    }
+
     return {
       testFile: generated.testFile,
       priority: generated.priority,
       framework: null,
-      command: "[FAILED] could not materialize generated test",
+      command: "[FAILED] could not merge/execute generated test",
       status: "error",
       duration: 0,
       exitCode: null,
@@ -424,18 +360,33 @@ async function runGeneratedTest(
       stderr: `${error instanceof Error ? error.message : String(error)}`,
       generated: true,
       generatedTestName: generated.testName,
-      tempFile: tempPath,
+      keptInTestFile: merge ? !!options.keepGeneratedTests : false,
     } as TestExecutionResult;
-  } finally {
-    // Clean up temp file unless keepGeneratedTests is enabled
-    if (tempPath && !options.keepGeneratedTests && fs.existsSync(tempPath)) {
-      try {
-        fs.unlinkSync(tempPath);
-      } catch (e) {
-        // Ignore cleanup errors
-      }
-    }
   }
+}
+
+function maybeRevert(
+  merge: MergeResult,
+  _reason: string,
+  options: TestRunnerOptions
+): void {
+  if (!options.keepGeneratedTests) {
+    revertMerge(merge);
+  }
+}
+
+/**
+ * Framework resolution is based on the test file's path/config, which is
+ * unaffected by merging generated content into it — so we can resolve
+ * against `generated.testFile` even for a brand-new file (the resolver
+ * walks up from the file's directory to find config, same as any other
+ * file in that location would).
+ */
+function resolveFrameworkForMergedFile(
+  generated: GeneratedTestInput,
+  options: TestRunnerOptions
+): FrameworkResolution {
+  return resolveFramework(generated.testFile, options.repositoryRoot);
 }
 
 /**
@@ -507,11 +458,11 @@ async function runExistingTest(
 
 /**
  * Core test execution: spawn the framework command and capture results.
- * 
- * `testFilePath` is an absolute path to the test file to run. It will be
- * converted to a path relative to `resolution.workspaceDir` before passing
- * to `buildTestCommand`, so that the framework runs it correctly regardless
- * of whether it's a regular test file or a generated one in __generated__/.
+ *
+ * `testFilePath` is an absolute path to the test file to run — either a
+ * pre-existing file, or the real file a generated test was just merged
+ * into. It will be converted to a path relative to
+ * `resolution.workspaceDir` before passing to `buildTestCommand`.
  */
 async function executeTestFile(
   testFilePath: string,

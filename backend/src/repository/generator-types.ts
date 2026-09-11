@@ -29,6 +29,8 @@ export interface TestGenerationTarget {
   framework: string;
   /** Optional extra static-analysis context: prioritizer evidence, related symbols, etc. */
   notes?: string[];
+  /** True if no related test file was found and must be created from scratch. */
+  isNewTestFile: boolean;
   /**
    * The verified, not-covered cases the LLM must generate tests for —
    * and ONLY these. Populated exclusively from Tier-1 (fallback) analysis;
