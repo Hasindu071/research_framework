@@ -282,16 +282,31 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
         keepGeneratedTests: true,  // Keep files for inspection
       });
 
-      const generatedPassed = generatedExecution.testExecution.filter(
-        (r: any) => r.status === "passed"
-      ).length;
-      const generatedFailed = generatedExecution.testExecution.filter(
-        (r: any) => r.status === "failed"
-      ).length;
+      // Calculate full breakdown instead of hiding other buckets
+      const genSummary = {
+        passed: generatedExecution.testExecution.filter((r: any) => r.status === "passed").length,
+        failed: generatedExecution.testExecution.filter((r: any) => r.status === "failed").length,
+        errors: generatedExecution.testExecution.filter((r: any) => r.status === "error").length,
+        not_found: generatedExecution.testExecution.filter((r: any) => r.status === "not_found").length,
+        skipped: generatedExecution.testExecution.filter((r: any) => r.status === "skipped").length,
+      };
 
       console.log(
-        `[Step 6/6] ✓ Executed ${generatedExecution.testExecution.length} generated test(s): ${generatedPassed} passed, ${generatedFailed} failed`
+        `[Step 6/6] ✓ Executed ${generatedExecution.testExecution.length} generated test(s): ` +
+        `${genSummary.passed} passed, ${genSummary.failed} failed, ${genSummary.errors} errors, ` +
+        `${genSummary.not_found} not_found, ${genSummary.skipped} skipped`
       );
+
+      // Per-test verdict, matching the format you want to see
+      for (const r of generatedExecution.testExecution as any[]) {
+        const icon = r.status === "passed" ? "✓" : r.status === "failed" ? "✗" : "⚠";
+        console.log(`[Generated Test] ${r.generatedTestName}`);
+        console.log(`  ${icon} ${r.status.toUpperCase()} (${r.duration.toFixed(2)}s)`);
+        if (r.status !== "passed") {
+          console.log(`  notes: ${r.notes ?? "(none)"}`);
+          if (r.stderr) console.log(`  stderr (first 500 chars):\n${r.stderr.slice(0, 500)}`);
+        }
+      }
     }
 
     // ========================================
@@ -417,6 +432,12 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
           notes: r.notes,
           error: r.status === "error" ? r.stderr : undefined,
           generatedFilePath: r.tempFile,
+        })),
+        verdicts: generatedExecution.testExecution.map((r: any) => ({
+          name: r.generatedTestName,
+          result: r.status === "passed" ? "PASSED" : r.status === "failed" ? "FAILED" : r.status.toUpperCase(),
+          durationSeconds: r.duration,
+          error: r.status !== "passed" ? (r.notes ?? r.stderr?.slice(0, 500)) : undefined,
         })),
         summary: {
           generated: generatedCount,
