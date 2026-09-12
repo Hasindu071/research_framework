@@ -6,6 +6,7 @@ import path from "path";
 // ======================================================
 
 export type TestFramework = "vitest" | "jest" | "playwright" | "mocha";
+export type PackageManager = "npm" | "yarn" | "pnpm" | "bun" | "unknown";
 
 export interface FrameworkCommand {
   command: string;

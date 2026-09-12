@@ -13,6 +13,7 @@ import {
   revertMerge,
   type MergeResult,
 } from "./test-file-writer.js";
+import type { TestFileContext } from "./test-context-mapper.js";
 
 // ======================================================
 // TYPES
@@ -23,12 +24,10 @@ export type TestStatus = "passed" | "failed" | "error" | "skipped" | "not_found"
 export interface PrioritizedTestInput {
   testFile: string;
   priority: number;
+  /** Optional: the mapped test context. If provided, uses this instead of re-resolving framework. */
+  context?: TestFileContext;
 }
 
-/**
- * A generated test: extends PrioritizedTestInput with the generated test code
- * and metadata about what it tests.
- */
 export interface GeneratedTestInput extends PrioritizedTestInput {
   /** The generated test code (it/describe block). */
   testCode: string;
@@ -239,6 +238,52 @@ export function toPrioritizedTestInputs(
   }));
 }
 
+/**
+ * Enrich test inputs with TestFileContext by running the full test suite
+ * detection and mapping pipeline.
+ *
+ * Generic over T so this works for both PrioritizedTestInput and
+ * GeneratedTestInput (and anything else shaped like PrioritizedTestInput)
+ * WITHOUT dropping extra fields. Previously this function unconditionally
+ * rebuilt a bare {testFile, priority, context} object, which silently
+ * stripped testCode/testName/sourceFile/isNewTestFile off generated test
+ * inputs — causing generated tests to be routed to runExistingTest()
+ * instead of runGeneratedTest(), so they were never merged into disk.
+ */
+export async function enrichTestInputsWithContext<T extends PrioritizedTestInput>(
+  testInputs: T[],
+  repositoryRoot: string
+): Promise<(T & { context?: TestFileContext })[]> {
+  try {
+    const { detectRepositoryTestSuite } = await import("./test-suite-detector.js");
+    const { mapAllTestFiles } = await import("./test-context-mapper.js");
+
+    // Run the full detection + mapping pipeline
+    const profile = detectRepositoryTestSuite(repositoryRoot);
+    const allContexts = mapAllTestFiles(profile);
+
+    // Build a map: testFile → TestFileContext
+    const contextByFile = new Map<string, TestFileContext>();
+    for (const ctx of allContexts) {
+      contextByFile.set(ctx.testFile, ctx);
+    }
+
+    // Enrich each input with its context WITHOUT dropping any of its
+    // existing fields (testCode, testName, sourceFile, isNewTestFile, etc.)
+    return testInputs.map((input) => {
+      const ctx = contextByFile.get(input.testFile);
+      return ctx ? { ...input, context: ctx } : { ...input };
+    });
+  } catch (error) {
+    console.error(
+      "Failed to enrich test inputs with context:",
+      error instanceof Error ? error.message : String(error)
+    );
+    // Graceful fallback: return inputs unchanged, framework resolution falls back to legacy logic
+    return testInputs.map((input) => ({ ...input }));
+  }
+}
+
 // ======================================================
 // RUN A SINGLE TEST
 // ======================================================
@@ -277,6 +322,10 @@ async function runGeneratedTest(
   let merge: MergeResult | undefined;
 
   try {
+    console.log(
+      `[Test-Writer] Writing 1 generated test to ${generated.testFile}`
+    );
+
     merge = mergeGeneratedTests(
       options.repositoryRoot,
       generated.testFile,
@@ -284,6 +333,42 @@ async function runGeneratedTest(
       generated.sourceFile,
       [{ name: generated.testName, testCode: generated.testCode }]
     );
+
+    // Verify the merge actually landed on disk before trusting it enough
+    // to execute. Read the file back rather than trusting the in-memory
+    // MergeResult, since a writer bug could report success without
+    // actually persisting the change.
+    const writtenContent = fs.readFileSync(merge.testFileAbsolute, "utf8");
+    const testNameFound = generated.testName && writtenContent.includes(generated.testName);
+    const codeSnippet = generated.testCode.trim().slice(0, 60);
+    const codeFound = codeSnippet.length > 0 && writtenContent.includes(codeSnippet);
+
+    if (!testNameFound && !codeFound) {
+      console.error(
+        `[Test-Writer] ✗ Verification failed — "${generated.testName}" not found in ` +
+          `${generated.testFile} after merge; aborting before execution`
+      );
+      maybeRevert(merge, "verification_failed", options);
+      return {
+        testFile: generated.testFile,
+        priority: generated.priority,
+        framework: null,
+        command: "[FAILED] merge verification failed",
+        status: "error",
+        duration: 0,
+        exitCode: null,
+        stdout: "",
+        stderr:
+          `Generated test "${generated.testName}" was not found in ` +
+          `${generated.testFile} after the merge step — the write may have ` +
+          `failed silently. Aborting before execution.`,
+        generated: true,
+        generatedTestName: generated.testName,
+        keptInTestFile: false,
+      };
+    }
+
+    console.log(`[Test-Writer] ✓ Test successfully written to ${generated.testFile}`);
 
     const resolution = resolveFrameworkForMergedFile(generated, options);
 
@@ -327,11 +412,22 @@ async function runGeneratedTest(
       };
     }
 
+    console.log(
+      `[Step 6/6] Executing updated test file: ${generated.testFile} ` +
+        `(cwd: ${resolution.workspaceRelative})...`
+    );
     const result = await executeTestFile(merge.testFileAbsolute, resolution, options);
 
-    const keep = result.status === "passed" || !!options.keepGeneratedTests;
+    // Keep generated tests if:
+    // 1. They passed
+    // 2. They errored (environment issue, not test failure) — allows debugging
+    // 3. keepGeneratedTests option is set
+    const keep = result.status === "passed" || result.status === "error" || !!options.keepGeneratedTests;
 
     if (!keep) {
+      console.log(
+        `[Test-Writer] Reverting "${generated.testName}" — test did not pass and keepGeneratedTests is false`
+      );
       revertMerge(merge);
     }
 
@@ -376,16 +472,42 @@ function maybeRevert(
 }
 
 /**
- * Framework resolution is based on the test file's path/config, which is
+ * Framework resolution for a generated test. The test file's path/config is
  * unaffected by merging generated content into it — so we can resolve
  * against `generated.testFile` even for a brand-new file (the resolver
  * walks up from the file's directory to find config, same as any other
  * file in that location would).
+ * 
+ * If a TestFileContext is provided, use it directly without invoking the
+ * legacy resolver, to ensure the merged file runs in the correct workspace
+ * with the correct framework.
  */
 function resolveFrameworkForMergedFile(
   generated: GeneratedTestInput,
   options: TestRunnerOptions
 ): FrameworkResolution {
+  // If we have mapped context, use it directly
+  if (generated.context && generated.context.framework) {
+    const workspaceDir = path.resolve(
+      options.repositoryRoot,
+      generated.context.executionDirectory
+    );
+
+    return {
+      framework: generated.context.framework,
+      packageManager: "unknown", // We don't have this from context
+      workspaceDir,
+      workspaceRelative: generated.context.executionDirectory,
+      configFile: generated.context.configPath,
+      testPathRelativeToWorkspace: generated.testFile,
+      confidence: 1.0,
+      evidence: ["Resolved from mapped TestFileContext", ...generated.context.warnings],
+      configVerified: true,
+      configIsWorkspace: false,
+    };
+  }
+
+  // Fallback: use legacy framework resolution
   return resolveFramework(generated.testFile, options.repositoryRoot);
 }
 
@@ -414,6 +536,70 @@ async function runExistingTest(
     };
   }
 
+  // If we have mapped context, use it directly without invoking the legacy resolver
+  if (test.context) {
+    if (!test.context.framework) {
+      return {
+        testFile: test.testFile,
+        priority: test.priority,
+        framework: null,
+        command: "[SKIPPED] no test framework was detected for this file's workspace",
+        status: "skipped",
+        duration: 0,
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        notes: test.context.warnings.join("; "),
+      };
+    }
+
+    // Construct a full FrameworkResolution from the context
+    const workspaceDir = path.resolve(
+      options.repositoryRoot,
+      test.context.executionDirectory
+    );
+
+    if (!isFrameworkInstalled(test.context.framework, workspaceDir)) {
+      return {
+        testFile: test.testFile,
+        priority: test.priority,
+        framework: test.context.framework,
+        command: `[SKIPPED] ${test.context.framework} not installed`,
+        status: "skipped",
+        duration: 0,
+        exitCode: null,
+        stdout: "",
+        stderr: `Framework not installed in workspace: ${test.context.framework}`,
+        notes: `${test.context.framework} not installed in workspace`,
+      };
+    }
+
+    // Build a resolution using the context
+    const resolution: FrameworkResolution = {
+      framework: test.context.framework,
+      packageManager: "unknown", // We don't have this from context, but it's not critical
+      workspaceDir,
+      workspaceRelative: test.context.executionDirectory,
+      configFile: test.context.configPath,
+      testPathRelativeToWorkspace: path.relative(workspaceDir, testFileAbs),
+      confidence: 1.0, // The mapper has already done the work
+      evidence: ["Resolved from mapped TestFileContext", ...test.context.warnings],
+      configVerified: true, // The mapper already verified this
+      configIsWorkspace: false, // Assume leaf config unless we know otherwise
+    };
+
+    console.log(
+      `[test-runner] Using mapped context for "${test.testFile}": framework="${test.context.framework}", workspace="${test.context.executionDirectory}", config="${test.context.configPath || "(default)"}"`
+    );
+
+    return executeTestFile(testFileAbs, resolution, options).then((partial) => ({
+      ...partial,
+      testFile: test.testFile,
+      priority: test.priority,
+    } as TestExecutionResult));
+  }
+
+  // Fallback: use legacy framework resolver if no context provided
   const resolution = resolveFramework(test.testFile, options.repositoryRoot);
 
   if (!resolution.framework) {

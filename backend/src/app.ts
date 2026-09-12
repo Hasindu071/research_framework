@@ -4,7 +4,7 @@ import { analyzeCommit } from "./repository/analyzer.js";
 import { buildLLMContext } from "./repository/context-builder.js";
 import { LLMClient } from "./repository/llm-client.js";
 import { getPrompts } from "./repository/prompts.js";
-import { runPrioritizedTests, toPrioritizedTestInputs, type GeneratedTestInput } from "./repository/test-runner.js";
+import { runPrioritizedTests, toPrioritizedTestInputs, enrichTestInputsWithContext, type GeneratedTestInput } from "./repository/test-runner.js";
 import { prioritizeTests } from "./repository/test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
 
@@ -220,13 +220,20 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       priority: test.priority,
     }));
 
+    // Enrich with TestFileContext before running
+    console.log("[Step 5.5/6] Mapping test suite context...");
+    const enrichedPrioritizedInputs = await enrichTestInputsWithContext(
+      prioritizedTestInputs,
+      repositoryPath
+    );
+
     let prioritizedExecution: { testExecution: any[]; stoppedEarly: boolean } = {
       testExecution: [],
       stoppedEarly: false,
     };
 
-    if (prioritizedTestInputs.length > 0) {
-      prioritizedExecution = await runPrioritizedTests(prioritizedTestInputs, {
+    if (enrichedPrioritizedInputs.length > 0) {
+      prioritizedExecution = await runPrioritizedTests(enrichedPrioritizedInputs, {
         repositoryRoot: repositoryPath,
         stopOnFailure: false,
         timeoutMs: 120_000,
@@ -277,13 +284,20 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       `[Step 6/6] Prepared ${generatedTestInputs.length} generated test(s) for execution`
     );
 
+    // Enrich generated test inputs with context before running
+    console.log("[Step 6/6] Mapping test suite context for generated tests...");
+    const enrichedGeneratedInputs = await enrichTestInputsWithContext(
+      generatedTestInputs,
+      repositoryPath
+    );
+
     let generatedExecution: { testExecution: any[]; stoppedEarly: boolean } = {
       testExecution: [],
       stoppedEarly: false,
     };
 
-    if (generatedTestInputs.length > 0) {
-      generatedExecution = await runPrioritizedTests(generatedTestInputs, {
+    if (enrichedGeneratedInputs.length > 0) {
+      generatedExecution = await runPrioritizedTests(enrichedGeneratedInputs, {
         repositoryRoot: repositoryPath,
         stopOnFailure: false,
         timeoutMs: 120_000,  // 2 min timeout (accounts for monorepo startup time)
@@ -659,8 +673,15 @@ app.post("/api/analyze-and-run", async (req, res) => {
       })
     );
 
+    // Enrich with TestFileContext before running
+    console.log("[Step 4] Mapping test suite context...");
+    const enrichedTestInputs = await enrichTestInputsWithContext(
+      testInputs,
+      repositoryPath
+    );
+
     // Run tests in priority order
-    const testRunResults = await runPrioritizedTests(testInputs, {
+    const testRunResults = await runPrioritizedTests(enrichedTestInputs, {
       repositoryRoot: repositoryPath,
       stopOnFailure: false,
     });

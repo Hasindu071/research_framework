@@ -8,6 +8,25 @@ import type { TestFramework } from "./frameworks.js";
 
 export type PackageManager = "npm" | "yarn" | "pnpm" | "bun" | "unknown";
 
+/**
+ * Complete context for a package/workspace, resolved from the test file's
+ * location. This is the foundation — everything else derives from this.
+ */
+export interface PackageContext {
+  /** Absolute path to the package directory (where package.json lives). */
+  packageDir: string;
+  /** Absolute path to package.json. */
+  packageJsonPath: string;
+  /** Package name from package.json (may be undefined for root). */
+  packageName?: string;
+  /** Package manager detected for this repository. */
+  packageManager: PackageManager;
+  /** All scripts from this package.json. */
+  scripts: Record<string, string>;
+  /** Dependencies + devDependencies combined. */
+  allDeps: Record<string, string>;
+}
+
 export interface FrameworkResolution {
   framework: TestFramework | null;
   packageManager: PackageManager;
@@ -38,6 +57,12 @@ export interface FrameworkResolution {
    * triggering root-level project glob validation errors.
    */
   configIsWorkspace: boolean;
+  /**
+   * Available test scripts in the owning package.json, in order of preference.
+   * Empty if no test scripts found. Can be used to choose a more specific
+   * test command than the generic framework invocation.
+   */
+  testScripts?: string[];
 }
 
 // ======================================================
@@ -95,6 +120,17 @@ const DEFAULT_EXCLUDE: string[] = [
 // ======================================================
 
 export function detectPackageManager(repoRoot: string): PackageManager {
+  // Priority 1: Check root package.json's packageManager field
+  const rootPkg = readPkgJson(repoRoot);
+  if (rootPkg?.packageManager) {
+    // Format is typically "pnpm@8.0.0", "yarn@3.6.0", etc.
+    const pm = rootPkg.packageManager.split("@")[0];
+    if (pm === "pnpm" || pm === "yarn" || pm === "npm" || pm === "bun") {
+      return pm as PackageManager;
+    }
+  }
+
+  // Priority 2: Lockfile detection (repo root)
   if (fs.existsSync(path.join(repoRoot, "pnpm-lock.yaml"))) return "pnpm";
   if (fs.existsSync(path.join(repoRoot, "yarn.lock"))) return "yarn";
   if (fs.existsSync(path.join(repoRoot, "package-lock.json"))) return "npm";
@@ -103,12 +139,42 @@ export function detectPackageManager(repoRoot: string): PackageManager {
     fs.existsSync(path.join(repoRoot, "bun.lock"))
   )
     return "bun";
+
   return "unknown";
 }
 
 // ======================================================
-// WORKSPACE DETECTION
+// WORKSPACE/PACKAGE DETECTION
 // ======================================================
+
+/**
+ * Resolve the package context for a test file by walking up from its
+ * location to find the nearest package.json (the owning package).
+ * 
+ * This is Step 1 of the new architecture — everything else flows from here.
+ */
+export function resolvePackageContext(
+  testFile: string,
+  repoRoot: string
+): PackageContext {
+  const ancestorDirs = collectAncestorDirs(testFile, repoRoot);
+  const packageDir = findNearestWorkspace(ancestorDirs);
+  const packageJsonPath = path.join(packageDir, "package.json");
+
+  // Read the package
+  const pkg = readPkgJson(packageDir) || {};
+  const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+  const packageManager = detectPackageManager(repoRoot);
+
+  return {
+    packageDir,
+    packageJsonPath,
+    packageName: pkg.name,
+    packageManager,
+    scripts: pkg.scripts || {},
+    allDeps,
+  };
+}
 
 /**
  * Build list of ancestor directories from test file to repo root (inclusive).
@@ -445,9 +511,8 @@ function configMatchesTest(
 // FRAMEWORK DETECTION FROM DEPENDENCIES
 // ======================================================
 
-function frameworkFromDeps(pkg: any): TestFramework | null {
-  if (!pkg) return null;
-  const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+function frameworkFromDeps(allDeps: Record<string, string>): TestFramework | null {
+  if (!allDeps) return null;
   for (const [name, deps] of Object.entries(DEP_NAMES) as [
     TestFramework,
     string[]
@@ -457,18 +522,35 @@ function frameworkFromDeps(pkg: any): TestFramework | null {
   return null;
 }
 
+/**
+ * Extract test-related scripts from a package, returning the framework
+ * they invoke (if any) and the script names in order of preference.
+ * Returns most-specific first: test:unit, test:e2e, test
+ */
+function getTestScripts(pkg: any): string[] {
+  if (!pkg?.scripts) return [];
+  
+  // Order by specificity: more-specific comes first
+  const scriptNames = [
+    "test:unit",
+    "test:e2e",
+    "test:component",
+    "test:integration",
+    "test",
+  ];
+
+  return scriptNames.filter((name) => name in pkg.scripts);
+}
+
 // ======================================================
 // FRAMEWORK DETECTION FROM SCRIPTS
 // ======================================================
 
 function frameworkFromScripts(
-  pkg: any
+  scripts: Record<string, string>
 ): { framework: TestFramework; script: string } | null {
-  if (!pkg?.scripts) return null;
-  for (const [scriptName, scriptCmd] of Object.entries(pkg.scripts) as [
-    string,
-    string
-  ][]) {
+  if (!scripts || Object.keys(scripts).length === 0) return null;
+  for (const [scriptName, scriptCmd] of Object.entries(scripts)) {
     if (!/test/i.test(scriptName)) continue;
     for (const fw of Object.keys(DEP_NAMES) as TestFramework[]) {
       if (new RegExp(`\\b${fw}\\b`, "i").test(scriptCmd)) {
@@ -510,41 +592,43 @@ function frameworkFromImports(testFileContent: string): TestFramework | null {
  *    match this test file, searched from the test file's directory up to
  *    the repo root (closest verified match wins).
  * 2. The test file's own imports.
- * 3. A "test"-like script in the nearest package.json (or repo root's).
- * 4. A framework dependency listed in the nearest package.json up the tree.
+ * 3. A "test"-like script in the owning package.json.
+ * 4. A framework dependency listed in the owning package.json.
  *
  * Returns a resolution with confidence (0-1), evidence trail, and paths
  * expressed relative to `workspaceDir` — the directory tests should
  * actually be executed from, since config `include`/`exclude` patterns are
  * relative to the config's own directory, not the repo root.
+ * 
+ * The key change: framework detection now prioritizes the owning package's
+ * context, not the root package.json. This prevents root-level orchestration
+ * commands from overriding package-specific test setup.
  */
 export function resolveFramework(
   testFile: string,
   repoRoot: string
 ): FrameworkResolution {
-  const packageManager = detectPackageManager(repoRoot);
   const ancestorDirs = collectAncestorDirs(testFile, repoRoot);
   const testFileAbs = path.resolve(repoRoot, testFile);
-  const nearestWorkspace = findNearestWorkspace(ancestorDirs);
-
+  const pkgContext = resolvePackageContext(testFile, repoRoot);
+  
   const evidence: string[] = [];
+  evidence.push(`resolved owning package: ${pkgContext.packageName || "(root)"} at ${path.relative(repoRoot, pkgContext.packageDir) || "."}`);
+
   let framework: TestFramework | null = null;
   let confidence = 0;
   let configFile: string | null = null;
-  let workspaceDir = nearestWorkspace;
+  let workspaceDir = pkgContext.packageDir;
   let configVerified = false;
   let configIsWorkspace = false;
 
   // Strategy 1: Config file, verified against include/exclude (highest confidence).
-  // Collect every candidate config across every framework, then walk them in
-  // order of proximity to the test file (closest ancestor dir first) so a
-  // nested workspace's config wins over one further up the tree.
+  // Search from the test file upward, but prioritize configs within the owning package
   const allCandidates: ConfigCandidate[] = [];
   for (const fw of Object.keys(CONFIG_FILES) as TestFramework[]) {
     allCandidates.push(...findConfigCandidates(ancestorDirs, fw));
   }
-  // ancestorDirs is already ordered nearest -> root, so sort candidates the
-  // same way to preserve that priority.
+  // ancestorDirs is already ordered nearest -> root, so sort candidates the same way
   allCandidates.sort(
     (a, b) => ancestorDirs.indexOf(a.dir) - ancestorDirs.indexOf(b.dir)
   );
@@ -584,9 +668,6 @@ export function resolveFramework(
     }
   }
 
-  // A config existed nearby but didn't actually claim this test file. Note
-  // it in the evidence trail for debugging, but don't use it to pick the
-  // framework or the run directory.
   if (!framework && firstUnverifiedCandidate) {
     evidence.push(
       `config "${firstUnverifiedCandidate.file}" found in ` +
@@ -610,47 +691,56 @@ export function resolveFramework(
     }
   }
 
-  // Strategy 3: Test script in package.json
+  // Strategy 3: Test script in the owning package (NEW: prioritizes package context)
   if (!framework) {
-    for (const dir of [nearestWorkspace, repoRoot]) {
-      const fromScripts = frameworkFromScripts(readPkgJson(dir));
-      if (fromScripts) {
-        framework = fromScripts.framework;
-        if (firstUnverifiedCandidate) {
-          evidence.push(
-            `config "${firstUnverifiedCandidate.file}" found but didn't match; ` +
-            `falling back to package.json script "${fromScripts.script}"`
-          );
-        } else {
-          evidence.push(
-            `package.json script "${fromScripts.script}" in ${path.relative(repoRoot, dir) || "."} invokes ${fromScripts.framework}`
-          );
-        }
-        confidence = 0.55;
-        break;
+    const fromScripts = frameworkFromScripts(pkgContext.scripts);
+    if (fromScripts) {
+      framework = fromScripts.framework;
+      if (firstUnverifiedCandidate) {
+        evidence.push(
+          `config "${firstUnverifiedCandidate.file}" found but didn't match; ` +
+          `falling back to package script "${fromScripts.script}"`
+        );
+      } else {
+        evidence.push(
+          `owning package script "${fromScripts.script}" invokes ${fromScripts.framework}`
+        );
       }
+      confidence = 0.65;
     }
   }
 
-  // Strategy 4: Framework dependency
+  // Strategy 4: Framework dependency in the owning package
   if (!framework) {
-    for (const dir of ancestorDirs) {
-      const fromDeps = frameworkFromDeps(readPkgJson(dir));
-      if (fromDeps) {
-        framework = fromDeps;
-        if (firstUnverifiedCandidate) {
-          evidence.push(
-            `config "${firstUnverifiedCandidate.file}" found but didn't match; ` +
-            `falling back to dependency: ${fromDeps} in ${path.relative(repoRoot, dir) || "."}/package.json`
-          );
-        } else {
-          evidence.push(
-            `${fromDeps} listed as dependency in ${path.relative(repoRoot, dir) || "."}/package.json`
-          );
-        }
-        confidence = 0.45;
-        break;
+    const fromDeps = frameworkFromDeps(pkgContext.allDeps);
+    if (fromDeps) {
+      framework = fromDeps;
+      if (firstUnverifiedCandidate) {
+        evidence.push(
+          `config "${firstUnverifiedCandidate.file}" found but didn't match; ` +
+          `falling back to dependency: ${fromDeps} in owning package`
+        );
+      } else {
+        evidence.push(
+          `${fromDeps} listed in owning package dependencies`
+        );
       }
+      confidence = 0.55;
+    }
+  }
+
+  // Strategy 5: Root-level framework dependency (lowest priority)
+  // Only use if owning package had nothing
+  if (!framework) {
+    const rootPkg = readPkgJson(repoRoot);
+    const rootAllDeps = { ...rootPkg?.dependencies, ...rootPkg?.devDependencies };
+    const fromRootDeps = frameworkFromDeps(rootAllDeps);
+    if (fromRootDeps) {
+      framework = fromRootDeps;
+      evidence.push(
+        `${fromRootDeps} listed in root package dependencies (owning package had no test framework)`
+      );
+      confidence = 0.35;
     }
   }
 
@@ -660,18 +750,15 @@ export function resolveFramework(
     );
   }
 
-  // For anything resolved by strategies 2-4 (no verified config), fall back
-  // to the nearest package.json dir as the run directory, same as before.
-  if (!configVerified) {
-    workspaceDir = nearestWorkspace;
-  }
-
   const workspaceRelative = path.relative(repoRoot, workspaceDir) || ".";
   const testPathRelativeToWorkspace = path.relative(workspaceDir, testFileAbs);
+  
+  // Extract available test scripts from the owning package
+  const testScripts = getTestScripts(pkgContext.scripts);
 
   return {
     framework,
-    packageManager,
+    packageManager: pkgContext.packageManager,
     workspaceDir,
     workspaceRelative,
     configFile,
@@ -680,6 +767,7 @@ export function resolveFramework(
     evidence,
     configVerified,
     configIsWorkspace,
+    testScripts,
   };
 }
 
@@ -717,6 +805,11 @@ function execPrefix(
  * When the config is workspace/projects-based, we omit --config entirely
  * and let the framework auto-discover from the workspace directory, to avoid
  * triggering root-level project glob validation errors.
+ * 
+ * Priority:
+ * 1. If a framework-specific test script exists (test:unit, test:e2e, test),
+ *    use the package manager to invoke it with the test file as an argument.
+ * 2. Otherwise, invoke the framework CLI directly with the test file.
  */
 export function buildTestCommand(
   resolution: FrameworkResolution,
@@ -728,17 +821,30 @@ export function buildTestCommand(
     configFile,
     configIsWorkspace,
     testPathRelativeToWorkspace,
+    testScripts,
   } = resolution;
 
   // Use the override if provided, otherwise fall back to the resolved path
   const testPath = targetFileRelativeToWorkspace || testPathRelativeToWorkspace;
 
   if (!framework) {
+    // No framework detected — try package.json test script as fallback
+    if (testScripts && testScripts.length > 0) {
+      return buildPackageManagerCommand(packageManager, testScripts[0]!, [testPath]);
+    }
+    // Fallback to npm test
     return packageManager === "unknown"
       ? { command: "npm", args: ["run", "test", "--", testPath] }
-      : { command: packageManager, args: ["test", testPath] };
+      : buildPackageManagerCommand(packageManager, "test", [testPath]);
   }
 
+  // If package has a test script, prefer it over generic framework invocation
+  // This ensures the package's own test setup/environment is used
+  if (testScripts && testScripts.length > 0) {
+    return buildPackageManagerCommand(packageManager, testScripts[0]!, [testPath]);
+  }
+
+  // Fallback: Generic framework CLI invocation
   // If the config is workspace/projects-based, omit --config and auto-discover
   // from the workspace directory. This avoids triggering root config's project
   // glob validation which requires project matches to be config files.
@@ -824,5 +930,44 @@ export function buildTestCommand(
         args: [...base.args, testPath],
       };
     }
+  }
+}
+
+/**
+ * Build a command that invokes a package script through the package manager.
+ * This ensures the test runs in the same environment/context as package scripts.
+ */
+function buildPackageManagerCommand(
+  packageManager: PackageManager,
+  scriptName: string,
+  extraArgs: string[]
+): { command: string; args: string[] } {
+  switch (packageManager) {
+    case "yarn":
+      return {
+        command: "yarn",
+        args: ["run", scriptName, ...extraArgs],
+      };
+    case "pnpm":
+      return {
+        command: "pnpm",
+        args: ["run", scriptName, ...extraArgs],
+      };
+    case "npm":
+      return {
+        command: "npm",
+        args: ["run", scriptName, "--", ...extraArgs],
+      };
+    case "bun":
+      return {
+        command: "bun",
+        args: ["run", scriptName, ...extraArgs],
+      };
+    default:
+      // Fallback to npm
+      return {
+        command: "npm",
+        args: ["run", scriptName, "--", ...extraArgs],
+      };
   }
 }
