@@ -1,4 +1,5 @@
 import type { LLMContext } from "./context-builder.js";
+import type { LLMClient } from "./llm-client.js";
 
 // ======================================================
 // TYPES
@@ -98,10 +99,10 @@ export interface TestGapAnalysis {
 // ENTRY POINT
 // ======================================================
 
-export function analyzeCoverageGaps(input: GapAnalysisInput): TestGapAnalysis {
+export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LLMClient): Promise<TestGapAnalysis> {
   const testCode = input.existingTestCode ?? "";
 
-  const fallbackBehaviors = extractFallbackBehaviors(input.diffText, input.symbol, testCode);
+  const fallbackBehaviors = await extractFallbackBehaviors(input.diffText, input.symbol, testCode, llmClient);
   const lexicalBehaviors = extractLexicalBehaviors(input.diffText);
   const changedBehaviors = [...fallbackBehaviors, ...lexicalBehaviors];
 
@@ -159,8 +160,8 @@ export function analyzeCoverageGaps(input: GapAnalysisInput): TestGapAnalysis {
   };
 }
 
-export function analyzeCoverageGapsBatch(inputs: GapAnalysisInput[]): TestGapAnalysis[] {
-  return inputs.map(analyzeCoverageGaps);
+export async function analyzeCoverageGapsBatch(inputs: GapAnalysisInput[], llmClient: LLMClient): Promise<TestGapAnalysis[]> {
+  return Promise.all(inputs.map(input => analyzeCoverageGaps(input, llmClient)));
 }
 
 // ======================================================
@@ -184,14 +185,26 @@ const FALLBACK_VARIABLE_PATTERN =
   /^\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+?)\s*(\?\?|\|\|)\s*(.+?)\s*;?\s*$/;
 
 interface FallbackExpr {
-  /*** The value that receives the result.** Examples:*   showTitleAndFeatureImage: ...*   const shouldExcludeOrganizer = ...*/
+  /** The value that receives the result.
+   * Examples:
+   *   showTitleAndFeatureImage: ...
+   *   const shouldExcludeOrganizer = ...
+   */
   property: string;
-  /*** The value being checked.** Example:*   excludeOrganizerEmail || calEvent.hideOrganizerEmail** sourceExpr = "excludeOrganizerEmail"*/
+  /** The value being checked.
+   * Example:
+   *   excludeOrganizerEmail || calEvent.hideOrganizerEmail
+   * sourceExpr = "excludeOrganizerEmail"
+   */
   sourceExpr: string;
   operator: "??" | "||";
   /** The value used when the source triggers the fallback. */
   fallbackExpr: string;
-  /*** True when the expression is a local variable assignment:* const x = value || fallback** False for:* property: value || fallback*/
+  /** True when the expression is a local variable assignment:
+   * const x = value || fallback
+   * False for:
+   * property: value || fallback
+   */
   isVariableAssignment: boolean;
 }
 
@@ -244,6 +257,132 @@ function extractFallbackExpr(trimmed: string): FallbackExpr | null {
   return null;
 }
 
+/**
+ * Use the LLM to verify whether each behavioral case of a fallback is covered
+ * by the existing test code.
+ *
+ * The LLM receives:
+ * - The fallback expression structure (property, sourceExpr, operator, fallbackExpr, isVariableAssignment)
+ * - The two fixed-order behavioral cases (pass-through and fallback)
+ * - The full existing test file code
+ *
+ * The LLM returns verdicts (covered/not-covered + evidence) for each case it can identify.
+ * If the LLM cannot tell, it omits the case, leaving it as "unknown".
+ * If the LLM call fails, all cases default to "unknown" (fail-safe).
+ */
+async function verifyFallbackCoverage(
+  fb: FallbackExpr,
+  passThroughCondition: string,
+  fallbackCondition: string,
+  testCode: string,
+  symbolName: string,
+  llmClient: LLMClient
+): Promise<BehaviorCase[]> {
+  const systemPrompt = `You are a code coverage analyst. Given a fallback expression (using ?? or ||) and existing test code, determine whether each behavioral case is covered by tests.
+
+A case is "covered" only if:
+1. There is a test that calls the function with an input triggering that case's branch
+2. AND there is an assertion in or near that test that checks the result
+
+Return a JSON object with an optional "cases" array. Each item should have:
+- "condition": the exact condition string provided
+- "status": "covered" or "not-covered"
+- "evidence": a brief excerpt from the test code showing the coverage (if covered)
+
+If you cannot determine whether a case is covered (e.g., the test code is ambiguous), omit it from the response.
+If ALL cases are ambiguous/omitted, return an empty object: {}
+
+Example response:
+{
+  "cases": [
+    {
+      "condition": "value is provided and not nullish",
+      "status": "covered",
+      "evidence": "getReplyToHeader(calEvent, emailOrPhoneNumber, false)"
+    }
+  ]
+}`;
+
+  const userPrompt = `Analyze whether these behavioral cases of a fallback expression are covered by existing tests.
+
+FALLBACK EXPRESSION:
+- Property: ${fb.property}
+- Source expression: ${fb.sourceExpr}
+- Operator: ${fb.operator}
+- Fallback expression: ${fb.fallbackExpr}
+- Type: ${fb.isVariableAssignment ? "variable assignment" : "object property"}
+
+BEHAVIORAL CASES TO VERIFY:
+1. ${passThroughCondition}
+2. ${fallbackCondition}
+
+SYMBOL NAME: ${symbolName}
+
+EXISTING TEST CODE:
+\`\`\`
+${testCode}
+\`\`\`
+
+Determine coverage for these two cases based on the test code provided.`;
+
+  try {
+    interface LLMCoverageResponse {
+      cases?: Array<{ condition: string; status: "covered" | "not-covered"; evidence?: string }>;
+    }
+
+    const response = await llmClient.generateJSON<LLMCoverageResponse>(systemPrompt, userPrompt);
+
+    console.log(
+      `[GapAnalyzer-LLM] Coverage verification for "${fb.property}": ` +
+        `${response.cases?.length ?? 0} verdict(s) provided`
+    );
+
+    // Map the LLM response back to the two cases we asked about
+    const resultCases: BehaviorCase[] = [
+      {
+        condition: passThroughCondition,
+        status: "unknown",
+        evidence: undefined,
+      },
+      {
+        condition: fallbackCondition,
+        status: "unknown",
+        evidence: undefined,
+      },
+    ];
+
+    // Update with LLM verdicts where provided
+    if (response.cases) {
+      for (const llmCase of response.cases) {
+        const matchingResult = resultCases.find((rc) => rc.condition === llmCase.condition);
+        if (matchingResult) {
+          matchingResult.status = llmCase.status;
+          matchingResult.evidence = llmCase.evidence;
+        }
+      }
+    }
+
+    return resultCases;
+  } catch (error) {
+    console.warn(
+      `[GapAnalyzer-LLM] ⚠️ Coverage verification failed for "${fb.property}": ${error instanceof Error ? error.message : String(error)}`
+    );
+    // Fail-safe: mark all cases as unknown so they're never wrongly treated as gaps
+    return [
+      {
+        condition: passThroughCondition,
+        status: "unknown",
+        evidence: undefined,
+      },
+      {
+        condition: fallbackCondition,
+        status: "unknown",
+        evidence: undefined,
+      },
+    ];
+  }
+}
+
 /** Values that put a `??` or `||` expression into the "fallback" branch. */
 function isFallbackTriggeringLiteral(token: string, operator: "??" | "||"): boolean {
   const t = token.trim();
@@ -271,7 +410,7 @@ function isFallbackTriggeringLiteral(token: string, operator: "??" | "||"): bool
 interface CallSitePropertyValue {
   /** The raw token passed for this property, or "<omitted>" if the key never appears in the call. */
   rawValue: string;
-  /** Index into testCode right after the full call expression — used to search for a nearby assertion. */
+  /** Index into testCode right after the full call expression – used to search for a nearby assertion. */
   searchFrom: number;
 }
 
@@ -327,11 +466,12 @@ function hasNearbyAssertion(testCode: string, fromIdx: number, property: string,
   return m ? m[0].trim() : null;
 }
 
-function extractFallbackBehaviors(
+async function extractFallbackBehaviors(
   diffText: string,
   symbolName: string,
-  testCode: string
-): ChangedBehavior[] {
+  testCode: string,
+  llmClient: LLMClient
+): Promise<ChangedBehavior[]> {
   const addedLines = getAddedLines(diffText);
   const behaviors: ChangedBehavior[] = [];
 
@@ -350,57 +490,57 @@ function extractFallbackBehaviors(
     const passThroughCondition = `${fb.property} is provided and not ${nullishOrFalsy}`;
     const fallbackCondition = `${fb.property} is ${nullishOrFalsy} → falls back to \`${truncate(fb.fallbackExpr, 30)}\``;
 
-    const callSites = findCallSitePropertyValues(testCode, symbolName, fb.property);
+    // If there's no existing test code, both cases are not-covered without asking the model
+    if (!testCode || testCode.trim().length === 0) {
+      const cases: BehaviorCase[] = [
+        {
+          condition: passThroughCondition,
+          status: "not-covered",
+          evidence: undefined,
+        },
+        {
+          condition: fallbackCondition,
+          status: "not-covered",
+          evidence: undefined,
+        },
+      ];
 
-    const passThroughEvidence = findCoveringCallSite(callSites, testCode, fb, "pass-through");
-    const fallbackEvidence = findCoveringCallSite(callSites, testCode, fb, "fallback");
+      behaviors.push({
+        label: `\`${fb.property}\` uses \`${fb.sourceExpr}\` with a \`${fb.operator}\` fallback to \`${truncate(fb.fallbackExpr, 30)}\``,
+        kind: "fallback",
+        evidence: line,
+        cases,
+        overallStatus: "not-covered",
+      });
+      continue;
+    }
 
-    const cases: BehaviorCase[] = [
-      {
-        condition: passThroughCondition,
-        status: passThroughEvidence ? "covered" : "not-covered",
-        evidence: passThroughEvidence ?? undefined,
-      },
-      {
-        condition: fallbackCondition,
-        status: fallbackEvidence ? "covered" : "not-covered",
-        evidence: fallbackEvidence ?? undefined,
-      },
-    ];
+    // Otherwise, ask the LLM to verify coverage
+    const cases = await verifyFallbackCoverage(
+      fb,
+      passThroughCondition,
+      fallbackCondition,
+      testCode,
+      symbolName,
+      llmClient
+    );
 
     const allCovered = cases.every((c) => c.status === "covered");
     const noneCovered = cases.every((c) => c.status === "not-covered");
+    const allUnknown = cases.every((c) => c.status === "unknown");
 
     behaviors.push({
       label: `\`${fb.property}\` uses \`${fb.sourceExpr}\` with a \`${fb.operator}\` fallback to \`${truncate(fb.fallbackExpr, 30)}\``,
       kind: "fallback",
       evidence: line,
       cases,
-      overallStatus: allCovered ? "covered" : noneCovered ? "not-covered" : "unknown",
+      overallStatus: allCovered ? "covered" : noneCovered ? "not-covered" : allUnknown ? "unknown" : "unknown",
     });
   }
 
   return behaviors;
 }
 
-function findCoveringCallSite(
-  callSites: CallSitePropertyValue[],
-  testCode: string,
-  fb: FallbackExpr,
-  wanted: "pass-through" | "fallback"
-): string | null {
-  for (const site of callSites) {
-    const isOmitted = site.rawValue === "<omitted>";
-    const triggersFallback = isOmitted || isFallbackTriggeringLiteral(site.rawValue, fb.operator);
-    const kind: "pass-through" | "fallback" = triggersFallback ? "fallback" : "pass-through";
-
-    if (kind !== wanted) continue;
-
-    const assertion = hasNearbyAssertion(testCode, site.searchFrom, fb.property);
-    if (assertion) return assertion;
-  }
-  return null;
-}
 
 // ======================================================
 // TIER 2 — LEXICAL SIGNALS (unverified; never sent to generator)

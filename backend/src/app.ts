@@ -171,9 +171,10 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     // Step 4: Build generation targets
     // ========================================
     console.log("[Step 4/5] Building generation targets...");
-    const { targets: generationTargets, gapAnalyses } = buildGenerationTargets(
+    const { targets: generationTargets, gapAnalyses } = await buildGenerationTargets(
       prioritizationResult.tests,
       llmContext,
+      llmClient,
       analysis.rawDiff,
       { topN: 5 }
     );

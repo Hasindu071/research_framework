@@ -62,12 +62,13 @@ const MAX_GENERATED_TESTS_PER_TARGET = 8;
  * Returns both the targets (for generation) and the full gap analyses
  * (for audit/reporting).
  */
-export function buildGenerationTargets(
+export async function buildGenerationTargets(
   prioritized: PrioritizedTest[],
   context: LLMContext,
+  llmClient: LLMClient,
   rawDiff: string,
   options: { topN?: number } = {}
-): GenerationTargetingResult {
+): Promise<GenerationTargetingResult> {
   const topN = options.topN ?? prioritized.length;
   const chosenTestFiles = new Set(
     prioritized.slice(0, topN).map((test) => test.testFile)
@@ -111,7 +112,7 @@ export function buildGenerationTargets(
       rawDiff,
       context
     );
-    const gapAnalyses = analyzeCoverageGapsBatch(gapInputs);
+    const gapAnalyses = await analyzeCoverageGapsBatch(gapInputs, llmClient);
 
     // Keep all gap analyses for reporting (regardless of whether gaps were found)
     allGapAnalyses.push(...gapAnalyses);
