@@ -178,31 +178,70 @@ export function analyzeCoverageGapsBatch(inputs: GapAnalysisInput[]): TestGapAna
 // required — a call with no assertion proves nothing, and an assertion
 // with no matching call proves nothing either.
 
-const FALLBACK_ASSIGNMENT_PATTERN =
+const FALLBACK_PROPERTY_PATTERN =
   /^\s*([a-zA-Z_$][\w$]*)\s*:\s*(.+?)\s*(\?\?|\|\|)\s*(.+?),?\s*$/;
+const FALLBACK_VARIABLE_PATTERN =
+  /^\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+?)\s*(\?\?|\|\|)\s*(.+?)\s*;?\s*$/;
 
 interface FallbackExpr {
+  /*** The value that receives the result.** Examples:*   showTitleAndFeatureImage: ...*   const shouldExcludeOrganizer = ...*/
   property: string;
+  /*** The value being checked.** Example:*   excludeOrganizerEmail || calEvent.hideOrganizerEmail** sourceExpr = "excludeOrganizerEmail"*/
   sourceExpr: string;
   operator: "??" | "||";
+  /** The value used when the source triggers the fallback. */
   fallbackExpr: string;
+  /*** True when the expression is a local variable assignment:* const x = value || fallback** False for:* property: value || fallback*/
+  isVariableAssignment: boolean;
 }
 
 function extractFallbackExpr(trimmed: string): FallbackExpr | null {
-  const m = FALLBACK_ASSIGNMENT_PATTERN.exec(trimmed);
-  if (!m || !m[1] || !m[2] || !m[3] || !m[4]) {
-    // Log lines that might be property assignments with ?? or || for debugging
-    if ((trimmed.includes("??") || trimmed.includes("||")) && /^\w/.test(trimmed)) {
-      console.log(`[GapAnalyzer-Fallback] Line contains ?? or || but didn't match regex: "${trimmed}"`);
-    }
-    return null;
+  // --------------------------------------------------
+  // Case 1:
+  // property: value ?? fallback
+  // property: value || fallback
+  // --------------------------------------------------
+  const propertyMatch = FALLBACK_PROPERTY_PATTERN.exec(trimmed);
+  if (propertyMatch &&
+      propertyMatch[1] &&
+      propertyMatch[2] &&
+      propertyMatch[3] &&
+      propertyMatch[4]) {
+    return {
+      property: propertyMatch[1],
+      sourceExpr: propertyMatch[2].trim(),
+      operator: propertyMatch[3] === "??" ? "??" : "||",
+      fallbackExpr: propertyMatch[4].trim(),
+      isVariableAssignment: false,
+    };
   }
-  return {
-    property: m[1],
-    sourceExpr: m[2].trim(),
-    operator: (m[3] === "??" ? "??" : "||"),
-    fallbackExpr: m[4].trim(),
-  };
+
+  // --------------------------------------------------
+  // Case 2:
+  // const x = value ?? fallback
+  // const x = value || fallback
+  // --------------------------------------------------
+  const variableMatch = FALLBACK_VARIABLE_PATTERN.exec(trimmed);
+  if (variableMatch &&
+      variableMatch[1] &&
+      variableMatch[2] &&
+      variableMatch[3] &&
+      variableMatch[4]) {
+    return {
+      property: variableMatch[1],
+      sourceExpr: variableMatch[2].trim(),
+      operator: variableMatch[3] === "??" ? "??" : "||",
+      fallbackExpr: variableMatch[4].trim(),
+      isVariableAssignment: true,
+    };
+  }
+
+  // Debug information
+  if (trimmed.includes("??") || trimmed.includes("||")) {
+    console.log(`[GapAnalyzer-Fallback] Line contains ?? or || but didn't match either fallback pattern: "${trimmed}"`);
+  }
+
+  return null;
 }
 
 /** Values that put a `??` or `||` expression into the "fallback" branch. */
