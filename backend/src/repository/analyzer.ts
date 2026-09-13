@@ -19,6 +19,7 @@ interface SymbolChange {
 interface ChangedLine {
   type: "added" | "deleted";
   content: string;
+  newLineNumber?: number;
 }
 
 interface FileChange {
@@ -347,15 +348,33 @@ function parseDiff(
 
     let insertions = 0;
     let deletions = 0;
+    let newLineNumber = 0;
+    let oldLineNumber = 0;
 
     for (const line of lines) {
+
+      // Parse hunk headers to track line numbers
+      // Format: @@ -oldStart,oldCount +newStart,newCount @@
+
+      if (line.startsWith("@@")) {
+        const match = line.match(
+          /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/
+        );
+        if (match?.[1]) {
+          newLineNumber = parseInt(match[1]) - 1;
+        }
+        const oldMatch = line.match(/-(\d+)/);
+        if (oldMatch?.[1]) {
+          oldLineNumber = parseInt(oldMatch[1]) - 1;
+        }
+        continue;
+      }
 
       // Ignore Git metadata
 
       if (
         line.startsWith("+++ ") ||
         line.startsWith("--- ") ||
-        line.startsWith("@@") ||
         line.startsWith("index ") ||
         line.startsWith("new file mode") ||
         line.startsWith("deleted file mode") ||
@@ -371,10 +390,12 @@ function parseDiff(
       if (line.startsWith("+")) {
 
         insertions++;
+        newLineNumber++;
 
         changedLines.push({
           type: "added",
           content: line.substring(1),
+          newLineNumber,
         });
       }
 
@@ -383,11 +404,19 @@ function parseDiff(
       else if (line.startsWith("-")) {
 
         deletions++;
+        oldLineNumber++;
 
         changedLines.push({
           type: "deleted",
           content: line.substring(1),
         });
+      }
+
+      // Context line (unchanged)
+
+      else if (line.startsWith(" ")) {
+        newLineNumber++;
+        oldLineNumber++;
       }
     }
 
