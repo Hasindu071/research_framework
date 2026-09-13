@@ -409,6 +409,22 @@ function configHasWorkspaceProjects(content: string): boolean {
 }
 
 /**
+ * Read a config file and report whether it declares a workspace/projects
+ * feature (e.g. Vitest's `projects`/`workspace`) — i.e. whether it's a
+ * router rather than a leaf config. Exported so callers building a
+ * FrameworkResolution from external context can make the same
+ * --config vs. auto-discover decision that resolveFramework() makes.
+ */
+export function isWorkspaceConfigFile(configPathAbs: string): boolean {
+  try {
+    const content = fs.readFileSync(configPathAbs, "utf8");
+    return configHasWorkspaceProjects(content);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Read a config file and pull out its include/exclude patterns, falling
  * back to framework defaults when nothing is declared or the file can't be
  * statically parsed.
@@ -523,6 +539,69 @@ function frameworkFromDeps(allDeps: Record<string, string>): TestFramework | nul
 }
 
 /**
+ * Analyze a test script to determine if it's a "passthrough" script
+ * that accepts a file argument, or a "wrapper" that doesn't.
+ *
+ * Passthrough examples:
+ *   "vitest"
+ *   "jest"
+ *   "mocha"
+ *   "vitest --ui"
+ *   "jest --watch"
+ *
+ * Wrapper examples (should NOT pass file to):
+ *   "yarn test:unit"        ← calls another script
+ *   "npm run test:unit"     ← calls another script
+ *   "nx test"               ← task runner
+ *   "turbo test"            ← monorepo runner
+ *   "node scripts/test.js"  ← custom script
+ *   "ts-node test/index.ts" ← custom script
+ *
+ * For wrappers, the file argument should be passed through the framework CLI
+ * (vitest/jest/etc.) directly, not to the wrapper script.
+ */
+function isPassthroughTestScript(scriptCmd: string): boolean {
+  if (!scriptCmd) return false;
+
+  // Normalize: trim and get the first word/command
+  const trimmed = scriptCmd.trim();
+
+  // Direct framework invocations are passthrough
+  const passthroughFrameworks = ["vitest", "jest", "mocha", "playwright"];
+  for (const fw of passthroughFrameworks) {
+    // Match "vitest", "vitest --ui", "vitest run", but not "yarn vitest"
+    if (new RegExp(`^${fw}(\\s|$)`).test(trimmed)) {
+      return true;
+    }
+  }
+
+  // Wrappers and task runners: never passthrough
+  const wrapperPatterns = [
+    /^yarn\s+/,        // yarn test:unit
+    /^npm\s+/,         // npm run test
+    /^pnpm\s+/,        // pnpm run test
+    /^bun\s+/,         // bun run test
+    /^npx\s+/,         // npx something
+    /^nx\s+/,          // nx test
+    /^turbo\s+/,       // turbo test
+    /^node\s+/,        // node scripts/test.js
+    /^ts-node\s+/,     // ts-node test/index.ts
+    /^tsx\s+/,         // tsx test/index.ts
+    /^node --/,        // node --loader ...
+  ];
+
+  for (const pattern of wrapperPatterns) {
+    if (pattern.test(trimmed)) {
+      return false;
+    }
+  }
+
+  // Scripts that are custom executables or unclear — assume NOT passthrough
+  // (safer to fall back to framework CLI than to break a custom script)
+  return false;
+}
+
+/**
  * Extract test-related scripts from a package, returning the framework
  * they invoke (if any) and the script names in order of preference.
  * Returns most-specific first: test:unit, test:e2e, test
@@ -540,6 +619,18 @@ function getTestScripts(pkg: any): string[] {
   ];
 
   return scriptNames.filter((name) => name in pkg.scripts);
+}
+
+/**
+ * Read the available test scripts (in priority order) from the package.json
+ * in `dir`. Exported so callers who build a FrameworkResolution from an
+ * externally-supplied TestFileContext (rather than via resolveFramework)
+ * can still prefer the repository's own test script over a bare framework
+ * CLI invocation.
+ */
+export function getTestScriptsForDir(dir: string): string[] {
+  const pkg = readPkgJson(dir);
+  return getTestScripts(pkg);
 }
 
 // ======================================================
@@ -806,9 +897,9 @@ function execPrefix(
  * and let the framework auto-discover from the workspace directory, to avoid
  * triggering root-level project glob validation errors.
  * 
- * Priority:
- * 1. If a framework-specific test script exists (test:unit, test:e2e, test),
- *    use the package manager to invoke it with the test file as an argument.
+ * Strategy:
+ * 1. If a framework-specific test script exists AND it's a passthrough
+ *    (e.g., "vitest", not "yarn test:unit"), use it and append the test file.
  * 2. Otherwise, invoke the framework CLI directly with the test file.
  */
 export function buildTestCommand(
@@ -821,30 +912,48 @@ export function buildTestCommand(
     configFile,
     configIsWorkspace,
     testPathRelativeToWorkspace,
-    testScripts,
   } = resolution;
 
   // Use the override if provided, otherwise fall back to the resolved path
   const testPath = targetFileRelativeToWorkspace || testPathRelativeToWorkspace;
 
   if (!framework) {
-    // No framework detected — try package.json test script as fallback
-    if (testScripts && testScripts.length > 0) {
-      return buildPackageManagerCommand(packageManager, testScripts[0]!, [testPath]);
+    // No framework detected — try package.json test script as fallback,
+    // but only if it's a passthrough script
+    if (resolution.testScripts && resolution.testScripts.length > 0) {
+      const pkg = readPkgJson(resolution.workspaceDir);
+      const scripts = pkg?.scripts || {};
+      const firstScript = resolution.testScripts[0]!;
+      const firstScriptCmd = scripts[firstScript];
+
+      if (firstScriptCmd && isPassthroughTestScript(firstScriptCmd)) {
+        return buildPackageManagerCommand(packageManager, firstScript, [testPath]);
+      }
     }
-    // Fallback to npm test
-    return packageManager === "unknown"
-      ? { command: "npm", args: ["run", "test", "--", testPath] }
-      : buildPackageManagerCommand(packageManager, "test", [testPath]);
+
+    // Fallback to npm test (via package manager)
+    return buildPackageManagerCommand(packageManager, "test", [testPath]);
   }
 
-  // If package has a test script, prefer it over generic framework invocation
-  // This ensures the package's own test setup/environment is used
-  if (testScripts && testScripts.length > 0) {
-    return buildPackageManagerCommand(packageManager, testScripts[0]!, [testPath]);
+  // Framework was detected. Check if we have a passthrough test script.
+  if (resolution.testScripts && resolution.testScripts.length > 0) {
+    const pkg = readPkgJson(resolution.workspaceDir);
+    const scripts = pkg?.scripts || {};
+
+    // Find the first passthrough script
+    for (const scriptName of resolution.testScripts) {
+      const scriptCmd = scripts[scriptName];
+      if (scriptCmd && isPassthroughTestScript(scriptCmd)) {
+        // This is a passthrough — we can safely pass the test file to it
+        return buildPackageManagerCommand(packageManager, scriptName, [testPath]);
+      }
+    }
+
+    // All test scripts are wrappers — fall through to direct framework invocation
   }
 
-  // Fallback: Generic framework CLI invocation
+  // No passthrough script found, or no test scripts at all.
+  // Fall back to direct framework CLI invocation.
   // If the config is workspace/projects-based, omit --config and auto-discover
   // from the workspace directory. This avoids triggering root config's project
   // glob validation which requires project matches to be config files.

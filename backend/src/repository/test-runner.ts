@@ -6,6 +6,9 @@ import type { TestFramework } from "./frameworks.js";
 import {
   resolveFramework,
   buildTestCommand,
+  detectPackageManager,
+  getTestScriptsForDir,
+  isWorkspaceConfigFile,
   type FrameworkResolution,
 } from "./framework-resolver.js";
 import {
@@ -492,10 +495,13 @@ function resolveFrameworkForMergedFile(
       options.repositoryRoot,
       generated.context.executionDirectory
     );
+    const configAbs = generated.context.configPath
+      ? path.resolve(options.repositoryRoot, generated.context.configPath)
+      : null;
 
     return {
       framework: generated.context.framework,
-      packageManager: "unknown", // We don't have this from context
+      packageManager: detectPackageManager(options.repositoryRoot),
       workspaceDir,
       workspaceRelative: generated.context.executionDirectory,
       configFile: generated.context.configPath,
@@ -503,7 +509,8 @@ function resolveFrameworkForMergedFile(
       confidence: 1.0,
       evidence: ["Resolved from mapped TestFileContext", ...generated.context.warnings],
       configVerified: true,
-      configIsWorkspace: false,
+      configIsWorkspace: configAbs ? isWorkspaceConfigFile(configAbs) : false,
+      testScripts: getTestScriptsForDir(workspaceDir),
     };
   }
 
@@ -575,9 +582,13 @@ async function runExistingTest(
     }
 
     // Build a resolution using the context
+    const configAbs = test.context.configPath
+      ? path.resolve(options.repositoryRoot, test.context.configPath)
+      : null;
+
     const resolution: FrameworkResolution = {
       framework: test.context.framework,
-      packageManager: "unknown", // We don't have this from context, but it's not critical
+      packageManager: detectPackageManager(options.repositoryRoot),
       workspaceDir,
       workspaceRelative: test.context.executionDirectory,
       configFile: test.context.configPath,
@@ -585,11 +596,14 @@ async function runExistingTest(
       confidence: 1.0, // The mapper has already done the work
       evidence: ["Resolved from mapped TestFileContext", ...test.context.warnings],
       configVerified: true, // The mapper already verified this
-      configIsWorkspace: false, // Assume leaf config unless we know otherwise
+      configIsWorkspace: configAbs ? isWorkspaceConfigFile(configAbs) : false,
+      testScripts: getTestScriptsForDir(workspaceDir),
     };
 
     console.log(
-      `[test-runner] Using mapped context for "${test.testFile}": framework="${test.context.framework}", workspace="${test.context.executionDirectory}", config="${test.context.configPath || "(default)"}"`
+      `[test-runner] Using mapped context for "${test.testFile}": framework="${test.context.framework}", ` +
+      `packageManager="${resolution.packageManager}", workspace="${test.context.executionDirectory}", ` +
+      `config="${test.context.configPath || "(default)"}", testScripts=[${(resolution.testScripts ?? []).join(", ")}]`
     );
 
     return executeTestFile(testFileAbs, resolution, options).then((partial) => ({
@@ -668,6 +682,8 @@ async function executeTestFile(
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const commandLabel = `(cwd: ${resolution.workspaceRelative}) ${command} ${args.join(" ")}`;
+
+  console.log(`[test-runner] Executing: ${commandLabel}`);
 
   return new Promise((resolve) => {
     const start = Date.now();

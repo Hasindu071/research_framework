@@ -2,9 +2,10 @@ import "dotenv/config";
 import express from "express";
 import { analyzeCommit } from "./repository/analyzer.js";
 import { buildLLMContext } from "./repository/context-builder.js";
+import { analyzeDependencyChanges } from "./repository/dependencyAnalyzer.js";
 import { LLMClient } from "./repository/llm-client.js";
 import { getPrompts } from "./repository/prompts.js";
-import { runPrioritizedTests, toPrioritizedTestInputs, enrichTestInputsWithContext, type GeneratedTestInput } from "./repository/test-runner.js";
+import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./repository/test-runner.js";
 import { prioritizeTests } from "./repository/test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
 
@@ -131,6 +132,13 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     console.log("[Step 1/5] Analyzing commit...");
     const analysis = await analyzeCommit(repositoryPath, commitHash);
     console.log(`[Step 1/5] ✓ Found ${analysis.summary.filesChanged} changed files`);
+
+    // ========================================
+    // Step 1.5: Analyze dependency changes
+    // ========================================
+    console.log("[Step 1.5/5] Analyzing dependency changes...");
+    const dependencyChanges = analyzeDependencyChanges(analysis.rawDiff);
+    console.log(`[Step 1.5/5] ✓ Found ${dependencyChanges.length} dependency change(s)`);
 
     // ========================================
     // Step 2: Build LLM context
@@ -390,6 +398,7 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
         totalInsertions: analysis.summary.totalInsertions,
         totalDeletions: analysis.summary.totalDeletions,
         changedSymbols: llmContext.changedSymbols,
+        dependencyChanges,
       },
       prioritization: {
         candidateTests: llmContext.candidateTests.length,

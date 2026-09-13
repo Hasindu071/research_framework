@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 
 import type { DependencyChange } from "../repository/dependencyAnalyzer.js";
-import type { TestMatch } from "../repository/test-analyzer.js";
+import type { TestMatch, ElementKind } from "../repository/test-analyzer.js";
 
 // ======================================================
 // NOTE ON INPUT TYPE
@@ -79,6 +79,13 @@ export interface CandidateTestSummary {
   impact?: TestMatch["impact"];
   confidence: number;
   symbols?: string[];
+  /**
+   * Kind of each symbol (function, method, class, constant, array,
+   * object, variable), keyed by symbol name. Lets the LLM understand
+   * what kind of change the test is tied to, e.g. "MAX_RETRIES
+   * (constant)" vs. "listUsers() (function)".
+   */
+  symbolKinds?: Record<string, ElementKind>;
 }
 
 export interface CodeExcerpt {
@@ -157,6 +164,7 @@ export function buildLLMContext(
     impact: match.impact,
     confidence: match.confidence,
     ...(match.symbols && { symbols: match.symbols }),
+    ...(match.symbolKinds && { symbolKinds: match.symbolKinds }),
   }));
 
   // Only the non-test changed files have "source code" in the sense

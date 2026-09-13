@@ -1,6 +1,13 @@
 import fs from "fs";
 import path from "path";
-import { Project, SyntaxKind, Node, type SourceFile } from "ts-morph";
+import {
+  Node,
+  Project,
+  SyntaxKind,
+  VariableDeclarationKind,
+  type SourceFile,
+  type VariableDeclaration,
+} from "ts-morph";
 
 /**
  * How a test was linked to a changed file, ordered here roughly by
@@ -8,9 +15,14 @@ import { Project, SyntaxKind, Node, type SourceFile } from "ts-morph";
  *   - "same-directory": co-located + related filename, positional only
  *   - "same-name": exact base filename match
  *   - "import": test resolvably imports the changed file
- *   - "symbol-usage": test calls a symbol actually defined in the
- *     changed file (AST-verified, not text search) — this is
- *     causal/behavioral evidence, not just naming/location
+ *   - "symbol-usage": test references an element actually defined in
+ *     the changed file (AST-verified, not text search) — this is
+ *     causal/behavioral evidence, not just naming/location. Covers
+ *     functions/methods/classes (via call/`new` expressions) *and*
+ *     constants/arrays/objects/variables (via real identifier
+ *     references), so a change like `MAX_RETRIES = 3 -> 5` or
+ *     `allowedRoles = [...]` gaining an entry is picked up even
+ *     though no function signature changed.
  *   - "locale-import": test imports a changed locale/translation file
  *   - "dependency": test covers a source file that imports a changed
  *     npm dependency
@@ -24,6 +36,28 @@ export type TestRelationship =
   | "dependency";
 
 /**
+ * The kind of exported binding an element is. "function"/"method"/
+ * "class" are matched via call/`new` expressions (behavioral
+ * invocation). "constant"/"array"/"object"/"variable" are matched via
+ * any real identifier reference, since they're read/compared rather
+ * than called — e.g. `expect(MAX_RETRIES).toBe(3)` or
+ * `allowedRoles.includes('author')`.
+ */
+export type ElementKind =
+  | "function"
+  | "method"
+  | "class"
+  | "constant"
+  | "array"
+  | "object"
+  | "variable";
+
+interface ExportedElement {
+  name: string;
+  kind: ElementKind;
+}
+
+/**
  * A symbol (function/method/exported binding) that a test was found
  * to invoke, along with whether the commit's diff actually touched
  * that symbol's declaration line.
@@ -35,11 +69,12 @@ export type TestRelationship =
  */
 /**
  * Whether a symbol-usage match exercises behavior the commit actually
- * changed ("direct") or merely calls some other, unmodified export
- * from the same file ("indirect") — e.g. shared setup/helper methods
- * on the same repository class. This is the distinction that matters
- * for "what does this commit impact", as opposed to "what shares a
- * file with something that changed".
+ * changed ("direct") or merely calls/references some other,
+ * unmodified export from the same file ("indirect") — e.g. shared
+ * setup/helper methods on the same repository class, or an unrelated
+ * constant exported from the same config file. This is the
+ * distinction that matters for "what does this commit impact", as
+ * opposed to "what shares a file with something that changed".
  */
 export type SymbolImpact = "direct" | "indirect";
 
@@ -50,23 +85,33 @@ export interface TestMatch {
   confidence: number;
   relationship: TestRelationship;
   /**
-   * Populated only for "symbol-usage" matches. Every symbol from the
-   * changed file that the test actually calls (AST-verified), not
-   * just the first one found.
+   * Populated only for "symbol-usage" matches. Every element from the
+   * changed file that the test actually references (AST-verified),
+   * not just the first one found. Includes functions/methods/classes
+   * as well as constants/arrays/objects/variables.
    */
   symbols?: string[];
   /**
    * Subset of `symbols` that the commit's diff actually touched.
    * Empty (not omitted) when the test uses the changed file but none
-   * of the specific symbols it calls were modified — that emptiness
-   * is itself meaningful, so callers shouldn't have to distinguish
-   * "empty array" from "field absent".
+   * of the specific elements it references were modified — that
+   * emptiness is itself meaningful, so callers shouldn't have to
+   * distinguish "empty array" from "field absent".
    */
   changedSymbolsUsed?: string[];
   /**
-   * "direct": at least one invoked symbol was changed by this commit.
-   * "indirect": the test invokes symbols from the changed file, but
-   * none of those specific symbols were themselves modified.
+   * Kind of each name appearing in `symbols`/`changedSymbolsUsed`
+   * (function, method, class, constant, array, object, variable),
+   * keyed by name. Lets downstream consumers (LLM context, reports)
+   * describe *what kind* of change a test is tied to, e.g.
+   * "MAX_RETRIES (constant)" vs. "listUsers() (function)".
+   */
+  symbolKinds?: Record<string, ElementKind>;
+  /**
+   * "direct": at least one referenced element was changed by this
+   * commit. "indirect": the test references elements from the
+   * changed file, but none of those specific elements were
+   * themselves modified.
    */
   impact?: SymbolImpact;
 }
@@ -314,12 +359,16 @@ function extractChangedDependencies(
   const dependencies = new Set<string>();
 
   for (const line of changedLines) {
-    if (line.type !== "added") {
+    // Process both added AND deleted lines to catch version changes
+    // For example, a version bump appears as:
+    // - "shell-quote": "1.8.2"  (type: "deleted")
+    // + "shell-quote": "1.8.4"  (type: "added")
+    if (line.type !== "added" && line.type !== "deleted") {
       continue;
     }
 
     /**
-     * Match:
+     * Match package.json format:
      *
      * "i18next-fs-backend": "^2.6.6"
      */
@@ -342,6 +391,52 @@ function extractChangedDependencies(
       continue;
     }
 
+    dependencies.add(packageName);
+  }
+
+  return Array.from(dependencies);
+}
+
+/**
+ * Extract package names from yarn.lock changes.
+ *
+ * yarn.lock format:
+ *
+ * "shell-quote@npm:^1.8.1":
+ *   version: 1.8.2
+ *   resolution: "shell-quote@npm:1.8.2"
+ */
+function extractChangedDependenciesFromYarnLock(
+  changedLines: {
+    type: string;
+    content: string;
+  }[]
+): string[] {
+  const dependencies = new Set<string>();
+
+  for (const line of changedLines) {
+    if (line.type !== "added" && line.type !== "deleted") {
+      continue;
+    }
+
+    /**
+     * Match yarn.lock package entry:
+     *
+     * "shell-quote@npm:^1.8.1":
+     *  or
+     * "shell-quote@npm:1.8.4":
+     */
+    const match = line.content.match(
+      /^\s*["']([^"'@]+)@/
+    );
+
+    if (!match?.[1]) {
+      continue;
+    }
+
+    const packageName = match[1];
+
+    // Avoid duplicates
     dependencies.add(packageName);
   }
 
@@ -489,37 +584,98 @@ function getSourceFileNode(filePath: string): SourceFile | undefined {
 }
 
 /**
- * Extract the names of symbols a source file exports that a test
- * could plausibly call directly: exported function declarations,
- * exported const/let bindings (arrow functions etc.), and methods on
- * exported classes.
+ * Classify a single exported variable declaration by the shape of
+ * its initializer. This is what lets a change to
+ *
+ *   export const MAX_RETRIES = 3;
+ *   export const allowedRoles = ['admin', 'editor'];
+ *   export const config = { timeout: 5000 };
+ *
+ * be recognized as a "constant"/"array"/"object" change respectively
+ * — not just as an opaque "exported binding" that only matters if
+ * something calls it like a function.
+ *
+ * Anything that isn't a literal (arrow/function expression, array
+ * literal, object literal, or a plain literal for `const`) falls back
+ * to "variable" — e.g. `let count = 0`, or `const x = someCall()`
+ * whose value isn't known statically.
+ */
+function classifyVariableDeclaration(
+  declaration: VariableDeclaration,
+  declarationKind: VariableDeclarationKind
+): ElementKind {
+  const initializer = declaration.getInitializer();
+
+  if (!initializer) {
+    return declarationKind === VariableDeclarationKind.Const
+      ? "constant"
+      : "variable";
+  }
+
+  if (
+    Node.isArrowFunction(initializer) ||
+    Node.isFunctionExpression(initializer)
+  ) {
+    return "function";
+  }
+
+  if (Node.isArrayLiteralExpression(initializer)) {
+    return "array";
+  }
+
+  if (Node.isObjectLiteralExpression(initializer)) {
+    return "object";
+  }
+
+  const isSimpleLiteral =
+    Node.isStringLiteral(initializer) ||
+    Node.isNumericLiteral(initializer) ||
+    Node.isNoSubstitutionTemplateLiteral(initializer) ||
+    Node.isTemplateExpression(initializer) ||
+    initializer.getKind() === SyntaxKind.TrueKeyword ||
+    initializer.getKind() === SyntaxKind.FalseKeyword ||
+    (Node.isPrefixUnaryExpression(initializer) &&
+      Node.isNumericLiteral(initializer.getOperand()));
+
+  if (declarationKind === VariableDeclarationKind.Const && isSimpleLiteral) {
+    return "constant";
+  }
+
+  return "variable";
+}
+
+/**
+ * Extract every element a source file exports that a test could
+ * plausibly reference: exported function declarations, exported
+ * const/let/var bindings (functions, constants, arrays, objects, or
+ * plain variables), and methods/name on exported classes.
  *
  * This is an AST walk, not a regex over the text — we only want real
  * declarations, not every substring in the file that looks like an
  * identifier. That distinction is exactly what fixed the earlier
  * false positives (a locale string or an unrelated identifier
- * shouldn't count as a "symbol").
+ * shouldn't count as an element).
  *
  * Known limitation: this doesn't currently resolve re-exports
  * (`export { listUsers } from "./other-file"`) back to their
- * original declaration — it only sees symbols declared directly in
+ * original declaration — it only sees elements declared directly in
  * this file.
  */
-function extractExportedSymbolNames(sourceFileAbsolute: string): string[] {
+function extractExportedElements(sourceFileAbsolute: string): ExportedElement[] {
   const sourceFile = getSourceFileNode(sourceFileAbsolute);
 
   if (!sourceFile) {
     return [];
   }
 
-  const names = new Set<string>();
+  const elements = new Map<string, ElementKind>();
 
   try {
     for (const fn of sourceFile.getFunctions()) {
       const name = fn.getName();
 
       if (fn.isExported() && name) {
-        names.add(name);
+        elements.set(name, "function");
       }
     }
 
@@ -528,8 +684,13 @@ function extractExportedSymbolNames(sourceFileAbsolute: string): string[] {
         continue;
       }
 
+      const declarationKind = variableStatement.getDeclarationKind();
+
       for (const declaration of variableStatement.getDeclarations()) {
-        names.add(declaration.getName());
+        const name = declaration.getName();
+        const kind = classifyVariableDeclaration(declaration, declarationKind);
+
+        elements.set(name, kind);
       }
     }
 
@@ -541,11 +702,11 @@ function extractExportedSymbolNames(sourceFileAbsolute: string): string[] {
       const className = cls.getName();
 
       if (className) {
-        names.add(className);
+        elements.set(className, "class");
       }
 
       for (const method of cls.getMethods()) {
-        names.add(method.getName());
+        elements.set(method.getName(), "method");
       }
     }
   } catch {
@@ -553,28 +714,38 @@ function extractExportedSymbolNames(sourceFileAbsolute: string): string[] {
     // before hitting whatever caused the failure.
   }
 
-  return Array.from(names);
+  return Array.from(elements.entries()).map(([name, kind]) => ({
+    name,
+    kind,
+  }));
 }
 
 /**
- * Check whether a test file contains real call expressions invoking
- * any of `symbolNames` — e.g. `repository.listUsers(...)` or
- * `listUsers(...)`. Walking call expressions (rather than searching
- * the raw text for the symbol name) means a symbol name that merely
- * appears in a comment, a string literal, or as an unrelated
- * identifier does not count as usage.
+ * Check whether a test file actually references any of `elements`.
  *
- * Returns every distinct symbol name that is actually called, not
- * just the first one found — a test commonly exercises several
- * methods/functions from the same changed file (e.g. both `create()`
- * and `listUsers()`), and stopping at the first match was silently
- * dropping evidence for the rest.
+ * Functions/methods/classes are matched behaviorally — a real call
+ * expression (`repository.listUsers(...)`, `listUsers(...)`) or a
+ * `new ClassName(...)` — the same AST-verified approach as before.
+ *
+ * Constants/arrays/objects/variables are *not* called, they're read,
+ * so we instead look for any real identifier reference to the name
+ * (excluding the import specifier's own identifier, since importing
+ * a name isn't "using" it). This is the piece that was missing:
+ * `import { MAX_RETRIES } from './config'; expect(MAX_RETRIES).toBe(3)`
+ * has zero call expressions on MAX_RETRIES, so the old call-only
+ * check reported no usage at all for this extremely common pattern.
+ *
+ * Returns every distinct element actually referenced, not just the
+ * first one found — a test commonly exercises several bindings from
+ * the same changed file (e.g. both `MAX_RETRIES` and `allowedRoles`),
+ * and stopping at the first match was silently dropping evidence for
+ * the rest.
  */
-function findUsedSymbols(
+function findUsedElements(
   testFileAbsolute: string,
-  symbolNames: string[]
-): string[] {
-  if (symbolNames.length === 0) {
+  elements: ExportedElement[]
+): ExportedElement[] {
+  if (elements.length === 0) {
     return [];
   }
 
@@ -584,10 +755,11 @@ function findUsedSymbols(
     return [];
   }
 
-  const symbolSet = new Set(symbolNames);
-  const used = new Set<string>();
+  const byName = new Map(elements.map((element) => [element.name, element.kind]));
+  const used = new Map<string, ElementKind>();
 
   try {
+    // Functions / methods: real call expressions.
     for (const call of testSourceFile.getDescendantsOfKind(
       SyntaxKind.CallExpression
     )) {
@@ -603,38 +775,92 @@ function findUsedSymbols(
         calledName = expression.getText();
       }
 
-      if (calledName && symbolSet.has(calledName)) {
-        used.add(calledName);
+      if (!calledName) {
+        continue;
       }
+
+      const kind = byName.get(calledName);
+
+      if (kind === "function" || kind === "method") {
+        used.set(calledName, kind);
+      }
+    }
+
+    // Classes: `new Foo(...)`.
+    for (const newExpression of testSourceFile.getDescendantsOfKind(
+      SyntaxKind.NewExpression
+    )) {
+      const expression = newExpression.getExpression();
+
+      if (!Node.isIdentifier(expression)) {
+        continue;
+      }
+
+      const name = expression.getText();
+      const kind = byName.get(name);
+
+      if (kind === "class") {
+        used.set(name, kind);
+      }
+    }
+
+    // Constants / arrays / objects / variables: any real identifier
+    // reference, since these are read/compared rather than called.
+    for (const identifier of testSourceFile.getDescendantsOfKind(
+      SyntaxKind.Identifier
+    )) {
+      const name = identifier.getText();
+      const kind = byName.get(name);
+
+      if (
+        kind !== "constant" &&
+        kind !== "array" &&
+        kind !== "object" &&
+        kind !== "variable"
+      ) {
+        continue;
+      }
+
+      const parent = identifier.getParent();
+
+      // Importing a name isn't "using" it on its own — skip the
+      // import specifier/clause's own identifier so a plain
+      // `import { MAX_RETRIES } from './config'` with no further
+      // reference doesn't count as usage by itself.
+      if (
+        parent &&
+        (Node.isImportSpecifier(parent) || Node.isImportClause(parent))
+      ) {
+        continue;
+      }
+
+      used.set(name, kind);
     }
   } catch {
     // Best-effort — return whatever we collected before the failure.
-    return Array.from(used);
+    return Array.from(used.entries()).map(([name, kind]) => ({ name, kind }));
   }
 
-  return Array.from(used);
+  return Array.from(used.entries()).map(([name, kind]) => ({ name, kind }));
 }
 
 /**
  * Given the diff for the changed source file, determine which of its
- * exported symbol names were actually touched by the commit — i.e.
- * the symbol's name appears on an added line, which for a new or
- * modified function/method/const declaration will include the
- * signature line itself.
+ * exported element names were actually touched by the commit — i.e.
+ * the element's name appears on an added line, which for a new or
+ * modified function/method/const/array/object declaration will
+ * include the declaration line itself.
  *
  * This is a line-level heuristic, not a full AST diff: it checks for
- * a whole-word match of the symbol name on any added line, rather
- * than confirming that line is specifically the *declaration* line.
- * That means a symbol whose body was edited (declaration untouched,
- * but an added line inside it happens to reference the symbol name
- * again, e.g. in a recursive call or a log message) can also be
- * flagged as "changed" — which is still a reasonable signal ("this
- * function's implementation changed"), just slightly broader than
- * "this function's signature changed". Good enough for ranking
- * behavioral relevance; not a substitute for a real diff-to-AST
- * mapping if that precision is ever needed.
+ * a whole-word match of the name on any added line, rather than
+ * confirming that line is specifically the *declaration* line. For a
+ * value change like `MAX_RETRIES = 3` -> `MAX_RETRIES = 5`, or an
+ * array literal gaining an entry, the declaration line itself is what
+ * changed, so this still lines up with "this element's value
+ * changed" — just slightly broader than "this exact line changed",
+ * the same tradeoff already accepted for function/method changes.
  */
-function extractChangedSymbolNames(
+function extractChangedElementNames(
   changedLines: {
     type: string;
     content: string;
@@ -706,65 +932,80 @@ function findFilesImportingPackage(
 
 /**
  * Build the human-readable reason, confidence, and impact
- * classification for a symbol-usage match, given every symbol the
- * test calls and which of those the commit actually changed.
+ * classification for a symbol/element-usage match, given every
+ * element the test references and which of those the commit actually
+ * changed.
  *
- * This is the direct/indirect split: a test that calls a symbol the
- * commit modified is evidence the test exercises the changed
- * behavior ("direct impact"). A test that merely calls other,
- * unmodified exports from the same file — e.g. shared setup methods
- * on the same repository class — has a real relationship to the file
- * but not to the change itself ("indirect"), and its confidence
- * should reflect that rather than being conflated with the direct
- * case. Previously both cases were reported as flat "symbol-usage"
- * at ~0.98 confidence, which overstated how relevant a
- * same-class-different-method test actually was to the commit.
+ * This is the direct/indirect split: a test that references an
+ * element the commit modified is evidence the test exercises the
+ * changed behavior ("direct impact") — whether that element is a
+ * function it calls or a constant it compares against. A test that
+ * merely references other, unmodified exports from the same file —
+ * e.g. shared setup methods on the same repository class, or an
+ * unrelated constant from the same config file — has a real
+ * relationship to the file but not to the change itself ("indirect"),
+ * and its confidence should reflect that.
  */
-function describeSymbolUsage(
-  usedSymbols: string[],
-  changedSymbolNames: Set<string>
+function describeElementUsage(
+  usedElements: ExportedElement[],
+  changedElementNames: Set<string>
 ): {
   reason: string;
   confidence: number;
   symbols: string[];
   changedSymbolsUsed: string[];
+  symbolKinds: Record<string, ElementKind>;
   impact: SymbolImpact;
 } {
-  const changedSymbolsUsed = usedSymbols.filter((name) =>
-    changedSymbolNames.has(name)
+  const symbolKinds: Record<string, ElementKind> = {};
+
+  for (const element of usedElements) {
+    symbolKinds[element.name] = element.kind;
+  }
+
+  const describe = (element: ExportedElement): string =>
+    element.kind === "function" || element.kind === "method"
+      ? `${element.name}()`
+      : `${element.name} (${element.kind})`;
+
+  const usedNames = usedElements.map((element) => element.name);
+  const changedUsed = usedElements.filter((element) =>
+    changedElementNames.has(element.name)
   );
 
-  if (changedSymbolsUsed.length > 0) {
-    const changedList = changedSymbolsUsed.map((n) => `${n}()`).join(", ");
-    const unchangedUsed = usedSymbols.filter(
-      (name) => !changedSymbolNames.has(name)
+  if (changedUsed.length > 0) {
+    const changedList = changedUsed.map(describe).join(", ");
+    const unchangedUsed = usedElements.filter(
+      (element) => !changedElementNames.has(element.name)
     );
 
-    let reason = `Test directly invokes ${changedList}, ${
-      changedSymbolsUsed.length === 1 ? "which was" : "which were"
+    let reason = `Test directly references ${changedList}, ${
+      changedUsed.length === 1 ? "which was" : "which were"
     } introduced or modified by this commit`;
 
     if (unchangedUsed.length > 0) {
-      reason += ` (also exercises pre-existing ${unchangedUsed
-        .map((n) => `${n}()`)
+      reason += ` (also references pre-existing ${unchangedUsed
+        .map(describe)
         .join(", ")})`;
     }
 
     return {
       reason,
       confidence: 0.99,
-      symbols: usedSymbols,
-      changedSymbolsUsed,
+      symbols: usedNames,
+      changedSymbolsUsed: changedUsed.map((element) => element.name),
+      symbolKinds,
       impact: "direct",
     };
   }
 
   return {
     reason:
-      "Test invokes symbols defined in the changed source file, but none of the invoked symbols were modified by this commit",
+      "Test references elements defined in the changed source file, but none of the referenced elements were modified by this commit",
     confidence: 0.65,
-    symbols: usedSymbols,
+    symbols: usedNames,
     changedSymbolsUsed: [],
+    symbolKinds,
     impact: "indirect",
   };
 }
@@ -774,13 +1015,14 @@ function describeSymbolUsage(
  *
  * Rules 1–3 establish that a test is *plausibly* related, from
  * weakest positional evidence to strongest resolvable-path evidence.
- * Whichever rule fires, we then separately check for symbol-usage
- * evidence and upgrade the match if the test actually calls something
- * the changed file exports — that's stronger than any name/path
- * coincidence, regardless of which rule found the candidate. If any
- * of the used symbols were themselves changed by this commit, that's
- * upgraded again, since it's evidence the test exercises the specific
- * behavior the commit modified, not just some other export nearby.
+ * Whichever rule fires, we then separately check for element-usage
+ * evidence and upgrade the match if the test actually references
+ * something the changed file exports — that's stronger than any
+ * name/path coincidence, regardless of which rule found the
+ * candidate. If any of the used elements were themselves changed by
+ * this commit, that's upgraded again, since it's evidence the test
+ * exercises the specific behavior the commit modified, not just some
+ * other export nearby.
  */
 function findTestsForSourceFile(
   sourceFile: string,
@@ -799,12 +1041,13 @@ function findTestsForSourceFile(
 
   /**
    * Computed once per changed source file — doesn't depend on which
-   * test file we're looking at.
+   * test file we're looking at. Covers functions/methods/classes
+   * *and* constants/arrays/objects/variables.
    */
-  const exportedSymbols = extractExportedSymbolNames(sourceFile);
-  const changedSymbolNames = extractChangedSymbolNames(
+  const exportedElements = extractExportedElements(sourceFile);
+  const changedElementNames = extractChangedElementNames(
     changedLines,
-    exportedSymbols
+    exportedElements.map((element) => element.name)
   );
 
   for (const testFileAbsolute of testFiles) {
@@ -870,17 +1113,19 @@ function findTestsForSourceFile(
     }
 
     /**
-     * SYMBOL-USAGE UPGRADE: if the test actually calls one or more
-     * symbols defined in the changed file, that's causal/behavioral
-     * evidence — stronger than any name or path coincidence — so we
-     * upgrade the match regardless of which rule above found it.
-     * Symbols the commit itself changed push confidence higher still.
+     * ELEMENT-USAGE UPGRADE: if the test actually references one or
+     * more elements defined in the changed file — a function it
+     * calls, a class it instantiates, or a constant/array/object it
+     * reads — that's causal/behavioral evidence, stronger than any
+     * name or path coincidence, so we upgrade the match regardless of
+     * which rule above found it. Elements the commit itself changed
+     * push confidence higher still.
      */
-    const usedSymbols = findUsedSymbols(testFileAbsolute, exportedSymbols);
+    const usedElements = findUsedElements(testFileAbsolute, exportedElements);
 
-    if (usedSymbols.length > 0) {
-      const { reason, confidence, symbols, changedSymbolsUsed, impact } =
-        describeSymbolUsage(usedSymbols, changedSymbolNames);
+    if (usedElements.length > 0) {
+      const { reason, confidence, symbols, changedSymbolsUsed, symbolKinds, impact } =
+        describeElementUsage(usedElements, changedElementNames);
 
       match = {
         ...match,
@@ -889,6 +1134,7 @@ function findTestsForSourceFile(
         confidence,
         symbols,
         changedSymbolsUsed,
+        symbolKinds,
         impact,
       };
     }
@@ -953,6 +1199,10 @@ function findTestsForLocaleFile(
  *    Locations.tsx
  *       ↓
  *    Locations.test.tsx
+ *
+ *    Includes both symbol changes (functions/methods/classes) and
+ *    data/value changes (constants/arrays/objects/variables) — see
+ *    findTestsForSourceFile().
  *
  * 2. Dependency changes
  *    Example:
@@ -1085,16 +1335,16 @@ export function analyzeTests(
   for (const change of changes) {
     const changedFile = normalizePath(change.file);
 
-    if (changedFile !== "package.json") {
+    if (changedFile !== "package.json" && changedFile !== "yarn.lock") {
       continue;
     }
 
-    const dependencies = extractChangedDependencies(
-      change.changedLines
-    );
+    const dependencies = changedFile === "yarn.lock"
+      ? extractChangedDependenciesFromYarnLock(change.changedLines)
+      : extractChangedDependencies(change.changedLines);
 
     console.log(
-      `Dependencies detected in package.json: ${
+      `Dependencies detected in ${changedFile}: ${
         dependencies.length
       }`
     );
@@ -1115,10 +1365,10 @@ export function analyzeTests(
 
       for (const sourceFile of affectedSourceFiles) {
         /**
-         * Symbol-usage evidence from these tests isn't meaningful
+         * Element-usage evidence from these tests isn't meaningful
          * for a dependency-driven match: the "commit" here is a
          * package.json bump, not an edit to `sourceFile` itself, so
-         * there's no diff to check for changed symbols. We still
+         * there's no diff to check for changed elements. We still
          * call findTestsForSourceFile() to reuse Rules 1–3, but the
          * resulting relationship/reason below is deliberately
          * overwritten to "dependency" rather than "symbol-usage".
