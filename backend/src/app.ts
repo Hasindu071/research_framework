@@ -8,18 +8,48 @@ import { getPrompts } from "./repository/prompts.js";
 import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./repository/test-runner.js";
 import { prioritizeTests } from "./repository/test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
+import { connectMongoDB, disconnectMongoDB, saveAnalysisResult, getAnalysisResults, listRepositories } from "./repository/mongodb-service.js";
 
 const app = express();
 
 app.use(express.json());
 
+// Initialize MongoDB connection on startup
+let mongoInitialized = false;
+let mongoConnected = false;
+
+async function initializeMongoDB() {
+  if (!mongoInitialized) {
+    try {
+      await connectMongoDB();
+      mongoInitialized = true;
+      mongoConnected = true;
+      console.log("✓ MongoDB initialized successfully");
+    } catch (error) {
+      console.error("⚠ Failed to initialize MongoDB:", error);
+      mongoInitialized = true;
+      mongoConnected = false;
+      // Don't crash the server - continue without MongoDB
+      console.log("⚠ Continuing without MongoDB - results will not be persisted");
+    }
+  }
+}
+
 app.post("/api/analyze-commit", async (req, res) => {
   try {
-    const { repositoryPath, commitHash } = req.body;
+    await initializeMongoDB();
+
+    const { repositoryPath, commitHash, repoName } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
         error: "repositoryPath and commitHash are required",
+      });
+    }
+
+    if (!repoName) {
+      return res.status(400).json({
+        error: "repoName is required",
       });
     }
 
@@ -102,6 +132,17 @@ app.post("/api/analyze-commit", async (req, res) => {
       responseData.llmError = llmError;
     }
 
+    // Save to MongoDB
+    console.log(`[Step 4] Saving analysis result to MongoDB collection '${repoName}'...`);
+    try {
+      const documentId = await saveAnalysisResult(repoName, responseData);
+      responseData.mongoId = documentId;
+      console.log(`[Step 4] ✓ Analysis result saved with ID: ${documentId}`);
+    } catch (mongoError) {
+      console.error(`[Step 4] ❌ Failed to save to MongoDB:`, mongoError);
+      responseData.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
+    }
+
     res.json(responseData);
 
   } catch (error) {
@@ -118,11 +159,19 @@ app.post("/api/analyze-commit", async (req, res) => {
 
 app.post("/api/analyze-prioritize-generate", async (req, res) => {
   try {
-    const { repositoryPath, commitHash } = req.body;
+    await initializeMongoDB();
+
+    const { repositoryPath, commitHash, repoName } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
         error: "repositoryPath and commitHash are required",
+      });
+    }
+
+    if (!repoName) {
+      return res.status(400).json({
+        error: "repoName is required",
       });
     }
 
@@ -385,7 +434,7 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     );
     console.log("========================================");
 
-    res.json({
+    const finalResponse: any = {
       success: true,
       commit: {
         hash: analysis.commit.hash,
@@ -480,7 +529,20 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
         },
         stoppedEarly: generatedExecution.stoppedEarly,
       },
-    });
+    };
+
+    // Save to MongoDB
+    console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
+    try {
+      const documentId = await saveAnalysisResult(repoName, finalResponse);
+      finalResponse.mongoId = documentId;
+      console.log(`[MongoDB] ✓ Result saved with ID: ${documentId}`);
+    } catch (mongoError) {
+      console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
+      finalResponse.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
+    }
+
+    res.json(finalResponse);
   } catch (error) {
     console.error(error);
 
@@ -496,13 +558,67 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// Get all repositories from MongoDB
+app.get("/api/repositories", async (req, res) => {
+  try {
+    await initializeMongoDB();
+    const repos = await listRepositories();
+    res.json({
+      success: true,
+      repositories: repos,
+      count: repos.length,
+    });
+  } catch (error) {
+    console.error("Failed to list repositories:", error);
+    res.status(500).json({
+      error: "Failed to list repositories",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Get all analysis results for a specific repository
+app.get("/api/repositories/:repoName", async (req, res) => {
+  try {
+    await initializeMongoDB();
+    const { repoName } = req.params;
+    const results = await getAnalysisResults(repoName);
+    res.json({
+      success: true,
+      repoName,
+      count: results.length,
+      results: results.map((r) => ({
+        _id: r._id,
+        savedAt: r.savedAt,
+        savedAtTimestamp: r.savedAtTimestamp,
+        commit: r.commit,
+        analysis: r.analysis,
+      })),
+    });
+  } catch (error) {
+    console.error("Failed to get repository results:", error);
+    res.status(500).json({
+      error: "Failed to get repository results",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
 app.post("/api/run-generated-tests", async (req, res) => {
   try {
-    const { repositoryPath, generatedTests } = req.body;
+    await initializeMongoDB();
+
+    const { repositoryPath, generatedTests, repoName } = req.body;
 
     if (!repositoryPath || !generatedTests || !Array.isArray(generatedTests)) {
       return res.status(400).json({
         error: "repositoryPath and generatedTests array are required",
+      });
+    }
+
+    if (!repoName) {
+      return res.status(400).json({
+        error: "repoName is required",
       });
     }
 
@@ -538,7 +654,7 @@ app.post("/api/run-generated-tests", async (req, res) => {
       skipped: results.testExecution.filter(t => t.status === "skipped").length,
     };
 
-    res.json({
+    const finalResponse: any = {
       success: true,
       testExecution: results.testExecution.map(result => ({
         testFile: result.testFile,
@@ -553,7 +669,20 @@ app.post("/api/run-generated-tests", async (req, res) => {
       summary: stats,
       stoppedEarly: results.stoppedEarly,
       note: "Generated test files are preserved in __generated__/ subdirectories for inspection",
-    });
+    };
+
+    // Save to MongoDB
+    console.log(`[MongoDB] Saving test results to collection '${repoName}'...`);
+    try {
+      const documentId = await saveAnalysisResult(repoName, finalResponse);
+      finalResponse.mongoId = documentId;
+      console.log(`[MongoDB] ✓ Test results saved with ID: ${documentId}`);
+    } catch (mongoError) {
+      console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
+      finalResponse.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
+    }
+
+    res.json(finalResponse);
   } catch (error) {
     console.error(error);
 
@@ -566,11 +695,19 @@ app.post("/api/run-generated-tests", async (req, res) => {
 
 app.post("/api/analyze-and-run", async (req, res) => {
   try {
-    const { repositoryPath, commitHash } = req.body;
+    await initializeMongoDB();
+
+    const { repositoryPath, commitHash, repoName } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
         error: "repositoryPath and commitHash are required",
+      });
+    }
+
+    if (!repoName) {
+      return res.status(400).json({
+        error: "repoName is required",
       });
     }
 
@@ -717,7 +854,7 @@ app.post("/api/analyze-and-run", async (req, res) => {
     console.log("Full pipeline completed successfully");
     console.log("========================================");
 
-    res.json({
+    const finalData: any = {
       success: true,
       commit: {
         hash: analysis.commit.hash,
@@ -744,7 +881,20 @@ app.post("/api/analyze-and-run", async (req, res) => {
         },
         testExecution: testRunResults.testExecution,
       },
-    });
+    };
+
+    // Save to MongoDB
+    console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
+    try {
+      const documentId = await saveAnalysisResult(repoName, finalData);
+      finalData.mongoId = documentId;
+      console.log(`[MongoDB] ✓ Result saved with ID: ${documentId}`);
+    } catch (mongoError) {
+      console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
+      finalData.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
+    }
+
+    res.json(finalData);
   } catch (error) {
     console.error(error);
 
@@ -757,8 +907,17 @@ app.post("/api/analyze-and-run", async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   console.log(`POST http://localhost:${PORT}/api/analyze-commit`);
   console.log(`GET http://localhost:${PORT}/api/health`);
+  console.log("");
+  
+  // Try to initialize MongoDB on startup
+  await initializeMongoDB();
+  if (mongoConnected) {
+    console.log("✓ MongoDB is ready");
+  } else {
+    console.log("⚠ MongoDB is not available - using in-memory storage only");
+  }
 });
