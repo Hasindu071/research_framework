@@ -2,6 +2,7 @@ import { simpleGit } from "simple-git";
 import { analyzeSymbol } from "./symbol-analyzer.js";
 import { analyzeDependencyChanges } from "./dependencyAnalyzer.js";
 import { analyzeTests } from "./test-analyzer.js";
+import { Node, Project, type SourceFile } from "ts-morph";
 import type { DependencyChange } from "./dependencyAnalyzer.js";
 import type { TestAnalysisResult } from "./test-analyzer.js";
 
@@ -13,7 +14,7 @@ interface SymbolChange {
   oldName: string;
   newName: string;
   file: string;
-  type: "rename";
+  type: "rename" | "modified";
 }
 
 interface ChangedLine {
@@ -134,18 +135,44 @@ export async function analyzeCommit(
   );
 
   // ==================================================
-  // 4. Detect REAL symbol renames
+  // 4. Detect symbol changes: renames first, then
+  //    everything else that was modified in place
   // ==================================================
 
   const symbolChanges =
     detectSymbolRenames(changes);
 
+  const renamedSymbolNames =
+    new Set<string>();
+
+  for (const s of symbolChanges) {
+    renamedSymbolNames.add(s.oldName);
+    renamedSymbolNames.add(s.newName);
+  }
+
+  const modifiedSymbols =
+    await detectModifiedSymbols(
+      changes,
+      git,
+      commitHash,
+      renamedSymbolNames
+    );
+
+  const allSymbolChanges = [
+    ...symbolChanges,
+    ...modifiedSymbols,
+  ];
+
   console.log(
     `Symbol renames detected: ${symbolChanges.length}`
   );
 
+  console.log(
+    `Symbols modified in place: ${modifiedSymbols.length}`
+  );
+
   // ==================================================
-  // 5. Analyze renamed symbols
+  // 5. Analyze changed symbols
   // ==================================================
 
   const symbolAnalysis: {
@@ -160,7 +187,7 @@ export async function analyzeCommit(
   const analyzedSymbols =
     new Set<string>();
 
-  for (const symbolChange of symbolChanges) {
+  for (const symbolChange of allSymbolChanges) {
 
     const symbolName =
       symbolChange.newName;
@@ -233,7 +260,7 @@ export async function analyzeCommit(
     },
 
     changes,
-    symbolChanges,
+    symbolChanges: allSymbolChanges,
     symbolAnalysis,
     dependencyChanges,
     testAnalysis,
@@ -409,6 +436,7 @@ function parseDiff(
         changedLines.push({
           type: "deleted",
           content: line.substring(1),
+          newLineNumber,
         });
       }
 
@@ -431,6 +459,199 @@ function parseDiff(
   }
 
   return changes;
+}
+
+// ======================================================
+// DETECT MODIFIED (NOT NECESSARILY RENAMED) SYMBOLS
+// ======================================================
+//
+// detectSymbolRenames() only fires when a deleted line and an added
+// line are near-identical except for one identifier. A commit that
+// just edits the body of GeneralView (e.g. changing useMemo deps or
+// a Select's options) produces no such pair — nothing was "renamed",
+// something was modified. This pass:
+//
+//   changed line (added OR deleted)
+//        ↓
+//   position in the new file's AST
+//        ↓
+//   nearest named enclosing declaration
+//        ↓
+//   "this symbol was modified"
+//
+// It intentionally does NOT require the declaration line itself to
+// be part of the diff.
+//
+// ======================================================
+
+function getNodeNameIfDeclaration(
+  node: Node
+): string | undefined {
+
+  if (Node.isFunctionDeclaration(node)) {
+    return node.getName();
+  }
+
+  if (Node.isClassDeclaration(node)) {
+    return node.getName();
+  }
+
+  if (Node.isMethodDeclaration(node)) {
+    return node.getName();
+  }
+
+  if (Node.isVariableDeclaration(node)) {
+    const init = node.getInitializer();
+    if (
+      init &&
+      (Node.isArrowFunction(init) ||
+        Node.isFunctionExpression(init))
+    ) {
+      return node.getName();
+    }
+  }
+
+  return undefined;
+}
+
+// Walk up from the changed line's position to the nearest *named*
+// enclosing declaration (component, function, method, class). This is
+// what lets a line deep inside a useMemo callback inside GeneralView
+// still resolve to "GeneralView" — the useMemo callback itself is
+// anonymous, so we keep climbing until we hit something with a name.
+function findEnclosingSymbolName(
+  sourceFile: SourceFile,
+  lineNumber: number
+): string | undefined {
+
+  let pos: number;
+
+  try {
+    pos = sourceFile.compilerNode.getPositionOfLineAndCharacter(
+      Math.max(lineNumber - 1, 0),
+      0
+    );
+  } catch {
+    return undefined;
+  }
+
+  let current: Node | undefined =
+    sourceFile.getDescendantAtPos(pos);
+
+  while (current) {
+    const name =
+      getNodeNameIfDeclaration(current);
+
+    if (name) {
+      return name;
+    }
+
+    current = current.getParent();
+  }
+
+  return undefined;
+}
+
+async function detectModifiedSymbols(
+  changes: FileChange[],
+  git: ReturnType<typeof simpleGit>,
+  commitHash: string,
+  renamedSymbolNames: Set<string>
+): Promise<SymbolChange[]> {
+
+  const results: SymbolChange[] = [];
+  const seen = new Set<string>();
+
+  const project = new Project({
+    useInMemoryFileSystem: true,
+    skipAddingFilesFromTsConfig: true,
+    compilerOptions: {
+      allowJs: true,
+      jsx: 4, // 4 = ts.JsxEmit.ReactJSX
+    },
+  });
+
+  for (const change of changes) {
+
+    if (change.binary) {
+      continue;
+    }
+
+    if (change.status === "deleted") {
+      continue; // file doesn't exist at this commit anymore
+    }
+
+    if (!/\.(ts|tsx|js|jsx)$/.test(change.file)) {
+      continue;
+    }
+
+    let content: string;
+
+    try {
+      // Fetch the file exactly as it exists AT this commit, rather than
+      // trusting whatever happens to be checked out on disk.
+      content = await git.show([
+        `${commitHash}:${change.file}`,
+      ]);
+    } catch {
+      continue; // e.g. path changed shape across a rename we can't resolve here
+    }
+
+    let sourceFile: SourceFile;
+
+    try {
+      sourceFile = project.createSourceFile(
+        `/__virtual__/${change.file.replace(/[\\/]/g, "__")}`,
+        content,
+        { overwrite: true }
+      );
+    } catch {
+      continue; // unparsable — skip rather than throw
+    }
+
+    const anchorLines = new Set<number>();
+
+    for (const line of change.changedLines) {
+      if (line.newLineNumber !== undefined) {
+        anchorLines.add(line.newLineNumber);
+      }
+    }
+
+    for (const lineNumber of anchorLines) {
+      const symbolName =
+        findEnclosingSymbolName(
+          sourceFile,
+          lineNumber
+        );
+
+      if (!symbolName) {
+        continue;
+      }
+
+      // Already reported as a rename — don't double-report the same
+      // identifier as both "rename" and "modified".
+      if (renamedSymbolNames.has(symbolName)) {
+        continue;
+      }
+
+      const key = `${change.file}:${symbolName}`;
+
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+
+      results.push({
+        oldName: symbolName,
+        newName: symbolName,
+        file: change.file,
+        type: "modified",
+      });
+    }
+  }
+
+  return results;
 }
 
 // ======================================================

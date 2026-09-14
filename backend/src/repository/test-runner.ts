@@ -716,6 +716,15 @@ async function executeTestFile(
     child.on("close", (exitCode) => {
       clearTimeout(timer);
 
+        console.log("========== TEST DEBUG ==========");
+        console.log("Command:", commandLabel);
+        console.log("Working directory:", resolution.workspaceDir);
+        console.log("Test path:", testFilePath);
+        console.log("Exit code:", exitCode);
+        console.log("STDOUT:", stdout);
+        console.log("STDERR:", stderr);
+        console.log("================================");
+
       const duration = (Date.now() - start) / 1000;
 
       // Exit code mapping:

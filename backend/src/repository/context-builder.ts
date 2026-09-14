@@ -34,7 +34,7 @@ interface CommitAnalysisLike {
     oldName: string;
     newName: string;
     file: string;
-    type: "rename";
+    type: "rename" | "modified";
   }[];
   dependencyChanges: DependencyChange[];
   testAnalysis: {
@@ -245,8 +245,11 @@ function buildChangedSymbols(
     result.push({ name, file, changeType });
   };
 
-  for (const rename of analysis.symbolChanges) {
-    add(rename.newName, rename.file, "renamed");
+  for (const symbolChange of analysis.symbolChanges) {
+    // If it was detected as a rename, report as "renamed"
+    // If it was detected as a modified (oldName === newName), report as "modified"
+    const changeType = symbolChange.type === "rename" ? "renamed" : "modified";
+    add(symbolChange.newName, symbolChange.file, changeType);
   }
 
   for (const match of analysis.testAnalysis.relatedTests) {
