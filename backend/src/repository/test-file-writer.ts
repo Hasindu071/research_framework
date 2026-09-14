@@ -173,32 +173,107 @@ export function mergeGeneratedTests(
     testCode: cleanGeneratedTestCode(t.testCode),
   }));
 
-  // Extract all imports from all tests
+  // Extract all imports and vi.mock() calls from all tests
   const allImports = new Set<string>();
-  const allTestLines: string[] = [];
+  const allMocks: string[] = [];
 
   for (const t of cleanedTests) {
-    const lines = t.testCode.split("\n");
+    let code = t.testCode;
+    
+    // Extract complete vi.mock() statements by parsing line by line
+    const lines = code.split("\n");
+    const mockLines: string[] = [];
+    const testLines: string[] = [];
+    let inMock = false;
+    let mockDepth = 0;
+    let currentMock = "";
+    
     for (const line of lines) {
       const trimmed = line.trim();
-      if (trimmed.startsWith("import ")) {
+      
+      // Check if this line starts a vi.mock() call
+      if (!inMock && trimmed.startsWith("vi.mock(")) {
+        inMock = true;
+        currentMock = line;
+        mockDepth = 0;
+        // Count opening parens
+        for (const ch of line) {
+          if (ch === "(") mockDepth++;
+          else if (ch === ")") mockDepth--;
+        }
+      } else if (inMock) {
+        currentMock += "\n" + line;
+        // Count parens
+        for (const ch of line) {
+          if (ch === "(") mockDepth++;
+          else if (ch === ")") mockDepth--;
+        }
+        // Check if mock is complete (all parens closed and line ends with semicolon)
+        if (mockDepth === 0 && (trimmed.endsWith(");") || trimmed === ")")) {
+          mockLines.push(currentMock);
+          currentMock = "";
+          inMock = false;
+        }
+      } else if (trimmed.startsWith("import ")) {
+        // Extract imports separately
         allImports.add(trimmed);
-      } else if (trimmed.length > 0) {
-        allTestLines.push(trimmed);
+      } else if (trimmed.length > 0 && !trimmed.startsWith("import ")) {
+        // Regular test code
+        testLines.push(line);
       }
+    }
+    
+    // If we ended while still in a mock, add what we have
+    if (inMock && currentMock) {
+      mockLines.push(currentMock);
+    }
+    
+    // Add all extracted mocks
+    for (const mock of mockLines) {
+      allMocks.push(mock);
     }
   }
 
-  // Build import block at file top
-  const importBlock = allImports.size > 0 ? Array.from(allImports).join("\n") + "\n\n" : "";
+  // Build import and mock block at file top
+  // Order: imports first, then mocks (vitest requirement)
+  let topLevelBlock = "";
+  if (allImports.size > 0) {
+    topLevelBlock += Array.from(allImports).join("\n") + "\n\n";
+  }
+  if (allMocks.length > 0) {
+    topLevelBlock += allMocks.join("\n\n") + "\n\n";
+  }
 
   // Build indented test block for describe
   const generatedBlock = cleanedTests
     .map((t) => {
       const lines = t.testCode.split("\n");
-      const testOnlyLines = lines
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && !line.startsWith("import "));
+      const testOnlyLines: string[] = [];
+      let inMock = false;
+      let mockDepth = 0;
+      
+      for (const line of lines) {
+        const trimmed = line.trim();
+        
+        // Skip vi.mock() lines and everything inside them
+        if (!inMock && trimmed.startsWith("vi.mock(")) {
+          inMock = true;
+          mockDepth = 0;
+          for (const ch of line) {
+            if (ch === "(") mockDepth++;
+            else if (ch === ")") mockDepth--;
+          }
+          if (mockDepth === 0) inMock = false;
+        } else if (inMock) {
+          for (const ch of line) {
+            if (ch === "(") mockDepth++;
+            else if (ch === ")") mockDepth--;
+          }
+          if (mockDepth === 0) inMock = false;
+        } else if (!trimmed.startsWith("import ") && trimmed.length > 0) {
+          testOnlyLines.push(trimmed);
+        }
+      }
       
       return (
         `\n  // Auto-generated — addresses a coverage gap identified from this commit's diff (${t.name})\n` +
@@ -217,7 +292,7 @@ export function mergeGeneratedTests(
       .replace(/\.(ts|tsx|js|jsx)$/, "");
 
     const scaffold =
-      importBlock +
+      topLevelBlock +
       `import * as ${toIdentifier(symbolBase)} from "${relativeImport}";\n\n` +
       `describe("${symbolBase}", () => {${generatedBlock}\n});\n`;
 
@@ -234,27 +309,43 @@ export function mergeGeneratedTests(
   const originalContent = fs.readFileSync(testFileAbsolute, "utf8");
   const insertionIndex = findOuterBlockInsertionPoint(originalContent);
 
-  // Add imports at the top of the file if not already present
+  // Add imports and mocks at the top of the file if not already present
   let finalContent: string;
-  if (importBlock.trim().length > 0) {
+  if (topLevelBlock.trim().length > 0) {
     const existingImports = originalContent.match(/^import .+$/gm) || [];
+    const existingMockStarts = originalContent.match(/^vi\.mock\(/gm) || [];
+    
     const newImports = Array.from(allImports).filter(
       (imp) => !existingImports.some((existing) => existing.trim() === imp)
     );
     
-    if (newImports.length > 0) {
+    // Only add mocks if we don't have roughly the same number
+    const shouldAddMocks = allMocks.length > 0 && existingMockStarts.length < allMocks.length;
+    
+    if (newImports.length > 0 || shouldAddMocks) {
       const firstImportIdx = originalContent.search(/^import /m);
       if (firstImportIdx !== -1) {
-        // Insert after existing imports
+        // Insert after first import line
         const insertAfterIdx = originalContent.indexOf("\n", firstImportIdx);
+        let insertedContent = "";
+        if (newImports.length > 0) {
+          insertedContent += newImports.join("\n") + "\n";
+        }
+        if (shouldAddMocks) {
+          insertedContent += allMocks.join("\n\n") + "\n\n";
+        }
         finalContent =
           originalContent.slice(0, insertAfterIdx + 1) +
-          newImports.join("\n") +
-          "\n" +
+          insertedContent +
           originalContent.slice(insertAfterIdx + 1);
       } else {
         // No imports exist, add at the top
-        finalContent = newImports.join("\n") + "\n\n" + originalContent;
+        finalContent =
+          newImports.join("\n") +
+          (newImports.length > 0 ? "\n\n" : "") +
+          allMocks.join("\n\n") +
+          (allMocks.length > 0 ? "\n\n" : "") +
+          originalContent;
       }
     } else {
       finalContent = originalContent;

@@ -36,6 +36,77 @@ interface RawGenerationResponse {
 const MAX_GENERATED_TESTS_PER_TARGET = 8;
 
 // ======================================================
+// TEMPLATE DISCOVERY
+// ======================================================
+
+/**
+ * Search the repository for a template test file matching the given framework.
+ * Used when creating new test files from scratch.
+ */
+async function findTemplateTestFile(
+  repositoryRoot: string,
+  targetFramework: string
+): Promise<{ file: string; content: string } | null> {
+  try {
+    // Import fs to read files
+    const fs = await import("fs");
+    const path = await import("path");
+    const { glob } = await import("glob");
+
+    // Search for test files with common patterns
+    const testPatterns = [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.spec.ts",
+      "**/*.spec.tsx",
+      "**/tests/**/*.ts",
+      "**/tests/**/*.tsx",
+    ];
+
+    for (const pattern of testPatterns) {
+      const testFiles = await glob(pattern, {
+        cwd: repositoryRoot,
+        ignore: ["**/node_modules/**", "**/dist/**", "**/.next/**"],
+        maxDepth: 10,
+      });
+
+      // Try to find a test file with matching framework
+      for (const testFile of testFiles.slice(0, 20)) {
+        // Check framework based on filename and content
+        const framework = inferFrameworkFromFileName(testFile);
+        if (framework === targetFramework) {
+          try {
+            const fullPath = path.join(repositoryRoot, testFile);
+            const content = fs.readFileSync(fullPath, "utf-8");
+            
+            // Make sure it has actual test content, not just imports
+            if (content.includes("it(") || content.includes("test(") || content.includes("describe(")) {
+              console.log(
+                `[Test-Generator] Found template test file for "${targetFramework}": ${testFile}`
+              );
+              return { file: testFile, content };
+            }
+          } catch {
+            // Skip files we can't read
+            continue;
+          }
+        }
+      }
+    }
+
+    console.log(
+      `[Test-Generator] No template test file found in repository for framework "${targetFramework}"`
+    );
+    return null;
+  } catch (error) {
+    console.log(
+      `[Test-Generator] Template search failed (non-critical): ${error instanceof Error ? error.message : String(error)}`
+    );
+    return null;
+  }
+}
+
+// ======================================================
 // BUILD TARGETS FROM PRIORITIZED TESTS
 // ======================================================
 
@@ -67,6 +138,7 @@ export async function buildGenerationTargets(
   context: LLMContext,
   llmClient: LLMClient,
   rawDiff: string,
+  repositoryRoot: string,
   options: { topN?: number } = {}
 ): Promise<GenerationTargetingResult> {
   const topN = options.topN ?? prioritized.length;
@@ -141,10 +213,55 @@ export async function buildGenerationTargets(
     );
 
     const sourceCodeExcerpt = context.sourceCode.find((s) => s.file === symbol.file);
-    const testCodeExcerpt = resolution.isNewFile
-      ? undefined
-      : context.testCode.find((t) => t.file === resolution.testFile);
     const testFramework = inferFrameworkFromFileName(resolution.testFile);
+    
+    // For new test files, find a template test file from the same framework to use as a style guide
+    let testCodeExcerpt: { file: string; content: string } | undefined;
+    let templateFile: string | undefined;
+    let isTemplate = false;
+    
+    if (resolution.isNewFile) {
+      // First, try to find a template from candidate tests (tests related to this commit)
+      let templateCandidate = context.testCode.find((t) => {
+        const candidateFramework = inferFrameworkFromFileName(t.file);
+        return candidateFramework === testFramework;
+      });
+      
+      if (templateCandidate) {
+        testCodeExcerpt = templateCandidate;
+        templateFile = templateCandidate.file;
+        isTemplate = true;
+        console.log(
+          `[Test-Generator] Using template test file for style reference: ${templateFile}`
+        );
+      } else {
+        // Second, search the entire repository for a matching framework test file
+        console.log(
+          `[Test-Generator] No candidate tests found for framework "${testFramework}". ` +
+          `Searching repository for a template test file...`
+        );
+        const repositoryTemplate = await findTemplateTestFile(repositoryRoot, testFramework);
+        
+        if (repositoryTemplate) {
+          testCodeExcerpt = {
+            file: repositoryTemplate.file,
+            content: repositoryTemplate.content,
+          };
+          templateFile = repositoryTemplate.file;
+          isTemplate = true;
+          console.log(
+            `[Test-Generator] Found repository template test file: ${templateFile}`
+          );
+        } else {
+          console.log(
+            `[Test-Generator] No template test file found in repository for framework "${testFramework}". ` +
+            `Gemini will generate test structure from scratch (using file structure conventions).`
+          );
+        }
+      }
+    } else {
+      testCodeExcerpt = context.testCode.find((t) => t.file === resolution.testFile);
+    }
 
     const relatedPrioritizedEvidence = prioritized
       .filter((p) => matchesForFile.some((m) => m.testFile === p.testFile))
@@ -158,6 +275,7 @@ export async function buildGenerationTargets(
       commitMessage: context.commit.message,
       existingTestFile: resolution.testFile,
       existingTestCode: testCodeExcerpt?.content ?? "",
+      existingTestCodeIsTemplate: isTemplate,
       // NOTE: TestGenerationTarget in generator-types.ts needs this field
       // added — it's what test-runner.ts uses to decide whether to
       // scaffold a brand-new file or extend an existing one.
@@ -166,7 +284,9 @@ export async function buildGenerationTargets(
       notes: [
         `Symbol ${symbol.changeType}`,
         resolution.isNewFile
-          ? "No related test file found for this source file — a new test file will be created"
+          ? templateFile
+            ? `No related test file found — using ${templateFile} as style template`
+            : "No related test file found for this source file — a new test file will be created from scratch"
           : `Selected as the single best related test file via "${resolution.match?.relationship}" relationship`,
         ...relatedPrioritizedEvidence,
       ],

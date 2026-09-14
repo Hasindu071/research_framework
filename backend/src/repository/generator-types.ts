@@ -27,6 +27,8 @@ export interface TestGenerationTarget {
   /** Existing test file this generation should extend/mirror, if any. */
   existingTestFile?: string;
   existingTestCode?: string;
+  /** If true, existingTestCode is from a template file (not the target testFile itself). */
+  existingTestCodeIsTemplate?: boolean;
   /** Test framework to target, e.g. "vitest". */
   framework: string;
   /** Optional extra static-analysis context: prioritizer evidence, related symbols, etc. */

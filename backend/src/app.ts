@@ -233,6 +233,7 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       llmContext,
       llmClient,
       analysis.rawDiff,
+      repositoryPath,
       { topN: 5 }
     );
     console.log(`[Step 4/5] ✓ Built ${generationTargets.length} generation target(s) from ${gapAnalyses.length} analyzed symbol(s)`);

@@ -25,6 +25,12 @@ Hard rules:
 - Match the existing test file's framework, style, imports, and conventions exactly. If no existing test file is given, use idiomatic style for the stated framework.
 - Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this."
 - Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
+- Mock placement (CRITICAL for vitest): ALL import statements and vi.mock() calls MUST appear at the very top of the test file, BEFORE any describe() or it() blocks. In vitest, vi.mock() must be at top-level module scope to work correctly. The file structure MUST be:
+  1. import statements (for vitest, testing library, and your symbol)
+  2. vi.mock() calls (if needed) — keep each mock on one line if possible, or format it complete and properly (opening paren on first line, closing paren with semicolon on last line)
+  3. describe() blocks with it() test cases
+  Do NOT put vi.mock() inside describe() blocks or nested anywhere — it will fail.
+  CRITICAL: Mock return values that are objects MUST be formatted correctly: the entire mock definition must parse as complete JavaScript. A mock statement must be complete with all braces and parentheses balanced.
 
 JSON formatting (CRITICAL):
 Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
@@ -102,9 +108,15 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
   sections.push(`## Test framework\n${target.framework}`);
 
   if (target.existingTestFile && target.existingTestCode) {
-    sections.push(
-      `## Existing test file (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nMatch this file's style and conventions. Use the import path from "Import path for tests (CRITICAL...)" above — do not copy imports from the existing test file if they import the symbol from a different path.`
-    );
+    if (target.existingTestCodeIsTemplate) {
+      sections.push(
+        `## Style template (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nThis is a reference from an existing test file in the same framework (${target.framework}). Use it as a template for:\n- File structure\n- Import organization\n- Test setup patterns\n- Assertion style\n- Mocking patterns\n\nBut generate the actual test code for "${target.symbol}" from scratch using the import path provided in "Import path for tests (CRITICAL...)" above.`
+      );
+    } else {
+      sections.push(
+        `## Existing test file (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nMatch this file's style and conventions. Use the import path from "Import path for tests (CRITICAL...)" above — do not copy imports from the existing test file if they import the symbol from a different path.`
+      );
+    }
   } else {
     sections.push(
       `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.`
