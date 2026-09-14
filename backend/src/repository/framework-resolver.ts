@@ -404,7 +404,14 @@ function extractTestMatchPatterns(content: string): string[] {
  * router that delegates to sub-configs, and shouldn't be treated as
  * directly verifiable via DEFAULT_INCLUDE fallback.
  */
-function configHasWorkspaceProjects(content: string): boolean {
+function configHasWorkspaceProjects(content: string, framework?: TestFramework): boolean {
+  // For Playwright, "projects" means browser targets (chromium, firefox, webkit),
+  // NOT a workspace configuration. Only "workspace" indicates a workspace config.
+  if (framework === "playwright") {
+    return /\bworkspace\s*:\s*/.test(content);
+  }
+  // For other frameworks (Vitest, Jest, etc.), both "projects" and "workspace"
+  // indicate a workspace/multi-project configuration.
   return /\b(projects|workspace)\s*:\s*/.test(content);
 }
 
@@ -414,11 +421,14 @@ function configHasWorkspaceProjects(content: string): boolean {
  * router rather than a leaf config. Exported so callers building a
  * FrameworkResolution from external context can make the same
  * --config vs. auto-discover decision that resolveFramework() makes.
+ * 
+ * For Playwright, only "workspace" indicates a workspace config;
+ * "projects" refers to browser targets, not workspace routing.
  */
-export function isWorkspaceConfigFile(configPathAbs: string): boolean {
+export function isWorkspaceConfigFile(configPathAbs: string, framework?: TestFramework): boolean {
   try {
     const content = fs.readFileSync(configPathAbs, "utf8");
-    return configHasWorkspaceProjects(content);
+    return configHasWorkspaceProjects(content, framework);
   } catch {
     return false;
   }
@@ -741,7 +751,7 @@ export function resolveFramework(
           path.join(candidate.dir, candidate.file),
           "utf8"
         );
-        configIsWorkspace = configHasWorkspaceProjects(content);
+        configIsWorkspace = configHasWorkspaceProjects(content, candidate.framework);
       } catch {
         configIsWorkspace = false;
       }

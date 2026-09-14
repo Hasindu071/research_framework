@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
+import * as os from "os";
 
 import type { TestFramework } from "./frameworks.js";
 import {
@@ -17,6 +18,61 @@ import {
   type MergeResult,
 } from "./test-file-writer.js";
 import type { TestFileContext } from "./test-context-mapper.js";
+import {
+  extractUnresolvedAlias,
+  resolveAliasTarget,
+  writeAliasOverrideConfig,
+  cleanupOverrideConfig,
+} from "./alias-resolver.js";
+
+// ======================================================
+// WORKSPACE-AWARE CONFIG RESOLUTION
+// ======================================================
+
+const VITEST_CONFIG_NAMES = [
+  "vitest.config.ts",
+  "vitest.config.mts",
+  "vitest.config.js",
+  "vite.config.ts",
+  "vite.config.mts",
+];
+
+/**
+ * Walk up from the test file to find the nearest vitest/vite config.
+ * For monorepos, prefer package-level configs (closer to the file) over root configs.
+ * This ensures each package's alias resolution is respected.
+ * 
+ * Returns the CLOSEST config (most specific to the test file's package),
+ * not the first one found when walking up.
+ */
+function findNearestVitestConfig(
+  testFileAbsolute: string,
+  repositoryRoot: string
+): { configPath: string; cwd: string } | null {
+  let dir = path.dirname(testFileAbsolute);
+  const rootResolved = path.resolve(repositoryRoot);
+  
+  // Find the CLOSEST config (most specific)
+  let closestConfig: { configPath: string; cwd: string } | null = null;
+
+  while (dir.startsWith(rootResolved)) {
+    for (const name of VITEST_CONFIG_NAMES) {
+      const candidate = path.join(dir, name);
+      if (fs.existsSync(candidate)) {
+        // Found a config in this directory. Since we're walking UP,
+        // the first one we find is the closest (most specific).
+        closestConfig = { configPath: candidate, cwd: dir };
+        // Return immediately — we want the closest, not the root
+        return closestConfig;
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  return closestConfig;
+}
 
 // ======================================================
 // TYPES
@@ -657,46 +713,88 @@ async function runExistingTest(
 }
 
 /**
- * Core test execution: spawn the framework command and capture results.
- *
- * `testFilePath` is an absolute path to the test file to run — either a
- * pre-existing file, or the real file a generated test was just merged
- * into. It will be converted to a path relative to
- * `resolution.workspaceDir` before passing to `buildTestCommand`.
+ * Core test execution spawner — separated so we can retry with different config if needed.
  */
-async function executeTestFile(
+/**
+ * Extract an unresolved import specifier from stderr and inject a vi.mock() call
+ * at the top of the test file to stub it out.
+ */
+function injectAutoMockForUnresolvedImport(
   testFilePath: string,
-  resolution: FrameworkResolution,
-  options: TestRunnerOptions
-): Promise<Partial<TestExecutionResult>> {
-  // Convert absolute testFilePath to workspace-relative path
-  const testPathRelativeToWorkspace = path.relative(
-    resolution.workspaceDir,
-    testFilePath
-  );
+  aliasPattern: string,
+  stderr: string
+): { success: boolean; backupContent?: string } {
+  try {
+    // Extract the full import specifier from the error message
+    // E.g., "Failed to resolve import "@components/settings/TravelScheduleModal""
+    const match = stderr.match(/Failed to resolve import "([^"]+)"/);
+    if (!match?.[1]) return { success: false };
+    
+    const fullImportPath = match[1];
+    
+    // Read the test file
+    const testContent = fs.readFileSync(testFilePath, "utf8");
+    const backup = testContent;
+    
+    // Create a generic mock for this import
+    const mockStatement = `vi.mock('${fullImportPath}', () => ({ default: () => null }));`;
+    
+    // Find the first import or vi.mock statement and insert before it
+    // Or insert right after the opening comments
+    const lines = testContent.split("\n");
+    let insertIndex = 0;
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] || "";
+      // Skip empty lines and comments at the top
+      if (line.trim() === "" || line.trim().startsWith("//") || line.trim().startsWith("/*")) {
+        insertIndex = i + 1;
+        continue;
+      }
+      // Insert before first import or vi.mock
+      if (line.trim().startsWith("import ") || line.trim().startsWith("vi.mock")) {
+        insertIndex = i;
+        break;
+      }
+      // If we hit any other code, insert after current line
+      insertIndex = i + 1;
+      break;
+    }
+    
+    // Insert the mock statement
+    lines.splice(insertIndex, 0, mockStatement);
+    const modifiedContent = lines.join("\n");
+    
+    // Write the modified content back
+    fs.writeFileSync(testFilePath, modifiedContent, "utf8");
+    console.log(`[test-runner] Injected mock for "${fullImportPath}" at line ${insertIndex}`);
+    
+    return { success: true, backupContent: backup };
+  } catch (err) {
+    console.log(`[test-runner] Failed to inject auto-mock:`, err);
+    return { success: false };
+  }
+}
 
-  const { command, args } = buildTestCommand(
-    resolution,
-    testPathRelativeToWorkspace
-  );
-
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const commandLabel = `(cwd: ${resolution.workspaceRelative}) ${command} ${args.join(" ")}`;
-
-  console.log(`[test-runner] Executing: ${commandLabel}`);
-
+async function spawnTestProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number
+): Promise<{
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}> {
   return new Promise((resolve) => {
     const start = Date.now();
-
     let stdout = "";
     let stderr = "";
     let timedOut = false;
 
     const child = spawn(command, args, {
-      // Run from the resolved workspace, not the repo root — config
-      // include/exclude patterns (and relative paths inside the config
-      // itself) are resolved relative to this directory.
-      cwd: resolution.workspaceDir,
+      cwd,
       shell: process.platform === "win32",
     });
 
@@ -715,85 +813,293 @@ async function executeTestFile(
 
     child.on("close", (exitCode) => {
       clearTimeout(timer);
-
-        console.log("========== TEST DEBUG ==========");
-        console.log("Command:", commandLabel);
-        console.log("Working directory:", resolution.workspaceDir);
-        console.log("Test path:", testFilePath);
-        console.log("Exit code:", exitCode);
-        console.log("STDOUT:", stdout);
-        console.log("STDERR:", stderr);
-        console.log("================================");
-
-      const duration = (Date.now() - start) / 1000;
-
-      // Exit code mapping:
-      // 0 = success
-      // 1 = test assertion failed
-      // 127 = command not found
-      // others = error
-      let status: TestStatus = "failed";
-      let notes: string | undefined;
-
-      if (timedOut) {
-        status = "error";
-      } else if (detectConfigError(stdout, stderr)) {
-        // Configuration/environment error (e.g., Playwright webServer timeout)
-        status = "error";
-        notes = "Test execution failed due to configuration or environment error — no actual test assertions ran";
-      } else if (detectImportOrSetupError(stdout, stderr)) {
-        // Test couldn't execute due to import/setup/environment error
-        status = "error";
-        notes = "Test execution failed during import/setup phase — test environment or dependencies could not be resolved";
-      } else if (detectNoTestsExecuted(resolution.framework, stdout, stderr)) {
-        // Framework ran but found no matching test files
-        status = "not_found";
-        notes = resolution.configVerified
-          ? `${resolution.framework} reported no test files matched the configured pattern`
-          : `${resolution.framework} reported no test files matched; the resolved config was not verified against this test file's path`;
-      } else if (exitCode === 0) {
-        status = "passed";
-      } else if (exitCode === 127) {
-        status = "error"; // Command not found
-      }
-
-      const result: Partial<TestExecutionResult> = {
-        framework: resolution.framework,
-        command: commandLabel,
-        status,
-        duration,
-        exitCode,
-        stdout: truncate(stdout),
-        stderr: timedOut
-          ? `${truncate(stderr)}\n[killed: exceeded ${timeoutMs}ms timeout]`
-          : truncate(stderr),
-        resolution,
-      };
-
-      if (notes !== undefined) {
-        result.notes = notes;
-      }
-
-      resolve(result);
+      const elapsed = (Date.now() - start) / 1000;
+      resolve({ exitCode, stdout, stderr, timedOut });
     });
 
     child.on("error", (error) => {
       clearTimeout(timer);
-
-      const duration = (Date.now() - start) / 1000;
-
       resolve({
-        framework: resolution.framework,
-        command: commandLabel,
-        status: "error" as const,
-        duration,
         exitCode: null,
-        stdout: truncate(stdout),
-        stderr: `${truncate(stderr)}\n${error.message}`,
-        resolution,
+        stdout,
+        stderr: `${stderr}\n${error.message}`,
+        timedOut: false,
       });
     });
   });
+}
+
+/**
+ * Execute a test file, with optional retry on unresolved alias errors.
+ * If the initial run fails with an unresolved alias, tries to detect the alias,
+ * resolve its target from tsconfig, and retry with a temporary override config.
+ */
+async function executeTestFile(
+  testFilePath: string,
+  resolution: FrameworkResolution,
+  options: TestRunnerOptions
+): Promise<Partial<TestExecutionResult>> {
+  // Convert absolute testFilePath to workspace-relative path
+  const testPathRelativeToWorkspace = path.relative(
+    resolution.workspaceDir,
+    testFilePath
+  );
+
+  let { command, args } = buildTestCommand(
+    resolution,
+    testPathRelativeToWorkspace
+  );
+
+  // For vitest/vite, find the nearest config and adjust execution context
+  let executionCwd = resolution.workspaceDir;
+  let originalConfigPath: string | null = null;
+
+  if (resolution.framework === "vitest") {
+    const configLookup = findNearestVitestConfig(
+      testFilePath,
+      options.repositoryRoot
+    );
+    if (configLookup) {
+      executionCwd = configLookup.cwd;
+      originalConfigPath = configLookup.configPath;
+      
+      // Check if config is at repo root or in a package
+      const isRootConfig = path.resolve(configLookup.cwd) === path.resolve(options.repositoryRoot);
+      
+      // Remove any existing --config arg and value if present
+      const configIdx = args.indexOf("--config");
+      if (configIdx !== -1) {
+        args = args.slice(0, configIdx).concat(args.slice(configIdx + 2));
+      }
+      
+      if (!isRootConfig) {
+        // Package-level config found — use it explicitly
+        const configRelative = path.relative(executionCwd, configLookup.configPath);
+        args = [...args, "--config", configRelative];
+        console.log(
+          `[test-runner] Found package-level vitest config: ${configLookup.configPath}`
+        );
+      } else {
+        // Root config found — DON'T pass --config flag
+        // This lets vitest discover configs naturally by walking up from cwd
+        // allowing monorepo packages to find their own package-level vite/vitest configs
+        console.log(
+          `[test-runner] Root config found but not using --config flag to allow monorepo package discovery`
+        );
+      }
+    }
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const commandLabel = `(cwd: ${executionCwd}) ${command} ${args.join(" ")}`;
+
+  console.log(`[test-runner] Executing: ${commandLabel}`);
+
+  // Initial attempt
+  const result = await spawnTestProcess(command, args, executionCwd, timeoutMs);
+
+  // If vitest and import error with unresolved alias, try auto-remediation
+  if (
+    resolution.framework === "vitest" &&
+    result.exitCode !== 0 &&
+    !result.timedOut &&
+    detectImportOrSetupError(result.stdout, result.stderr)
+  ) {
+    const unresolvedAlias = extractUnresolvedAlias(result.stderr);
+    if (unresolvedAlias) {
+      console.log(
+        `[test-runner] Detected unresolved import/alias. Attempting to inject auto-mock...`
+      );
+      
+      // Try two remediation strategies
+      
+      // Strategy 1: Alias resolution retry with override config
+      if (originalConfigPath) {
+        const aliasTarget = resolveAliasTarget(
+          unresolvedAlias,
+          path.dirname(testFilePath),
+          options.repositoryRoot
+        );
+        if (aliasTarget) {
+          console.log(
+            `[test-runner] Strategy 1: Resolved alias "${unresolvedAlias}" → "${aliasTarget}". Retrying with override config...`
+          );
+
+          const tmpDir = path.join(os.tmpdir(), "vitest-alias-overrides");
+          const overrideConfigPath = writeAliasOverrideConfig(
+            originalConfigPath,
+            unresolvedAlias,
+            aliasTarget,
+            tmpDir
+          );
+
+          try {
+            // Rebuild args with override config
+            let retryArgs = [...args];
+            const configIdx = retryArgs.indexOf("--config");
+            if (configIdx !== -1) {
+              retryArgs = retryArgs
+                .slice(0, configIdx)
+                .concat(retryArgs.slice(configIdx + 2));
+            }
+            const configRelative = path.relative(executionCwd, overrideConfigPath);
+            retryArgs = [...retryArgs, "--config", configRelative];
+
+            const retryLabel = `(cwd: ${executionCwd}, retry with alias override) ${command} ${retryArgs.join(" ")}`;
+            console.log(`[test-runner] Retrying: ${retryLabel}`);
+
+            const retryResult = await spawnTestProcess(
+              command,
+              retryArgs,
+              executionCwd,
+              timeoutMs
+            );
+
+            // Use retry result if it's better
+            if (
+              retryResult.exitCode === 0 ||
+              !detectImportOrSetupError(retryResult.stdout, retryResult.stderr)
+            ) {
+              console.log(
+                `[test-runner] Retry succeeded with alias override config`
+              );
+              return buildExecutionResult(
+                retryResult,
+                retryLabel,
+                resolution,
+                timeoutMs
+              );
+            }
+          } finally {
+            cleanupOverrideConfig(overrideConfigPath);
+          }
+        }
+      }
+      
+      // Strategy 2: Inject auto-mock into test file
+      console.log(`[test-runner] Strategy 2: Injecting auto-mock for unresolved import...`);
+      const injectionResult = injectAutoMockForUnresolvedImport(
+        testFilePath,
+        unresolvedAlias,
+        result.stderr
+      );
+      
+      if (injectionResult.success) {
+        console.log(`[test-runner] Auto-mock injected. Retrying test execution...`);
+        const retryLabel = `(cwd: ${executionCwd}, retry after auto-mock injection) ${command} ${args.join(" ")}`;
+        const retryResult = await spawnTestProcess(
+          command,
+          args,
+          executionCwd,
+          timeoutMs
+        );
+        
+        // Restore original test file
+        if (injectionResult.backupContent) {
+          fs.writeFileSync(testFilePath, injectionResult.backupContent, "utf8");
+        }
+        
+        if (
+          retryResult.exitCode === 0 ||
+          !detectImportOrSetupError(retryResult.stdout, retryResult.stderr)
+        ) {
+          console.log(`[test-runner] Retry succeeded with auto-mock injection`);
+          return buildExecutionResult(
+            retryResult,
+            retryLabel,
+            resolution,
+            timeoutMs
+          );
+        }
+        
+        // If still failed, use original result
+        return buildExecutionResult(result, commandLabel, resolution, timeoutMs);
+      }
+    }
+  }
+
+  // Use initial result
+  return buildExecutionResult(
+    result,
+    commandLabel,
+    resolution,
+    timeoutMs
+  );
+}
+
+/**
+ * Build the final TestExecutionResult from a spawn result.
+ */
+function buildExecutionResult(
+  spawnResult: {
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+  },
+  commandLabel: string,
+  resolution: FrameworkResolution,
+  timeoutMs: number
+): Partial<TestExecutionResult> {
+  console.log("========== TEST DEBUG ==========");
+  console.log("Command:", commandLabel);
+  console.log("Exit code:", spawnResult.exitCode);
+  console.log("STDOUT:", spawnResult.stdout);
+  console.log("STDERR:", spawnResult.stderr);
+  console.log("================================");
+
+  const duration = spawnResult.timedOut ? timeoutMs / 1000 : 0;
+
+  // Exit code mapping:
+  // 0 = success
+  // 1 = test assertion failed
+  // 127 = command not found
+  // others = error
+  let status: TestStatus = "failed";
+  let notes: string | undefined;
+
+  if (spawnResult.timedOut) {
+    status = "error";
+  } else if (detectConfigError(spawnResult.stdout, spawnResult.stderr)) {
+    // Configuration/environment error (e.g., Playwright webServer timeout)
+    status = "error";
+    notes = "Test execution failed due to configuration or environment error — no actual test assertions ran";
+  } else if (detectImportOrSetupError(spawnResult.stdout, spawnResult.stderr)) {
+    // Test couldn't execute due to import/setup/environment error
+    status = "error";
+    notes = "Test execution failed during import/setup phase — test environment or dependencies could not be resolved";
+  } else if (
+    detectNoTestsExecuted(resolution.framework, spawnResult.stdout, spawnResult.stderr)
+  ) {
+    // Framework ran but found no matching test files
+    status = "not_found";
+    notes = resolution.configVerified
+      ? `${resolution.framework} reported no test files matched the configured pattern`
+      : `${resolution.framework} reported no test files matched; the resolved config was not verified against this test file's path`;
+  } else if (spawnResult.exitCode === 0) {
+    status = "passed";
+  } else if (spawnResult.exitCode === 127) {
+    status = "error"; // Command not found
+  }
+
+  const result: Partial<TestExecutionResult> = {
+    framework: resolution.framework,
+    command: commandLabel,
+    status,
+    duration,
+    exitCode: spawnResult.exitCode,
+    stdout: truncate(spawnResult.stdout),
+    stderr: spawnResult.timedOut
+      ? `${truncate(spawnResult.stderr)}\n[killed: exceeded ${timeoutMs}ms timeout]`
+      : truncate(spawnResult.stderr),
+    resolution,
+  };
+
+  if (notes !== undefined) {
+    result.notes = notes;
+  }
+
+  return result;
 }
 
 function truncate(output: string): string {

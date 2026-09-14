@@ -2,6 +2,85 @@ import type { TestGenerationTarget } from "./generator-types.js";
 import path from "path";
 
 // ======================================================
+// COMPONENT IMPORT EXTRACTION FOR AUTO-MOCKING
+// ======================================================
+
+/**
+ * Extract capitalized (component-like) imports from workspace/relative paths.
+ * These are what the LLM should stub out so a render test doesn't depend on
+ * the full real dependency tree.
+ * 
+ * Includes:
+ * - Relative imports: ./Foo, ../Foo
+ * - Scoped packages: @calcom/*, @components/*, etc.
+ * - Workspace monorepo imports: Any import that looks like a local path
+ */
+export function extractComponentImportsToMock(sourceFileContent: string): string[] {
+  const importRegex = /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["']([^"']+)["']/g;
+  const results = new Set<string>();
+  let match: RegExpExecArray | null;
+
+  while ((match = importRegex.exec(sourceFileContent)) !== null) {
+    const named = match[1];
+    const defaultImport = match[2];
+    const starAs = match[3];
+    const source = match[4];
+
+    if (!source) continue;
+
+    // Skip external packages (lodash, react, etc.) unless they're workspace packages
+    const isExternalPackage = 
+      !source.startsWith(".") &&
+      !source.startsWith("@") &&
+      !source.startsWith("@calcom") &&
+      !source.startsWith("@components") &&
+      !source.startsWith("app/") &&
+      !source.startsWith("packages/");
+    
+    if (isExternalPackage) continue;
+
+    // For relative imports, always include if there's a capitalized import
+    if (source.startsWith(".")) {
+      if (defaultImport && /^[A-Z]/.test(defaultImport)) {
+        results.add(source);
+      }
+      if (starAs && /^[A-Z]/.test(starAs)) {
+        results.add(source);
+      }
+      if (named) {
+        const names = (named as string).split(",");
+        for (const name of names) {
+          const n = (name.trim().split(" as ")[0] ?? "").trim();
+          if (n && /^[A-Z]/.test(n)) {
+            results.add(source);
+          }
+        }
+      }
+      continue;
+    }
+
+    // For scoped packages (@calcom/*, @components/*, etc.) and workspace paths
+    if (defaultImport && /^[A-Z]/.test(defaultImport)) {
+      results.add(source);
+    }
+    if (starAs && /^[A-Z]/.test(starAs)) {
+      results.add(source);
+    }
+    if (named) {
+      const names = (named as string).split(",");
+      for (const name of names) {
+        const n = (name.trim().split(" as ")[0] ?? "").trim();
+        if (n && /^[A-Z]/.test(n)) {
+          results.add(source);
+        }
+      }
+    }
+  }
+
+  return Array.from(results);
+}
+
+// ======================================================
 // SYSTEM PROMPT
 // ======================================================
 
@@ -25,12 +104,15 @@ Hard rules:
 - Match the existing test file's framework, style, imports, and conventions exactly. If no existing test file is given, use idiomatic style for the stated framework.
 - Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this."
 - Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
+- CRITICAL: All variables used in test code MUST be defined before use. Never reference undefined variables like \`id\`, \`someValue\`, etc. If you need a test value, define it first.
 - Mock placement (CRITICAL for vitest): ALL import statements and vi.mock() calls MUST appear at the very top of the test file, BEFORE any describe() or it() blocks. In vitest, vi.mock() must be at top-level module scope to work correctly. The file structure MUST be:
   1. import statements (for vitest, testing library, and your symbol)
   2. vi.mock() calls (if needed) — keep each mock on one line if possible, or format it complete and properly (opening paren on first line, closing paren with semicolon on last line)
   3. describe() blocks with it() test cases
-  Do NOT put vi.mock() inside describe() blocks or nested anywhere — it will fail.
+  Do NOT put vi.mock() inside describe() blocks or nested anywhere — it will fail. Do NOT put vi.mock() inside it() test cases — they must be at the absolute top of the file, BEFORE any it() call.
   CRITICAL: Mock return values that are objects MUST be formatted correctly: the entire mock definition must parse as complete JavaScript. A mock statement must be complete with all braces and parentheses balanced.
+  Your testCode will be inserted into an outer describe() wrapper by the merger. Write ONLY it()/test() calls, with any vi.mock() and imports on separate lines BEFORE the first it() call, never INSIDE it().
+- Do NOT wrap your test case(s) in a describe() block. The file merger already provides an outer describe() wrapper — your testCode must contain ONLY it()/test() call(s) (plus any vi.mock() calls at the top), never its own describe(). Your tests will be nested inside the scaffold's describe() automatically.
 
 JSON formatting (CRITICAL):
 Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
@@ -93,6 +175,9 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
     }
   }
 
+  // Extract component imports that should be auto-mocked
+  const componentsToMock = extractComponentImportsToMock(target.sourceFileContent);
+
   const sections: string[] = [];
 
   sections.push(`## Changed symbol\n${target.symbol} (in ${target.sourceFile})`);
@@ -106,6 +191,20 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
   sections.push(`## Changed code\n\`\`\`\n${target.changedCode}\n\`\`\``);
 
   sections.push(`## Test framework\n${target.framework}`);
+
+  if (componentsToMock.length > 0) {
+    const mockStatements = componentsToMock
+      .map((source) => {
+        // Generate a simple mock for this import
+        const componentName = path.basename(source);
+        return `vi.mock('${source}', () => ({ default: () => <div data-testid="${componentName}">Mocked</div> }));`;
+      })
+      .join("\n");
+
+    sections.push(
+      `## Components to stub (auto-mock these paths)\n\nThese imports come from the changed code and should be mocked so the test only exercises \`${target.symbol}\`'s own logic, not its full child tree. Mock each with a simple functional component:\n\n\`\`\`typescript\n${mockStatements}\n\`\`\`\n\nPlace all vi.mock() calls at the very top of the test file, BEFORE any describe() or it() blocks. This is critical for vitest to intercept the imports correctly.\n\nIMPORTANT: Also mock any imports that the source file itself has (not just child components). For example, if the source imports from @components/*, @calcom/*, or other workspace paths, those MUST be mocked too, even if they're not React components. Use simple mocks like () => ({}) for non-components, or stubs that return empty objects/functions.`
+    );
+  }
 
   if (target.existingTestFile && target.existingTestCode) {
     if (target.existingTestCodeIsTemplate) {
@@ -138,7 +237,7 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
   }
 
   sections.push(
-    `## Task\nFor "${target.symbol}", generate exactly one test case per entry in "Coverage gaps to fill" above. CRITICAL: Use the import path provided in "Import path for tests (CRITICAL...)" — this is non-negotiable and has been mathematically calculated. Return only the JSON object described in the system prompt.`
+    `## Task\nFor "${target.symbol}", generate exactly one test case per entry in "Coverage gaps to fill" above. CRITICAL: Use the import path provided in "Import path for tests (CRITICAL...)" — this is non-negotiable and has been mathematically calculated. ${componentsToMock.length > 0 ? `Also include vi.mock() statements for the components listed in "Components to stub" at the top of the file, before any describe() blocks.` : ""} Return only the JSON object described in the system prompt.`
   );
 
   return sections.join("\n\n");

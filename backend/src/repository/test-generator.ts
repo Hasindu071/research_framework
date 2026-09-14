@@ -18,6 +18,7 @@ import {
   buildGapAnalysisInputsFromAnalysis,
   type TestGapAnalysis,
 } from "./test-gap-analyzer.js";
+import * as path from "path";
 
 /**
  * Result of building generation targets, including the gap analysis that
@@ -36,16 +37,103 @@ interface RawGenerationResponse {
 const MAX_GENERATED_TESTS_PER_TARGET = 8;
 
 // ======================================================
+// TEMPLATE SIMILARITY SCORING
+// ======================================================
+
+const COMPONENT_EXTENSIONS = new Set(["tsx", "jsx"]);
+
+function getExtension(filePath: string): string {
+  const match = filePath.match(/\.([a-zA-Z0-9]+)$/);
+  return match?.[1]?.toLowerCase() ?? "";
+}
+
+function isComponentFile(filePath: string): boolean {
+  return COMPONENT_EXTENSIONS.has(getExtension(filePath));
+}
+
+/**
+ * Rough signal that a test file actually renders a React component
+ * (Testing Library / Enzyme), vs. testing plain logic.
+ */
+function looksLikeComponentTest(content: string): boolean {
+  return /@testing-library\/react|from ["']enzyme["']|\brender\s*\(|\bscreen\.|\bmount\s*\(|\bshallow\s*\(/.test(
+    content
+  );
+}
+
+/**
+ * Number of path segments that differ between two directories.
+ * 0 = same directory, higher = further apart. Cheap "how nearby" signal.
+ */
+function directoryDistance(dirA: string, dirB: string): number {
+  if (dirA === dirB) return 0;
+  const segA = dirA.split(path.sep).filter(Boolean);
+  const segB = dirB.split(path.sep).filter(Boolean);
+  let common = 0;
+  while (
+    common < segA.length &&
+    common < segB.length &&
+    segA[common] === segB[common]
+  ) {
+    common++;
+  }
+  return segA.length - common + (segB.length - common);
+}
+
+interface TemplateCandidate {
+  file: string;
+  content: string;
+}
+
+/**
+ * Score a candidate test file as a style template for `sourceFile`.
+ * Higher is better. Replaces "first Vitest file we happen to find" with
+ * a similarity ranking, so a component change doesn't get matched to a
+ * plain-logic test file (or vice versa) just because both use Vitest.
+ */
+function scoreTemplateCandidate(
+  candidate: TemplateCandidate,
+  sourceFile: string,
+  sourceIsComponent: boolean
+): number {
+  let score = 0;
+  const candidateIsComponentExt = COMPONENT_EXTENSIONS.has(
+    getExtension(candidate.file)
+  );
+
+  if (sourceIsComponent) {
+    if (candidateIsComponentExt) score += 40;
+    if (looksLikeComponentTest(candidate.content)) score += 40;
+  } else {
+    // Copying render()/screen. boilerplate into a plain-function test is
+    // the wrong shape, so penalize component-flavored templates here too.
+    if (!candidateIsComponentExt) score += 30;
+    if (!looksLikeComponentTest(candidate.content)) score += 20;
+  }
+
+  const distance = directoryDistance(
+    path.dirname(sourceFile),
+    path.dirname(candidate.file)
+  );
+  score += Math.max(0, 20 - distance * 2);
+
+  return score;
+}
+
+// ======================================================
 // TEMPLATE DISCOVERY
 // ======================================================
 
 /**
  * Search the repository for a template test file matching the given framework.
- * Used when creating new test files from scratch.
+ * Used when creating new test files from scratch. Ranks candidates by similarity
+ * to the source file (extension family, component test detection, directory proximity).
  */
 async function findTemplateTestFile(
   repositoryRoot: string,
-  targetFramework: string
+  targetFramework: string,
+  sourceFile: string,
+  sourceIsComponent: boolean
 ): Promise<{ file: string; content: string } | null> {
   try {
     // Import fs to read files
@@ -63,7 +151,9 @@ async function findTemplateTestFile(
       "**/tests/**/*.tsx",
     ];
 
-    for (const pattern of testPatterns) {
+    const candidates: TemplateCandidate[] = [];
+
+    outer: for (const pattern of testPatterns) {
       const testFiles = await glob(pattern, {
         cwd: repositoryRoot,
         ignore: ["**/node_modules/**", "**/dist/**", "**/.next/**"],
@@ -71,33 +161,62 @@ async function findTemplateTestFile(
       });
 
       // Try to find a test file with matching framework
-      for (const testFile of testFiles.slice(0, 20)) {
+      for (const testFile of testFiles) {
         // Check framework based on filename and content
         const framework = inferFrameworkFromFileName(testFile);
-        if (framework === targetFramework) {
-          try {
-            const fullPath = path.join(repositoryRoot, testFile);
-            const content = fs.readFileSync(fullPath, "utf-8");
-            
-            // Make sure it has actual test content, not just imports
-            if (content.includes("it(") || content.includes("test(") || content.includes("describe(")) {
-              console.log(
-                `[Test-Generator] Found template test file for "${targetFramework}": ${testFile}`
-              );
-              return { file: testFile, content };
-            }
-          } catch {
-            // Skip files we can't read
-            continue;
+        if (framework !== targetFramework) continue;
+
+        try {
+          const fullPath = path.join(repositoryRoot, testFile);
+          const content = fs.readFileSync(fullPath, "utf-8");
+
+          // Make sure it has actual test content, not just imports
+          if (
+            content.includes("it(") ||
+            content.includes("test(") ||
+            content.includes("describe(")
+          ) {
+            candidates.push({ file: testFile, content });
           }
+        } catch {
+          // Skip files we can't read
+          continue;
         }
+
+        if (candidates.length >= 60) break outer; // keep scoring cheap on big repos
       }
     }
 
+    if (candidates.length === 0) {
+      console.log(
+        `[Test-Generator] No template test file found for framework "${targetFramework}"`
+      );
+      return null;
+    }
+
+    const ranked = candidates
+      .map((c) => ({
+        ...c,
+        score: scoreTemplateCandidate(c, sourceFile, sourceIsComponent),
+      }))
+      .sort((a, b) => b.score - a.score);
+
     console.log(
-      `[Test-Generator] No template test file found in repository for framework "${targetFramework}"`
+      `[Test-Generator] Template ranking for "${sourceFile}" — top 3: ` +
+        ranked
+          .slice(0, 3)
+          .map((r) => `${r.file} (${r.score})`)
+          .join(", ")
     );
-    return null;
+
+    if (ranked.length === 0) {
+      return null;
+    }
+
+    return { 
+      file: ranked[0]!.file, 
+      content: ranked[0]!.content 
+    };
   } catch (error) {
     console.log(
       `[Test-Generator] Template search failed (non-critical): ${error instanceof Error ? error.message : String(error)}`
@@ -214,6 +333,7 @@ export async function buildGenerationTargets(
 
     const sourceCodeExcerpt = context.sourceCode.find((s) => s.file === symbol.file);
     const testFramework = inferFrameworkFromFileName(resolution.testFile);
+    const sourceIsComponent = isComponentFile(symbol.file);
     
     // For new test files, find a template test file from the same framework to use as a style guide
     let testCodeExcerpt: { file: string; content: string } | undefined;
@@ -221,41 +341,53 @@ export async function buildGenerationTargets(
     let isTemplate = false;
     
     if (resolution.isNewFile) {
-      // First, try to find a template from candidate tests (tests related to this commit)
-      let templateCandidate = context.testCode.find((t) => {
-        const candidateFramework = inferFrameworkFromFileName(t.file);
-        return candidateFramework === testFramework;
-      });
-      
-      if (templateCandidate) {
-        testCodeExcerpt = templateCandidate;
-        templateFile = templateCandidate.file;
+      const inCommitCandidates = context.testCode.filter(
+        (t) => inferFrameworkFromFileName(t.file) === testFramework
+      );
+
+      let bestInCommit: {
+        file: string;
+        content: string;
+        score: number;
+      } | null = null;
+      for (const c of inCommitCandidates) {
+        const score = scoreTemplateCandidate(c, symbol.file, sourceIsComponent);
+        if (!bestInCommit || score > bestInCommit.score) {
+          bestInCommit = { ...c, score };
+        }
+      }
+
+      // Don't accept a mediocre in-commit match just because it's nearby in
+      // the diff — this is exactly how zod-utils.test.ts won before.
+      const MIN_ACCEPTABLE_SCORE = sourceIsComponent ? 40 : 20;
+
+      if (bestInCommit && bestInCommit.score >= MIN_ACCEPTABLE_SCORE) {
+        testCodeExcerpt = { file: bestInCommit.file, content: bestInCommit.content };
+        templateFile = bestInCommit.file;
         isTemplate = true;
         console.log(
-          `[Test-Generator] Using template test file for style reference: ${templateFile}`
+          `[Test-Generator] Using in-commit template: ${templateFile} (score ${bestInCommit.score})`
         );
       } else {
-        // Second, search the entire repository for a matching framework test file
         console.log(
-          `[Test-Generator] No candidate tests found for framework "${testFramework}". ` +
-          `Searching repository for a template test file...`
+          `[Test-Generator] No good in-commit template for "${testFramework}" ` +
+            `(best score ${bestInCommit?.score ?? "n/a"}, need ${MIN_ACCEPTABLE_SCORE}). Searching repository...`
         );
-        const repositoryTemplate = await findTemplateTestFile(repositoryRoot, testFramework);
-        
+        const repositoryTemplate = await findTemplateTestFile(
+          repositoryRoot,
+          testFramework,
+          symbol.file,
+          sourceIsComponent
+        );
+
         if (repositoryTemplate) {
-          testCodeExcerpt = {
-            file: repositoryTemplate.file,
-            content: repositoryTemplate.content,
-          };
+          testCodeExcerpt = repositoryTemplate;
           templateFile = repositoryTemplate.file;
           isTemplate = true;
-          console.log(
-            `[Test-Generator] Found repository template test file: ${templateFile}`
-          );
+          console.log(`[Test-Generator] Found repository template test file: ${templateFile}`);
         } else {
           console.log(
-            `[Test-Generator] No template test file found in repository for framework "${testFramework}". ` +
-            `Gemini will generate test structure from scratch (using file structure conventions).`
+            `[Test-Generator] No template found for "${testFramework}". Generating from scratch.`
           );
         }
       }
@@ -272,6 +404,7 @@ export async function buildGenerationTargets(
       sourceFile: symbol.file,
       testFile: resolution.testFile,
       changedCode: sourceCodeExcerpt?.content ?? "",
+      sourceFileContent: sourceCodeExcerpt?.content ?? "",
       commitMessage: context.commit.message,
       existingTestFile: resolution.testFile,
       existingTestCode: testCodeExcerpt?.content ?? "",

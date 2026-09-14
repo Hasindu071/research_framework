@@ -22,6 +22,8 @@ export interface TestGenerationTarget {
   testFile: string;
   /** The changed code for this symbol (diff hunk or full function body). */
   changedCode: string;
+  /** Full source file content — used to extract ALL component imports that should be mocked. */
+  sourceFileContent: string;
   /** Commit message, for behavioral intent. */
   commitMessage?: string;
   /** Existing test file this generation should extend/mirror, if any. */

@@ -1,15 +1,61 @@
 import fs from "fs";
 import path from "path";
 import type { TestMatch, TestRelationship } from "./test-analyzer.js";
+import { buildMissingMockStubs } from "./auto-mock-generator.js";
 
 // ======================================================
 // CLEAN GENERATED TEST CODE
 // ======================================================
 
 /**
+ * If the LLM ignored the "no describe()" instruction and wrapped its own
+ * test(s) in a describe(), strip that one outer layer so we don't end up
+ * double-nested inside the scaffold's own describe().
+ */
+function stripOuterDescribeWrapper(code: string): string {
+  const trimmed = code.trim();
+  
+  // Check for describe block at the start
+  if (!trimmed.startsWith("describe")) return code;
+  
+  // Simple approach: find the outermost { and matching }
+  let braceDepth = 0;
+  let braceStart = -1;
+  let braceEnd = -1;
+  
+  for (let i = 0; i < trimmed.length; i++) {
+    const char = trimmed[i];
+    
+    if (char === "{") {
+      if (braceDepth === 0) braceStart = i + 1;
+      braceDepth++;
+    } else if (char === "}") {
+      braceDepth--;
+      if (braceDepth === 0) {
+        braceEnd = i;
+        break;
+      }
+    }
+  }
+  
+  // If we found matching braces and they wrap actual code, extract it
+  if (braceStart > 0 && braceEnd > braceStart) {
+    const content = trimmed.slice(braceStart, braceEnd).trim();
+    if (content.length > 0) {
+      return content;
+    }
+  }
+  
+  return code;
+}
+
+/**
  * Clean generated test code before writing it to disk.
+ * - Removes outer describe() wrapper if the LLM added one (defensive strip)
  * - Removes Markdown code fences if Gemini added them
  * - Removes excess indentation from all lines
+ * - Moves vi.mock() calls to the top (in case LLM put them elsewhere)
+ * - Handles multi-line vi.mock() statements properly
  */
 function cleanGeneratedTestCode(code: string): string {
   console.log("[Test-File-Writer] USING FIXED cleanGeneratedTestCode");
@@ -18,20 +64,88 @@ function cleanGeneratedTestCode(code: string): string {
   
   let cleaned = code.replace(/\r\n/g, "\n").trim();
 
+  // Strip outer describe() wrapper if present (defensive against LLM ignoring the instruction)
+  cleaned = stripOuterDescribeWrapper(cleaned);
+
   // Remove Markdown code fences if Gemini added them
   cleaned = cleaned.replace(/^```(?:typescript|ts|javascript|js)?\s*/i, "");
   cleaned = cleaned.replace(/\s*```$/i, "");
 
-  // Remove unwanted indentation
+  // Extract vi.mock and import lines to move to top, handling multi-line mocks
   const lines = cleaned.split("\n");
-  const nonEmptyLines = lines.filter((line) => line.trim().length > 0);
+  const mocks: string[] = [];
+  const imports: string[] = [];
+  const other: string[] = [];
+  
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line?.trim() ?? "";
+    
+    if (trimmed.startsWith("vi.mock(")) {
+      // Extract the full mock statement (may span multiple lines)
+      let mockCode = line || "";
+      let depth = 0;
+      let bracketDepth = 0;
+      let foundEnd = false;
+      
+      for (const ch of mockCode) {
+        if (ch === "(") depth++;
+        else if (ch === ")") depth--;
+        if (ch === "{") bracketDepth++;
+        else if (ch === "}") bracketDepth--;
+        if (depth === 0 && bracketDepth === 0 && ch === ")") {
+          foundEnd = true;
+          break;
+        }
+      }
+      
+      // Continue reading lines until complete
+      while (!foundEnd && i + 1 < lines.length) {
+        i++;
+        const nextLine = lines[i];
+        if (nextLine) {
+          mockCode += "\n" + nextLine;
+          for (const ch of nextLine) {
+            if (ch === "(") depth++;
+            else if (ch === ")") depth--;
+            if (ch === "{") bracketDepth++;
+            else if (ch === "}") bracketDepth--;
+            if (depth === 0 && bracketDepth === 0 && ch === ")") {
+              foundEnd = true;
+              break;
+            }
+          }
+        }
+      }
+      
+      mocks.push(mockCode);
+      i++;
+    } else if (trimmed.startsWith("import ")) {
+      imports.push(line || "");
+      i++;
+    } else if (trimmed.length > 0) {
+      other.push(line || "");
+      i++;
+    } else {
+      i++;
+    }
+  }
+  
+  // Reassemble with imports FIRST, then mocks, then other code
+  // This ensures imports are available before vi.mock() references them
+  const reassembled = [...imports, ...mocks, ...other].join("\n");
+
+  // Remove unwanted indentation
+  const reassembledLines = reassembled.split("\n");
+  const nonEmptyLines = reassembledLines.filter((line) => line.trim().length > 0);
   
   const minIndent =
     nonEmptyLines.length > 0
       ? Math.min(...nonEmptyLines.map((line) => line.match(/^\s*/)?.[0].length ?? 0))
       : 0;
 
-  const result = lines.map((line) => line.slice(minIndent)).join("\n").trim();
+  const result = reassembledLines.map((line) => line.slice(minIndent)).join("\n").trim();
   console.log("[Test-File-Writer] Cleaned testCode (first 200 chars):");
   console.log(result.substring(0, 200));
   return result;
@@ -180,58 +294,92 @@ export function mergeGeneratedTests(
   for (const t of cleanedTests) {
     let code = t.testCode;
     
-    // Extract complete vi.mock() statements by parsing line by line
+    // Extract complete vi.mock() statements by parsing carefully
+    // Look for vi.mock calls anywhere in the code (even if wrongly placed inside it())
     const lines = code.split("\n");
     const mockLines: string[] = [];
-    const testLines: string[] = [];
-    let inMock = false;
-    let mockDepth = 0;
-    let currentMock = "";
+    let i = 0;
     
-    for (const line of lines) {
-      const trimmed = line.trim();
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line?.trim() ?? "";
       
       // Check if this line starts a vi.mock() call
-      if (!inMock && trimmed.startsWith("vi.mock(")) {
-        inMock = true;
-        currentMock = line;
-        mockDepth = 0;
-        // Count opening parens
-        for (const ch of line) {
-          if (ch === "(") mockDepth++;
-          else if (ch === ")") mockDepth--;
+      if (trimmed.startsWith("vi.mock(")) {
+        // Extract the full mock statement by tracking parens/braces
+        let mockCode = line || "";
+        let depth = 0;
+        let bracketDepth = 0;
+        let foundEnd = false;
+        
+        for (const ch of mockCode) {
+          if (ch === "(") depth++;
+          else if (ch === ")") depth--;
+          if (ch === "{") bracketDepth++;
+          else if (ch === "}") bracketDepth--;
+          if (depth === 0 && bracketDepth === 0 && ch === ")") {
+            foundEnd = true;
+            break;
+          }
         }
-      } else if (inMock) {
-        currentMock += "\n" + line;
-        // Count parens
-        for (const ch of line) {
-          if (ch === "(") mockDepth++;
-          else if (ch === ")") mockDepth--;
+        
+        // If not complete on first line, keep reading
+        while (!foundEnd && i + 1 < lines.length) {
+          i++;
+          const nextLine = lines[i];
+          if (nextLine) {
+            mockCode += "\n" + nextLine;
+            for (const ch of nextLine) {
+              if (ch === "(") depth++;
+              else if (ch === ")") depth--;
+              if (ch === "{") bracketDepth++;
+              else if (ch === "}") bracketDepth--;
+              if (depth === 0 && bracketDepth === 0 && ch === ")") {
+                foundEnd = true;
+                break;
+              }
+            }
+          }
         }
-        // Check if mock is complete (all parens closed and line ends with semicolon)
-        if (mockDepth === 0 && (trimmed.endsWith(");") || trimmed === ")")) {
-          mockLines.push(currentMock);
-          currentMock = "";
-          inMock = false;
-        }
+        
+        mockLines.push(mockCode);
+        i++;
       } else if (trimmed.startsWith("import ")) {
         // Extract imports separately
         allImports.add(trimmed);
-      } else if (trimmed.length > 0 && !trimmed.startsWith("import ")) {
-        // Regular test code
-        testLines.push(line);
+        i++;
+      } else if (trimmed.length > 0 && !trimmed.startsWith("vi.")) {
+        // Regular test code — skip here, process later
+        i++;
+      } else {
+        i++;
       }
-    }
-    
-    // If we ended while still in a mock, add what we have
-    if (inMock && currentMock) {
-      mockLines.push(currentMock);
     }
     
     // Add all extracted mocks
     for (const mock of mockLines) {
       allMocks.push(mock);
     }
+  }
+
+  // Safety net: auto-mock any local component import the LLM missed
+  try {
+    const sourceFileAbsolute = path.resolve(repositoryRoot, sourceFile);
+    if (fs.existsSync(sourceFileAbsolute)) {
+      const sourceFileContent = fs.readFileSync(sourceFileAbsolute, "utf8");
+      const combinedTestCode = cleanedTests.map((t) => t.testCode).join("\n");
+      const missingMocks = buildMissingMockStubs(sourceFileContent, combinedTestCode);
+      if (missingMocks.length > 0) {
+        console.log(
+          `[Test-File-Writer] Auto-mocking ${missingMocks.length} local component import(s) the LLM didn't mock`
+        );
+        allMocks.push(...missingMocks);
+      }
+    }
+  } catch (err) {
+    console.log(
+      `[Test-File-Writer] Auto-mock safety net skipped: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   // Build import and mock block at file top
@@ -249,29 +397,54 @@ export function mergeGeneratedTests(
     .map((t) => {
       const lines = t.testCode.split("\n");
       const testOnlyLines: string[] = [];
-      let inMock = false;
-      let mockDepth = 0;
+      let i = 0;
       
-      for (const line of lines) {
-        const trimmed = line.trim();
+      while (i < lines.length) {
+        const line = lines[i];
+        const trimmed = line?.trim() ?? "";
         
-        // Skip vi.mock() lines and everything inside them
-        if (!inMock && trimmed.startsWith("vi.mock(")) {
-          inMock = true;
-          mockDepth = 0;
-          for (const ch of line) {
-            if (ch === "(") mockDepth++;
-            else if (ch === ")") mockDepth--;
+        // Skip vi.mock() calls and imports — they go at file top
+        if (trimmed.startsWith("vi.mock(")) {
+          // Skip the entire mock statement
+          let depth = 0;
+          let bracketDepth = 0;
+          let foundEnd = false;
+          
+          for (const ch of (line || "")) {
+            if (ch === "(") depth++;
+            else if (ch === ")") depth--;
+            if (ch === "{") bracketDepth++;
+            else if (ch === "}") bracketDepth--;
+            if (depth === 0 && bracketDepth === 0 && ch === ")") {
+              foundEnd = true;
+              break;
+            }
           }
-          if (mockDepth === 0) inMock = false;
-        } else if (inMock) {
-          for (const ch of line) {
-            if (ch === "(") mockDepth++;
-            else if (ch === ")") mockDepth--;
+          
+          while (!foundEnd && i + 1 < lines.length) {
+            i++;
+            const nextLine = lines[i];
+            for (const ch of (nextLine || "")) {
+              if (ch === "(") depth++;
+              else if (ch === ")") depth--;
+              if (ch === "{") bracketDepth++;
+              else if (ch === "}") bracketDepth--;
+              if (depth === 0 && bracketDepth === 0 && ch === ")") {
+                foundEnd = true;
+                break;
+              }
+            }
           }
-          if (mockDepth === 0) inMock = false;
-        } else if (!trimmed.startsWith("import ") && trimmed.length > 0) {
-          testOnlyLines.push(trimmed);
+          i++;
+        } else if (trimmed.startsWith("import ")) {
+          // Skip imports
+          i++;
+        } else if (trimmed.length > 0) {
+          // Keep test code
+          testOnlyLines.push(line || "");
+          i++;
+        } else {
+          i++;
         }
       }
       
