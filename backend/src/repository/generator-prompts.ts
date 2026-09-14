@@ -1,4 +1,5 @@
 import type { TestGenerationTarget } from "./generator-types.js";
+import path from "path";
 
 // ======================================================
 // SYSTEM PROMPT
@@ -9,6 +10,7 @@ export const TEST_GENERATOR_SYSTEM_PROMPT = `You are a senior software engineer 
 You will be given:
 - The symbol that changed and the file it lives in
 - The actual changed code (diff or full body)
+- The EXACT import path to use for this symbol (pre-calculated from test file location to source file location)
 - An existing test file for that area of code, if one exists
 - The test framework in use
 - A list called "Coverage gaps to fill" — behaviors that static analysis has PROVEN are not exercised by any existing test, with the exact diff evidence for each
@@ -16,6 +18,7 @@ You will be given:
 Your job is narrow and specific: generate exactly ONE test case per entry in "Coverage gaps to fill" — no more, no fewer.
 
 Hard rules:
+- Import path is CRITICAL: Use the EXACT import path provided in "Import path for tests (CRITICAL...)". Do not generate your own import path, do not modify it, do not try to infer a different path based on file names or guesses. The import path has been mathematically calculated from the test file location to the source file location. Any deviation will cause the tests to fail to resolve the import.
 - Do NOT generate a test for anything not listed in "Coverage gaps to fill", even if the source code suggests other edge cases exist, even if it seems related, even if you think it would improve coverage. Those judgments have already been made upstream by static analysis; your job is execution, not discovery.
 - Every test case's "addressesGap" field must be copied VERBATIM, character-for-character, from the gap's label in the list you were given. Any test whose addressesGap doesn't exactly match a provided gap will be discarded before it ever reaches the codebase.
 - If a gap's condition can't be tested with a small, well-defined test given the information you have, skip that gap entirely rather than inventing a broader or different test to cover it.
@@ -66,9 +69,29 @@ Response format (exact shape required):
 // ======================================================
 
 export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): string {
+  // Calculate relative import path from test file to source file
+  const testDir = path.dirname(target.testFile);
+  const sourceDir = path.dirname(target.sourceFile);
+  const sourceBaseName = path.basename(target.sourceFile, path.extname(target.sourceFile));
+  
+  let relativeImportPath: string;
+  if (testDir === sourceDir) {
+    // Same directory: use ./filename
+    relativeImportPath = `./${sourceBaseName}`;
+  } else {
+    // Different directory: calculate relative path
+    const relativePath = path.relative(testDir, sourceDir);
+    relativeImportPath = path.join(relativePath, sourceBaseName).replace(/\\/g, "/");
+    if (!relativeImportPath.startsWith(".")) {
+      relativeImportPath = `./${relativeImportPath}`;
+    }
+  }
+
   const sections: string[] = [];
 
   sections.push(`## Changed symbol\n${target.symbol} (in ${target.sourceFile})`);
+
+  sections.push(`## Import path for tests (CRITICAL — use EXACTLY this path)\nTest file location: ${target.testFile}\nSource file location: ${target.sourceFile}\n\nWhen writing test imports, use this relative path from the test file:\n\`\`\`typescript\nimport { ${target.symbol} } from '${relativeImportPath}';\n\`\`\`\n\nThis is the ONLY correct import path for this test. Do not generate any other import path, even if it looks correct. Use exactly: ${relativeImportPath}`);
 
   if (target.commitMessage) {
     sections.push(`## Commit message\n${target.commitMessage}`);
@@ -80,11 +103,11 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
 
   if (target.existingTestFile && target.existingTestCode) {
     sections.push(
-      `## Existing test file (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nMatch this file's style and conventions.`
+      `## Existing test file (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nMatch this file's style and conventions. Use the import path from "Import path for tests (CRITICAL...)" above — do not copy imports from the existing test file if they import the symbol from a different path.`
     );
   } else {
     sections.push(
-      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch.`
+      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.`
     );
   }
 
@@ -103,7 +126,7 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
   }
 
   sections.push(
-    `## Task\nFor "${target.symbol}", generate exactly one test case per entry in "Coverage gaps to fill" above. Return only the JSON object described in the system prompt.`
+    `## Task\nFor "${target.symbol}", generate exactly one test case per entry in "Coverage gaps to fill" above. CRITICAL: Use the import path provided in "Import path for tests (CRITICAL...)" — this is non-negotiable and has been mathematically calculated. Return only the JSON object described in the system prompt.`
   );
 
   return sections.join("\n\n");

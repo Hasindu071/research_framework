@@ -1,5 +1,6 @@
 import { simpleGit } from "simple-git";
 import { analyzeSymbol } from "./symbol-analyzer.js";
+import { discoverSourceFiles } from "./file-discovery.js";
 import { analyzeDependencyChanges } from "./dependencyAnalyzer.js";
 import { analyzeTests } from "./test-analyzer.js";
 import { Node, Project, type SourceFile } from "ts-morph";
@@ -172,6 +173,13 @@ export async function analyzeCommit(
   );
 
   // ==================================================
+  // 4.5. Discover source files ONCE for reuse
+  // ==================================================
+
+  console.log("Discovering all source files...");
+  const discoveredFiles = discoverSourceFiles(repositoryPath);
+
+  // ==================================================
   // 5. Analyze changed symbols
   // ==================================================
 
@@ -209,7 +217,7 @@ export async function analyzeCommit(
 
     const analysis =
       analyzeSymbol(
-        repositoryPath,
+        discoveredFiles,
         symbolName
       );
 

@@ -80,18 +80,22 @@ export async function buildGenerationTargets(
   // same changed symbol; we only ever build one target for it.
   const seenSymbols = new Set<string>();
 
-  // A changed symbol is "in scope" if at least one of the top-N prioritized
-  // test files has a real relationship to its file — this preserves the
-  // original "only bother with symbols something highly-ranked cares about"
-  // filtering, without letting that highly-ranked test file dictate which
-  // file gets edited if a stronger-evidence match exists elsewhere.
-  const relevantSymbols = context.changedSymbols.filter((symbol) =>
-    context.candidateTests.some(
-      (candidate) =>
-        candidate.changedFile === symbol.file &&
-        chosenTestFiles.has(candidate.testFile)
-    )
-  );
+  // A changed symbol is "in scope" if:
+  // 1. (Preferred) At least one of the top-N prioritized test files has a real relationship to its file, OR
+  // 2. (Fallback) If there are no prioritized tests, all changed symbols are in scope
+  //    (we'll generate tests directly for them)
+  const relevantSymbols = context.changedSymbols.filter((symbol) => {
+    // If we have prioritized tests, require a match
+    if (chosenTestFiles.size > 0) {
+      return context.candidateTests.some(
+        (candidate) =>
+          candidate.changedFile === symbol.file &&
+          chosenTestFiles.has(candidate.testFile)
+      );
+    }
+    // If we have NO prioritized tests, all changed symbols are fair game
+    return true;
+  });
 
   for (const symbol of relevantSymbols) {
     if (seenSymbols.has(symbol.name)) {
@@ -149,6 +153,7 @@ export async function buildGenerationTargets(
     targets.push({
       symbol: symbol.name,
       sourceFile: symbol.file,
+      testFile: resolution.testFile,
       changedCode: sourceCodeExcerpt?.content ?? "",
       commitMessage: context.commit.message,
       existingTestFile: resolution.testFile,

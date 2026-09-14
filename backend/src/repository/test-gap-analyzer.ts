@@ -119,6 +119,19 @@ export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LL
       }))
   );
 
+  // If there's no existing test code, treat all lexical behaviors as gaps
+  // (they're definitely not covered since there are no tests at all)
+  if (testCode.trim().length === 0 && lexicalBehaviors.length > 0) {
+    for (const lexBehavior of lexicalBehaviors) {
+      coverageGaps.push({
+        label: lexBehavior.label,
+        kind: lexBehavior.kind,
+        evidence: lexBehavior.evidence,
+        condition: `Not covered — no existing test file to verify against`,
+      });
+    }
+  }
+
   console.log(
     `[GapAnalyzer] Symbol: "${input.symbol}" | ` +
       `diffText length: ${input.diffText?.length ?? 0} chars | ` +
@@ -138,16 +151,16 @@ export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LL
     console.warn(`[GapAnalyzer] DEBUG: Added lines (${addedLines.length}): ${JSON.stringify(addedLines.slice(0, 10))}`);
   }
 
-  if (fallbackBehaviors.length > 0 && coverageGaps.length === 0) {
+  if (fallbackBehaviors.length > 0 && coverageGaps.filter(g => g.kind === "fallback").length === 0) {
     console.log(
       `[GapAnalyzer] ℹ️ All fallback behaviors for "${input.symbol}" are covered by existing tests.`
     );
   }
 
-  if (lexicalBehaviors.length > 0) {
+  if (lexicalBehaviors.length > 0 && testCode.trim().length > 0) {
     console.log(
       `[GapAnalyzer] ℹ️ ${lexicalBehaviors.length} Tier-2 (unverified) behavior(s) detected for ` +
-        `"${input.symbol}" — not sent to generator, coverage status unknown by design.`
+        `"${input.symbol}" — not sent to generator (existing tests present), coverage status unknown by design.`
     );
   }
 
@@ -179,10 +192,12 @@ export async function analyzeCoverageGapsBatch(inputs: GapAnalysisInput[], llmCl
 // required — a call with no assertion proves nothing, and an assertion
 // with no matching call proves nothing either.
 
-const FALLBACK_PROPERTY_PATTERN =
-  /^\s*([a-zA-Z_$][\w$]*)\s*:\s*(.+?)\s*(\?\?|\|\|)\s*(.+?),?\s*$/;
-const FALLBACK_VARIABLE_PATTERN =
-  /^\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+?)\s*(\?\?|\|\|)\s*(.+?)\s*;?\s*$/;
+// More robust patterns that handle nested parentheses/brackets
+// (Kept for reference but now using algorithm-based extraction instead)
+// const FALLBACK_PROPERTY_PATTERN =
+//   /^\s*([a-zA-Z_$][\w$]*)\s*:\s*(.+)\s+(\?\?|\|\|)\s+([^,]*?)(?:,\s*)?$/;
+// const FALLBACK_VARIABLE_PATTERN =
+//   /^\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+)\s+(\?\?|\|\|)\s+(.+?)\s*;?\s*$/;
 
 interface FallbackExpr {
   /** The value that receives the result.
@@ -209,51 +224,99 @@ interface FallbackExpr {
 }
 
 function extractFallbackExpr(trimmed: string): FallbackExpr | null {
+  // Check if line has any fallback operators
+  if (!trimmed.includes("??") && !trimmed.includes("||")) {
+    return null;
+  }
+
+  // CRITICAL: Only extract top-level fallbacks. Skip lines where the operator
+  // is deeply nested (e.g., inside function calls or complex array literals).
+  // We'll use a simple heuristic: count parens/braces. If the operator is inside
+  // a nested context (paren depth > 0), skip it to avoid mangling complex expressions.
+
+  let operatorPos = -1;
+  let foundOperator: "??" | "||" | null = null;
+
+  // Find FIRST operator (we'll check its nesting depth)
+  const qqIdx = trimmed.indexOf("??");
+  const orIdx = trimmed.indexOf("||");
+
+  if (qqIdx !== -1 && (orIdx === -1 || qqIdx < orIdx)) {
+    operatorPos = qqIdx;
+    foundOperator = "??";
+  } else if (orIdx !== -1) {
+    operatorPos = orIdx;
+    foundOperator = "||";
+  }
+
+  if (operatorPos === -1 || !foundOperator) {
+    return null;
+  }
+
+  // Check nesting depth at operator position
+  let parenDepth = 0;
+  let braceDepth = 0;
+  for (let i = 0; i < operatorPos; i++) {
+    if (trimmed[i] === "(") parenDepth++;
+    else if (trimmed[i] === ")") parenDepth--;
+    else if (trimmed[i] === "{") braceDepth++;
+    else if (trimmed[i] === "}") braceDepth--;
+  }
+
+  // If operator is nested inside parens or braces, skip it (too complex)
+  if (parenDepth > 0 || braceDepth > 0) {
+    return null;
+  }
+
+  const beforeOp = trimmed.substring(0, operatorPos).trim();
+  const afterOp = trimmed.substring(operatorPos + 2).trim();
+
   // --------------------------------------------------
-  // Case 1:
-  // property: value ?? fallback
-  // property: value || fallback
+  // Case 1: property: value ?? fallback
   // --------------------------------------------------
-  const propertyMatch = FALLBACK_PROPERTY_PATTERN.exec(trimmed);
-  if (propertyMatch &&
-      propertyMatch[1] &&
-      propertyMatch[2] &&
-      propertyMatch[3] &&
-      propertyMatch[4]) {
+  const propertyMatch = /^([a-zA-Z_$][\w$]*)\s*:\s*(.+)$/.exec(beforeOp);
+  if (propertyMatch && propertyMatch[1] && propertyMatch[2]) {
     return {
       property: propertyMatch[1],
       sourceExpr: propertyMatch[2].trim(),
-      operator: propertyMatch[3] === "??" ? "??" : "||",
-      fallbackExpr: propertyMatch[4].trim(),
+      operator: foundOperator,
+      fallbackExpr: afterOp.replace(/,\s*$/, ""), // Remove trailing comma
       isVariableAssignment: false,
     };
   }
 
   // --------------------------------------------------
-  // Case 2:
-  // const x = value ?? fallback
-  // const x = value || fallback
+  // Case 2: const x = value ?? fallback
   // --------------------------------------------------
-  const variableMatch = FALLBACK_VARIABLE_PATTERN.exec(trimmed);
-  if (variableMatch &&
-      variableMatch[1] &&
-      variableMatch[2] &&
-      variableMatch[3] &&
-      variableMatch[4]) {
+  const variableMatch = /^(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+)$/.exec(beforeOp);
+  if (variableMatch && variableMatch[1] && variableMatch[2]) {
     return {
       property: variableMatch[1],
       sourceExpr: variableMatch[2].trim(),
-      operator: variableMatch[3] === "??" ? "??" : "||",
-      fallbackExpr: variableMatch[4].trim(),
+      operator: foundOperator,
+      fallbackExpr: afterOp.replace(/[;,]\s*$/, ""), // Remove trailing semicolon or comma
       isVariableAssignment: true,
     };
   }
 
-  // Debug information
-  if (trimmed.includes("??") || trimmed.includes("||")) {
-    console.log(`[GapAnalyzer-Fallback] Line contains ?? or || but didn't match either fallback pattern: "${trimmed}"`);
+  // --------------------------------------------------
+  // Case 3: value={expr ?? fallback} (JSX attribute)
+  // --------------------------------------------------
+  const jsxMatch = /^value=\{(.+)\}/.exec(beforeOp);
+  if (jsxMatch && jsxMatch[1]) {
+    // The entire expression before the operator is the source
+    const fullJsxSource = jsxMatch[1].trim();
+    return {
+      property: "value",
+      sourceExpr: fullJsxSource,
+      operator: foundOperator,
+      fallbackExpr: afterOp.replace(/\}\s*$/, "").trim(), // Remove closing brace
+      isVariableAssignment: false,
+    };
   }
 
+  // If no specific case matched, skip this line
+  // (it's likely a complex nested fallback we can't safely extract)
   return null;
 }
 

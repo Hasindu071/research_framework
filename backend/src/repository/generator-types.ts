@@ -18,6 +18,8 @@ export interface TestGenerationTarget {
   symbol: string;
   /** File where the symbol is defined, e.g. "apps/admin/src/editor/card-config.ts" */
   sourceFile: string;
+  /** File where tests should be written, e.g. "apps/admin/src/editor/card-config.test.ts" */
+  testFile: string;
   /** The changed code for this symbol (diff hunk or full function body). */
   changedCode: string;
   /** Commit message, for behavioral intent. */

@@ -1,12 +1,6 @@
-import {
-  Project,
-  SyntaxKind,
-  Node,
-  SourceFile,
-} from "ts-morph";
+import { SyntaxKind, Node, Project } from "ts-morph";
 
-import path from "path";
-import { glob } from "glob";
+import type { DiscoveredFile } from "./file-discovery.js";
 
 // ======================================================
 // TYPES
@@ -42,361 +36,177 @@ export interface SymbolAnalysis {
 // ANALYZE SYMBOL
 // ======================================================
 
+/**
+ * Analyze a symbol by loading files on-demand.
+ * Files are loaded one-at-a-time and discarded after analysis to minimize memory usage.
+ */
 export function analyzeSymbol(
-  repositoryPath: string,
+  discoveredFiles: DiscoveredFile[],
   symbolName: string
 ): SymbolAnalysis {
+  console.log(`📊 Analyzing symbol: ${symbolName}`);
 
-  console.log(
-    `Analyzing symbol: ${symbolName}`
-  );
+  const definitions: SymbolInfo[] = [];
+  const usages: SymbolInfo[] = [];
+  const seenUsages = new Set<string>();
 
-  // ==================================================
-  // Result arrays
-  // ==================================================
+  // Load each file individually, analyze, then discard
+  for (const discovered of discoveredFiles) {
+    const { absolutePath, relativePath } = discovered;
 
-  const definitions:
-    SymbolInfo[] = [];
-
-  const usages:
-    SymbolInfo[] = [];
-
-  // ==================================================
-  // Prevent duplicate usages
-  // ==================================================
-
-  const seenUsages =
-    new Set<string>();
-
-  // ==================================================
-  // Find source files to analyze
-  // ==================================================
-
-  const patterns = [
-    path.join(repositoryPath, "**/*.ts"),
-    path.join(repositoryPath, "**/*.tsx"),
-    path.join(repositoryPath, "**/*.js"),
-    path.join(repositoryPath, "**/*.jsx"),
-  ];
-
-  const ignorePatterns = [
-    path.join(repositoryPath, "node_modules/**"),
-    path.join(repositoryPath, ".git/**"),
-    path.join(repositoryPath, "dist/**"),
-    path.join(repositoryPath, "build/**"),
-    path.join(repositoryPath, ".next/**"),
-    path.join(repositoryPath, "coverage/**"),
-  ];
-
-  const files = glob.sync(patterns, {
-    ignore: ignorePatterns,
-  });
-
-  console.log(
-    `Found ${files.length} source files to analyze`
-  );
-
-  // ==================================================
-  // Process files incrementally to avoid memory issues
-  // ==================================================
-
-  for (const filePath of files) {
-
-    // Create a fresh project for each file
     const project = new Project({
       skipAddingFilesFromTsConfig: true,
     });
 
     try {
+      const sourceFile = project.addSourceFileAtPath(absolutePath);
 
-      const sourceFile = project.addSourceFileAtPath(filePath);
-
-      const relativeFile =
-        path.relative(
-          repositoryPath,
-          filePath
-        );
-
-      // ==================================================
-      // 1. Function definitions
-      // ==================================================
-
-      for (
-        const fn
-        of sourceFile.getFunctions()
-      ) {
-
-        if (
-          fn.getName() !== symbolName
-        ) {
-          continue;
-        }
-
-        definitions.push({
-          name: symbolName,
-
-          type: "function",
-
-          file: relativeFile,
-
-          line:
-            fn.getStartLineNumber(),
-
-          role: "definition",
-        });
-      }
-
-      // ==================================================
-      // 2. Variable definitions
-      // ==================================================
-
-      for (
-        const variable
-        of sourceFile.getVariableDeclarations()
-      ) {
-
-        if (
-          variable.getName() !== symbolName
-        ) {
-          continue;
-        }
-
-        definitions.push({
-          name: symbolName,
-
-          type: "variable",
-
-          file: relativeFile,
-
-          line:
-            variable.getStartLineNumber(),
-
-          role: "definition",
-        });
-      }
-
-      // ==================================================
-      // 3. Class definitions
-      // ==================================================
-
-      for (
-        const cls
-        of sourceFile.getClasses()
-      ) {
-
-        // ------------------------------------------------
-        // Class itself
-        // ------------------------------------------------
-
-        if (
-          cls.getName() === symbolName
-        ) {
-
+      // ============================================
+      // FUNCTION DEFINITIONS
+      // ============================================
+      for (const fn of sourceFile.getFunctions()) {
+        if (fn.getName() === symbolName) {
           definitions.push({
             name: symbolName,
+            type: "function",
+            file: relativePath,
+            line: fn.getStartLineNumber(),
+            role: "definition",
+          });
+        }
+      }
 
+      // ============================================
+      // VARIABLE DEFINITIONS
+      // ============================================
+      for (const variable of sourceFile.getVariableDeclarations()) {
+        if (variable.getName() === symbolName) {
+          definitions.push({
+            name: symbolName,
+            type: "variable",
+            file: relativePath,
+            line: variable.getStartLineNumber(),
+            role: "definition",
+          });
+        }
+      }
+
+      // ============================================
+      // CLASS DEFINITIONS
+      // ============================================
+      for (const cls of sourceFile.getClasses()) {
+        if (cls.getName() === symbolName) {
+          definitions.push({
+            name: symbolName,
             type: "class",
-
-            file: relativeFile,
-
-            line:
-              cls.getStartLineNumber(),
-
+            file: relativePath,
+            line: cls.getStartLineNumber(),
             role: "definition",
           });
         }
 
-        // ------------------------------------------------
-        // Methods inside class
-        // ------------------------------------------------
-
-        for (
-          const method
-          of cls.getMethods()
-        ) {
-
-          if (
-            method.getName() !== symbolName
-          ) {
-            continue;
+        for (const method of cls.getMethods()) {
+          if (method.getName() === symbolName) {
+            definitions.push({
+              name: symbolName,
+              type: "method",
+              file: relativePath,
+              line: method.getStartLineNumber(),
+              role: "definition",
+            });
           }
-
-          definitions.push({
-            name: symbolName,
-
-            type: "method",
-
-            file: relativeFile,
-
-            line:
-              method.getStartLineNumber(),
-
-            role: "definition",
-          });
         }
       }
 
-      // ==================================================
-      // 4. Find all identifier occurrences
-      // ==================================================
+      // ============================================
+      // USAGES
+      // ============================================
+      const identifiers = sourceFile.getDescendantsOfKind(
+        SyntaxKind.Identifier
+      );
 
-      const identifiers =
-        sourceFile.getDescendantsOfKind(
-          SyntaxKind.Identifier
-        );
-
-      for (
-        const identifier
-        of identifiers
-      ) {
-
-        // Not our symbol
-
-        if (
-          identifier.getText() !==
-          symbolName
-        ) {
+      for (const identifier of identifiers) {
+        if (identifier.getText() !== symbolName) {
           continue;
         }
 
-        // ==================================================
-        // Ignore variable definition
-        // ==================================================
-
+        // Skip definitions
         const variableDeclaration =
           identifier.getFirstAncestorByKind(
             SyntaxKind.VariableDeclaration
           );
-
         if (
           variableDeclaration &&
-          variableDeclaration.getNameNode() ===
-            identifier
+          variableDeclaration.getNameNode() === identifier
         ) {
           continue;
         }
-
-        // ==================================================
-        // Ignore function definition
-        // ==================================================
 
         const functionDeclaration =
           identifier.getFirstAncestorByKind(
             SyntaxKind.FunctionDeclaration
           );
-
         if (
           functionDeclaration &&
-          functionDeclaration.getNameNode() ===
-            identifier
+          functionDeclaration.getNameNode() === identifier
         ) {
           continue;
         }
-
-        // ==================================================
-        // Ignore class definition
-        // ==================================================
 
         const classDeclaration =
           identifier.getFirstAncestorByKind(
             SyntaxKind.ClassDeclaration
           );
-
         if (
           classDeclaration &&
-          classDeclaration.getNameNode() ===
-            identifier
+          classDeclaration.getNameNode() === identifier
         ) {
           continue;
         }
-
-        // ==================================================
-        // Ignore method definition
-        // ==================================================
 
         const methodDeclaration =
           identifier.getFirstAncestorByKind(
             SyntaxKind.MethodDeclaration
           );
-
         if (
           methodDeclaration &&
-          methodDeclaration.getNameNode() ===
-            identifier
+          methodDeclaration.getNameNode() === identifier
         ) {
           continue;
         }
-
-        // ==================================================
-        // Find containing function
-        // ==================================================
 
         const containingFunction =
-          findContainingFunction(
-            identifier
-          );
+          findContainingFunction(identifier);
 
-        // ==================================================
-        // Create unique usage ID
-        // ==================================================
-
-        const usageKey =
-          [
-            relativeFile,
-
-            identifier.getStartLineNumber(),
-
-            identifier.getStart(),
-
-            symbolName,
-          ].join(":");
-
-        // ==================================================
-        // Skip duplicate occurrence
-        // ==================================================
-
-        if (
-          seenUsages.has(usageKey)
-        ) {
+        const usageKey = `${relativePath}:${identifier.getStart()}`;
+        if (seenUsages.has(usageKey)) {
           continue;
         }
 
-        seenUsages.add(
-          usageKey
-        );
-
-        // ==================================================
-        // Save usage
-        // ==================================================
+        seenUsages.add(usageKey);
 
         usages.push({
           name: symbolName,
-
-          type:
-            containingFunction?.type ??
-            "function",
-
-          file: relativeFile,
-
-          line:
-            identifier.getStartLineNumber(),
-
+          type: containingFunction?.type ?? "function",
+          file: relativePath,
+          line: identifier.getStartLineNumber(),
           role: "usage",
-
-          containingFunction:
-            containingFunction?.name,
+          containingFunction: containingFunction?.name,
         });
       }
-
     } catch (error) {
-      console.warn(`Failed to analyze file ${filePath}:`, error);
+      console.warn(
+        `Failed to analyze file ${absolutePath}:`,
+        error
+      );
     }
+
     // Project goes out of scope and gets garbage collected
   }
 
-  // ==================================================
-  // Return result
-  // ==================================================
+  console.log(
+    `✓ Found ${definitions.length} definition(s), ${usages.length} usage(s)`
+  );
 
   return {
     definitions,
