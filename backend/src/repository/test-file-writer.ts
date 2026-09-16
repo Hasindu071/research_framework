@@ -55,6 +55,92 @@ function stripOuterDescribeWrapper(code: string): string {
  * - Trailing commas in function calls
  * - Malformed JSX fragments
  */
+/**
+ * Fix common LLM pattern mistakes that cause test failures:
+ * 1. vi.advanceTimersByTimeAsync without vi.useFakeTimers setup
+ * 2. Component definitions inside tests that reference undefined symbols
+ * 3. screen usage without import
+ */
+function fixLLMPatternMistakes(code: string): string {
+  let fixed = code;
+
+  // Fix 1: Add vi.useFakeTimers() before vi.advanceTimersByTimeAsync()
+  if (fixed.includes("vi.advanceTimersByTimeAsync")) {
+    const hasBeforeEachWithFakeTimers = /beforeEach\s*\(\s*\(\)\s*=>\s*{\s*vi\.useFakeTimers\(\)/.test(fixed);
+    
+    if (!hasBeforeEachWithFakeTimers) {
+      if (!fixed.includes("vi.useFakeTimers()")) {
+        const firstItIndex = fixed.indexOf("it(");
+        if (firstItIndex > -1) {
+          const lineStart = fixed.lastIndexOf("\n", firstItIndex) + 1;
+          const indent = fixed.substring(lineStart, firstItIndex).match(/^\s*/)?.[0] || "";
+          
+          const beforeEachCode = `beforeEach(() => {\n${indent}  vi.useFakeTimers();\n${indent}});\n\n${indent}`;
+          fixed = fixed.substring(0, lineStart) + beforeEachCode + fixed.substring(lineStart);
+          
+          console.log("[Test-File-Writer] Added beforeEach with vi.useFakeTimers() for timer-based tests");
+        }
+      }
+    }
+  }
+
+  // Fix 2: Detect and fix screen.getByText/findByText pattern
+  // This is a strong indicator that the LLM is using the wrong pattern
+  // If we see screen.getByText but render is called, we need to destructure instead
+  if (fixed.includes("screen.getByText") || fixed.includes("screen.findByText")) {
+    // Check if render is being called (meaning we should destructure)
+    if (fixed.includes("render(")) {
+      // Find what query methods are used via screen
+      const screenMethods = new Set<string>();
+      const screenRegex = /screen\.(get|find|query)(By\w+)/g;
+      let match;
+      while ((match = screenRegex.exec(fixed)) !== null) {
+        screenMethods.add((match[1] || '') + (match[2] || ''));
+      }
+      
+      if (screenMethods.size > 0) {
+        // Replace screen.getByX with getByX
+        fixed = fixed.replace(/screen\.(get|find|query)(By\w+)/g, "$1$2");
+        
+        // Add destructuring to render calls if not already there
+        const methodsList = Array.from(screenMethods).join(", ");
+        
+        // Find the first render() call and add destructuring if needed
+        const hasExistingDestructure = /const\s+{\s*\w+.*}\s*=\s*render\s*\(/;
+        if (!hasExistingDestructure.test(fixed)) {
+          // Replace first render( with const { methods } = render(
+          fixed = fixed.replace(
+            /(\n\s*)render\s*\(/,
+            `$1const { ${methodsList} } = render(`
+          );
+        }
+        
+        console.log("[Test-File-Writer] Fixed screen.getByX pattern: replaced with destructured methods");
+      }
+    }
+  }
+
+  // Fix 3: Detect component definitions that reference undefined variables
+  const componentDefRegex = /function\s+(\w+)\s*\(\s*\)\s*{[\s\S]*?}/g;
+  let componentMatch;
+  while ((componentMatch = componentDefRegex.exec(fixed)) !== null) {
+    const componentCode = componentMatch[0];
+    const hookCallRegex = /\b(use\w+)\s*\(/g;
+    let hookMatch;
+    while ((hookMatch = hookCallRegex.exec(componentCode)) !== null) {
+      const hookName = hookMatch[1];
+      if (!fixed.includes(`const ${hookName}`) && 
+          !fixed.includes(`import.*${hookName}`) &&
+          !fixed.includes(`function ${hookName}`) &&
+          !fixed.match(new RegExp(`\\b${hookName}\\s*=`))) {
+        console.log(`[Test-File-Writer] WARNING: Component uses undefined hook '${hookName}'. LLM test may fail.`);
+      }
+    }
+  }
+  
+  return fixed;
+}
+
 function fixCommonSyntaxErrors(code: string): string {
   // Fix double commas in JSX/function calls (e.g., "</>,," or "arg,,")
   code = code.replace(/,{2,}/g, ",");
@@ -84,7 +170,10 @@ function cleanGeneratedTestCode(code: string): string {
   
   let cleaned = code.replace(/\r\n/g, "\n").trim();
   
-  // Fix common syntax errors early
+  // Fix LLM pattern mistakes early (screen.getByText, timer setup, etc.)
+  cleaned = fixLLMPatternMistakes(cleaned);
+  
+  // Fix common syntax errors
   cleaned = fixCommonSyntaxErrors(cleaned);
 
   // Strip outer describe() wrapper if present (defensive against LLM ignoring the instruction)
@@ -392,13 +481,63 @@ export function mergeGeneratedTests(
   try {
     for (const t of cleanedTests) {
       const code = t.testCode;
-      // Check if code uses common symbols that need imports
-      if (code.includes('createWithEqualityFn') && !allImports.has('import { createWithEqualityFn } from \'zustand/traditional\';')) {
-        // Add the import since it's used in the test code
-        allImports.add('import { createWithEqualityFn } from \'zustand/traditional\';');
-        console.log('[Test-File-Writer] Auto-added missing import for createWithEqualityFn');
+      
+      // Map of common symbols to their imports
+      const symbolImportMap = new Map<string, string>([
+        // React
+        ['React', "import React from 'react';"],
+        ['StrictMode', "import { StrictMode } from 'react';"],
+        // Zustand
+        ['create', "import { create } from 'zustand';"],
+        ['createWithEqualityFn', "import { createWithEqualityFn } from 'zustand/traditional';"],
+        ['persist', "import { persist } from 'zustand/middleware';"],
+        ['createJSONStorage', "import { createJSONStorage } from 'zustand/middleware';"],
+        ['devtools', "import { devtools } from 'zustand/middleware';"],
+        ['subscribeWithSelector', "import { subscribeWithSelector } from 'zustand/middleware';"],
+        ['combine', "import { combine } from 'zustand/middleware';"],
+        // Testing libraries
+        ['render', "import { render } from '@testing-library/react';"],
+        ['screen', "import { screen } from '@testing-library/react';"],
+        ['act', "import { act } from '@testing-library/react';"],
+        ['cleanup', "import { cleanup } from '@testing-library/react';"],
+        ['waitFor', "import { waitFor } from '@testing-library/react';"],
+        ['fireEvent', "import { fireEvent } from '@testing-library/react';"],
+        ['within', "import { within } from '@testing-library/react';"],
+        ['userEvent', "import userEvent from '@testing-library/user-event';"],
+        // Vitest
+        ['vi', "import { vi } from 'vitest';"],
+        ['it', "import { it } from 'vitest';"],
+        ['describe', "import { describe } from 'vitest';"],
+        ['expect', "import { expect } from 'vitest';"],
+        ['beforeEach', "import { beforeEach } from 'vitest';"],
+        ['afterEach', "import { afterEach } from 'vitest';"],
+        ['beforeAll', "import { beforeAll } from 'vitest';"],
+        ['afterAll', "import { afterAll } from 'vitest';"],
+        ['test', "import { test } from 'vitest';"],
+        // Common test utilities
+        ['sleep', "import { sleep } from './test-utils';"],
+      ]);
+      
+      // Check for used symbols and add missing imports
+      for (const [symbol, importStatement] of symbolImportMap) {
+        // Check if symbol is used in the code
+        // Look for the symbol as a standalone identifier (not part of another word)
+        // Be generous: look for it in common contexts
+        const symbolPatterns = [
+          new RegExp(`\\b${symbol}\\s*\\(`),  // symbol(...)
+          new RegExp(`\\b${symbol}\\s*\\)`),  // )symbol...
+          new RegExp(`\\b${symbol}\\s*,`),    // symbol,
+          new RegExp(`\\s${symbol}\\b`),      // leading whitespace + symbol
+          new RegExp(`\\b${symbol}$`, 'm'),   // symbol at line end
+        ];
+        
+        const isUsed = symbolPatterns.some(pattern => pattern.test(code));
+        
+        if (isUsed && !allImports.has(importStatement)) {
+          allImports.add(importStatement);
+          console.log(`[Test-File-Writer] Auto-added missing import for ${symbol}`);
+        }
       }
-      // Add more checks as needed for other commonly used symbols
     }
   } catch (err) {
     console.log(`[Test-File-Writer] Auto-import safety net skipped: ${err instanceof Error ? err.message : String(err)}`);

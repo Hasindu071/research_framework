@@ -840,7 +840,7 @@ async function executeTestFile(
   options: TestRunnerOptions
 ): Promise<Partial<TestExecutionResult>> {
   // Convert absolute testFilePath to workspace-relative path
-  const testPathRelativeToWorkspace = path.relative(
+  let testPathRelativeToWorkspace = path.relative(
     resolution.workspaceDir,
     testFilePath
   );
@@ -862,6 +862,15 @@ async function executeTestFile(
     if (configLookup) {
       executionCwd = configLookup.cwd;
       originalConfigPath = configLookup.configPath;
+      
+      // Recalculate test path relative to the execution cwd
+      testPathRelativeToWorkspace = path.relative(executionCwd, testFilePath);
+      
+      // Rebuild command with correct relative path
+      ({ command, args } = buildTestCommand(
+        resolution,
+        testPathRelativeToWorkspace
+      ));
       
       // Check if config is at repo root or in a package
       const isRootConfig = path.resolve(configLookup.cwd) === path.resolve(options.repositoryRoot);

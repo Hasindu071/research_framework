@@ -179,7 +179,8 @@ You will be given:
 
 Your job is narrow and specific: generate exactly ONE test case per entry in "Coverage gaps to fill" — no more, no fewer.
 
-Hard rules:
+Hard rules (in priority order):
+1. MATCH THE EXISTING TEST PATTERN EXACTLY: If an existing test file is provided, this is your PRIMARY DIRECTIVE. Copy its exact approach to writing tests. Do not invent new patterns. If existing tests use \`{ findByText } = render(...)\` instead of \`screen.getByText\`, use that exact pattern. If existing tests avoid \`vi.advanceTimersByTimeAsync()\`, do not use it. If existing tests do NOT wrap components in \`StrictMode\`, do NOT add it. Follow the existing file's conventions 100%. The existing test file shows you EXACTLY what is acceptable in this codebase — your job is to match it perfectly, not to improve or deviate.
 - Import path is CRITICAL: Use the EXACT import path provided in "Import path for tests (CRITICAL...)". Do not generate your own import path, do not modify it, do not try to infer a different path based on file names or guesses. The import path has been mathematically calculated from the test file location to the source file location. Any deviation will cause the tests to fail to resolve the import.
 - Required imports are MANDATORY: If the section "Required imports (extracted from the changed code)" is provided, you MUST include ALL of those import statements at the very start of your response, BEFORE ANY it() blocks. These symbols are used in the changed code and the tests will fail if they're not imported. Do not invent or guess imports — only use the ones provided.
   CRITICAL: Place import statements ONLY at the absolute top of your entire testCode output, not repeated per test. All imports go at the beginning, then all it() calls follow. Example structure:
@@ -189,6 +190,13 @@ Hard rules:
   
   it('second test', () => { ... });
 
+- CRITICAL PROHIBITED PATTERNS (do NOT use these):
+  * Do NOT wrap component tests in \`<StrictMode>...</StrictMode>\` unless the existing test file explicitly does this. StrictMode is rarely used in existing tests; check the template first. If the template does not use StrictMode, do not add it to your generated tests.
+  * Do NOT use \`vi.advanceTimersByTimeAsync()\` unless the existing test file already uses it and shows \`vi.useFakeTimers()\` being called first. If you need to advance timers, ALWAYS call \`vi.useFakeTimers()\` in a \`beforeEach\` or at the start of the test. The pattern MUST be: \`vi.useFakeTimers(); ... vi.advanceTimersByTimeAsync(...);\`
+  * Do NOT use \`screen.getByText(...)\` or \`screen.findByText(...)\` unless the existing test file does. If the existing file destructures \`{ getByText, findByText } = render(...)\` or \`{ findByText } = await screen.findByText(...)\`, follow that pattern exactly. Check what the existing tests use and do NOT mix patterns.
+  * Do NOT invent new assertion patterns. Use \`expect()\` with the same matchers as the existing tests.
+  * CRITICAL: Never import \`screen\` from @testing-library/react unless the existing test file explicitly uses it. Most tests destructure from render() instead. When in doubt, DO NOT import screen.
+
 - Do NOT generate a test for anything not listed in "Coverage gaps to fill", even if the source code suggests other edge cases exist, even if it seems related, even if you think it would improve coverage. Those judgments have already been made upstream by static analysis; your job is execution, not discovery.
 - Every test case's "addressesGap" field must be copied VERBATIM, character-for-character, from the gap's label in the list you were given. Any test whose addressesGap doesn't exactly match a provided gap will be discarded before it ever reaches the codebase.
 - If a gap's condition can't be tested with a small, well-defined test given the information you have, skip that gap entirely rather than inventing a broader or different test to cover it.
@@ -196,6 +204,7 @@ Hard rules:
 - Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this."
 - Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
 - CRITICAL: All variables used in test code MUST be defined before use. Never reference undefined variables like \`id\`, \`someValue\`, etc. If you need a test value, define it first.
+- CRITICAL: Scope matters — if you define a component inside a test with \`function Counter() { ... }\`, that component is ONLY scoped to that test block. DO NOT reference it from another test. If multiple tests need a component, define it ONCE outside all it() blocks, at the top level (but still inside the test file), OR use a beforeEach hook.
 - CRITICAL: Syntax correctness is essential. Generate valid JavaScript/TypeScript that will parse without errors:
   - NO double commas: (\`</>,, \` is WRONG, \`</>, \` is CORRECT)
   - NO trailing commas in function arguments: (\`render(...,)\` is WRONG, \`render(...)\` is CORRECT)
@@ -301,7 +310,12 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
       .join('\n');
     
     sections.push(
-      `## Required imports (extracted from the changed code)\n\nThese symbols are used in the changed code and MUST be imported in your generated tests:\n\n\`\`\`typescript\n${importsSection}\n\`\`\`\n\nAdd these imports at the very top of your test code, before any it() blocks but after any vi.mock() calls.`
+      `## CRITICAL: Required imports (MUST be included — test will fail without these)\n\nThese symbols are USED IN THE CHANGED CODE and MUST be imported at the very TOP of your generated test code, BEFORE ANY it() blocks.\n\nIf you do not include these imports, the tests will fail with "ReferenceError: X is not defined" errors.\n\n\`\`\`typescript\n${importsSection}\n\`\`\`\n\nPlace these imports FIRST in your testCode output. Nothing else goes before these imports. Then add your it() test blocks.\n\nIf ANY import is missing, the tests WILL FAIL. These are not optional suggestions — they are MANDATORY.`
+    );
+  } else {
+    // Even if no extracted imports, remind about the main symbol import
+    sections.push(
+      `## CRITICAL: Main symbol import (MUST be included at the start)\n\nYour tests MUST import the changed symbol:\n\n\`\`\`typescript\nimport { ${target.symbol} } from '${relativeImportPath}';\n\`\`\`\n\nPlace this import FIRST in your testCode output, before any it() blocks. Without this import, the test will fail.`
     );
   }
 
@@ -334,12 +348,12 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
       );
     } else {
       sections.push(
-        `## Existing test file (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nMatch this file's style and conventions. Use the import path from "Import path for tests (CRITICAL...)" above — do not copy imports from the existing test file if they import the symbol from a different path.`
+        `## Existing test file (${target.existingTestFile}) — CRITICAL REFERENCE\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nCRITICAL: Match this file's style, patterns, and conventions EXACTLY. Use the same:\n- Import sources and organization\n- Test setup and cleanup patterns  \n- Assertion style and libraries\n- How to handle async operations, timers, and rendering\n- Variable naming conventions\n- Mock setup patterns\n- Do NOT wrap in StrictMode unless the existing tests do (most tests do NOT)\n- Do NOT use vi.advanceTimersByTimeAsync() unless you see vi.useFakeTimers() called first in the existing tests\n\nQUERY METHOD (CRITICAL): Check this file's test queries:\n- If the file IMPORTS \`screen\` from '@testing-library/react' and USES \`screen.getByText('...')\`, then USE THAT PATTERN\n- If the file DESTRUCTURES from render like \`const { getByText } = render(...)\`, then USE THAT PATTERN\n- If you see method calls like \`getByText\`, \`findByText\`, \`queryByText\` without 'screen.' prefix, those are destructured — do the same\n- DO NOT mix patterns — pick ONE based on what this file uses\n- DO NOT use \`screen.getByText\` if this file doesn't import screen\n\nDo not deviate from the existing test's patterns even if you think an alternative is better. Your generated tests must be indistinguishable in style from the existing tests.\n\nThe import path from "Import path for tests (CRITICAL...)" above applies — do not copy imports from the existing test file if they import the symbol from a different path.`
       );
     }
   } else {
     sections.push(
-      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.`
+      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.\n\nGuidelines (since no existing test to reference):\n- Do NOT wrap components in StrictMode unless absolutely necessary for the test logic\n- If using timers (vi.advanceTimersByTimeAsync), MUST call vi.useFakeTimers() first\n- Use screen.getByText/findByText sparingly; prefer specific queries like getByTestId\n- If you use utility functions like \`sleep()\`, they MUST be either defined in the test OR imported from './test-utils'. Do NOT use undefined functions.\n- Keep test setup simple and focused on the changed behavior`
     );
   }
 
@@ -351,6 +365,100 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
             `${i + 1}. ${g.condition}\n   originating change: \`${g.evidence}\`\n   addressesGap label to copy verbatim: "${g.label}"`
         )
         .join("\n\n")
+  );
+
+  // Add pattern examples section emphasizing what NOT to do
+  sections.push(`## Critical Pattern Rules (DO NOT deviate)
+
+**Do NOT use these patterns — they will cause test failures:**
+
+WRONG:
+\`\`\`typescript
+// Using undefined utility functions
+it('test', async () => {
+  await sleep(100);  // ERROR: sleep is not defined unless imported
+});
+\`\`\`
+
+RIGHT:
+\`\`\`typescript
+// Import utility functions if they're needed
+import { sleep } from './test-utils';
+
+it('test', async () => {
+  await sleep(100);  // Works — sleep is imported
+});
+\`\`\`
+
+---
+
+WRONG:
+\`\`\`typescript
+// Using StrictMode without existing test precedent
+import { StrictMode } from 'react';
+it('test', () => {
+  render(<StrictMode><MyComponent /></StrictMode>);
+});
+\`\`\`
+
+RIGHT (if StrictMode is not in existing tests):
+\`\`\`typescript
+it('test', () => {
+  render(<MyComponent />);
+});
+\`\`\`
+
+---
+
+WRONG:
+\`\`\`typescript
+// Using screen.getByText without existing test precedent
+import { screen, render } from '@testing-library/react';
+it('test', () => {
+  render(<MyComponent />);
+  const el = screen.getByText('text');
+});
+\`\`\`
+
+RIGHT (if existing tests destructure from render):
+\`\`\`typescript
+import { render } from '@testing-library/react';
+it('test', () => {
+  const { getByText } = render(<MyComponent />);
+  const el = getByText('text');
+});
+\`\`\`
+
+---
+
+WRONG:
+\`\`\`typescript
+// Defining component inside one test and trying to use it in another
+it('test 1', () => {
+  function Counter() { return <div>count</div>; }
+  render(<Counter />);
+});
+it('test 2', () => {
+  render(<Counter />);  // ERROR: Counter is not defined here!
+});
+\`\`\`
+
+RIGHT:
+\`\`\`typescript
+// Define component at the top level, before all it() blocks
+function Counter() { return <div>count</div>; }
+
+it('test 1', () => {
+  render(<Counter />);
+});
+it('test 2', () => {
+  render(<Counter />);  // Works — Counter is in scope
+});
+\`\`\`
+
+**Structure reminder:** All imports, vi.mock() calls, and helper function/component definitions MUST come before any it() blocks.
+
+**Always check the existing test file first and copy that pattern exactly.** Your generated tests must blend seamlessly with the existing code.`
   );
 
   if (target.notes && target.notes.length > 0) {
