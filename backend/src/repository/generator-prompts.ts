@@ -2,6 +2,88 @@ import type { TestGenerationTarget } from "./generator-types.js";
 import path from "path";
 
 // ======================================================
+// SYMBOL EXTRACTION FROM CHANGED CODE
+// ======================================================
+
+/**
+ * Extract all identifiers that look like function or class names used in the changed code.
+ * This helps us determine what needs to be imported in generated tests.
+ * 
+ * Matches patterns like:
+ * - create(...) - function calls
+ * - Object.is - static method references
+ * - capitalizedIdentifier(...) - function calls
+ */
+export function extractUsedSymbols(changedCode: string): string[] {
+  const symbols = new Set<string>();
+  
+  // Match identifiers followed by ( or . (function calls, method access)
+  const identifierRegex = /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[\.(]/g;
+  let match: RegExpExecArray | null;
+  
+  while ((match = identifierRegex.exec(changedCode)) !== null) {
+    const symbol = match[1] || '';
+    // Skip common keywords and React/test utilities
+    if (symbol && !['if', 'for', 'while', 'const', 'let', 'var', 'function', 'return', 'async', 'await'].includes(symbol)) {
+      symbols.add(symbol);
+    }
+  }
+  
+  return Array.from(symbols);
+}
+
+/**
+ * Extract imports from source file and map symbols to their sources.
+ * Returns a map of {symbol} -> {import source}.
+ * 
+ * Examples:
+ * - { createWithEqualityFn: 'zustand/traditional' }
+ * - { Object: 'builtin' }
+ */
+export function extractImportMap(sourceFileContent: string): Record<string, string> {
+  const importMap: Record<string, string> = {};
+  
+  // Match various import styles
+  const importRegex = /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["']([^"']+)["']/g;
+  let match: RegExpExecArray | null;
+  
+  while ((match = importRegex.exec(sourceFileContent)) !== null) {
+    const named = match[1];      // named imports: { foo, bar }
+    const defaultImport = match[2]; // default import: foo
+    const starAs = match[3];       // namespace: * as foo
+    const source = match[4] || ''; // 'path/to/module'
+    
+    if (source) {
+      if (defaultImport) {
+        importMap[defaultImport] = source;
+      }
+      if (starAs) {
+        importMap[starAs] = source;
+      }
+      if (named) {
+        // Split named imports and add each one
+        const names = (named as string).split(',');
+        for (const name of names) {
+          const cleanName = (name.trim().split(' as ')[0] ?? '').trim();
+          if (cleanName) {
+            importMap[cleanName] = source;
+          }
+        }
+      }
+    }
+  }
+  
+  // Add builtins
+  importMap['Object'] = 'builtin';
+  importMap['Array'] = 'builtin';
+  importMap['String'] = 'builtin';
+  importMap['Number'] = 'builtin';
+  importMap['Boolean'] = 'builtin';
+  
+  return importMap;
+}
+
+// ======================================================
 // COMPONENT IMPORT EXTRACTION FOR AUTO-MOCKING
 // ======================================================
 
@@ -90,6 +172,7 @@ You will be given:
 - The symbol that changed and the file it lives in
 - The actual changed code (diff or full body)
 - The EXACT import path to use for this symbol (pre-calculated from test file location to source file location)
+- A list of required imports that MUST be included (extracted from the changed code)
 - An existing test file for that area of code, if one exists
 - The test framework in use
 - A list called "Coverage gaps to fill" — behaviors that static analysis has PROVEN are not exercised by any existing test, with the exact diff evidence for each
@@ -98,6 +181,14 @@ Your job is narrow and specific: generate exactly ONE test case per entry in "Co
 
 Hard rules:
 - Import path is CRITICAL: Use the EXACT import path provided in "Import path for tests (CRITICAL...)". Do not generate your own import path, do not modify it, do not try to infer a different path based on file names or guesses. The import path has been mathematically calculated from the test file location to the source file location. Any deviation will cause the tests to fail to resolve the import.
+- Required imports are MANDATORY: If the section "Required imports (extracted from the changed code)" is provided, you MUST include ALL of those import statements at the very start of your response, BEFORE ANY it() blocks. These symbols are used in the changed code and the tests will fail if they're not imported. Do not invent or guess imports — only use the ones provided.
+  CRITICAL: Place import statements ONLY at the absolute top of your entire testCode output, not repeated per test. All imports go at the beginning, then all it() calls follow. Example structure:
+  import { createWithEqualityFn } from 'zustand/traditional';
+  
+  it('first test', () => { ... });
+  
+  it('second test', () => { ... });
+
 - Do NOT generate a test for anything not listed in "Coverage gaps to fill", even if the source code suggests other edge cases exist, even if it seems related, even if you think it would improve coverage. Those judgments have already been made upstream by static analysis; your job is execution, not discovery.
 - Every test case's "addressesGap" field must be copied VERBATIM, character-for-character, from the gap's label in the list you were given. Any test whose addressesGap doesn't exactly match a provided gap will be discarded before it ever reaches the codebase.
 - If a gap's condition can't be tested with a small, well-defined test given the information you have, skip that gap entirely rather than inventing a broader or different test to cover it.
@@ -105,14 +196,21 @@ Hard rules:
 - Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this."
 - Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
 - CRITICAL: All variables used in test code MUST be defined before use. Never reference undefined variables like \`id\`, \`someValue\`, etc. If you need a test value, define it first.
-- Mock placement (CRITICAL for vitest): ALL import statements and vi.mock() calls MUST appear at the very top of the test file, BEFORE any describe() or it() blocks. In vitest, vi.mock() must be at top-level module scope to work correctly. The file structure MUST be:
-  1. import statements (for vitest, testing library, and your symbol)
+- CRITICAL: Syntax correctness is essential. Generate valid JavaScript/TypeScript that will parse without errors:
+  - NO double commas: (\`</>,, \` is WRONG, \`</>, \` is CORRECT)
+  - NO trailing commas in function arguments: (\`render(...,)\` is WRONG, \`render(...)\` is CORRECT)
+  - NO missing closing parens/brackets
+  - NO malformed JSX
+  - Every opening paren/bracket must have a matching close
+  - Every comma must be followed by a value or newline, not another comma
+- Mock placement (CRITICAL for vitest): ALL import statements and vi.mock() calls MUST appear at the very top of your entire testCode output, BEFORE any it() blocks. In vitest, vi.mock() must be at top-level module scope to work correctly. The file structure MUST be:
+  1. import statements (for vitest, testing library, your symbol, AND any required imports listed in "Required imports")
   2. vi.mock() calls (if needed) — keep each mock on one line if possible, or format it complete and properly (opening paren on first line, closing paren with semicolon on last line)
-  3. describe() blocks with it() test cases
-  Do NOT put vi.mock() inside describe() blocks or nested anywhere — it will fail. Do NOT put vi.mock() inside it() test cases — they must be at the absolute top of the file, BEFORE any it() call.
+  3. it()/test() blocks for all test cases
+  Do NOT put vi.mock() inside it() blocks or nested anywhere — it will fail. Do NOT put vi.mock() inside test cases — they must be at the absolute top of the entire output, BEFORE any it() call.
   CRITICAL: Mock return values that are objects MUST be formatted correctly: the entire mock definition must parse as complete JavaScript. A mock statement must be complete with all braces and parentheses balanced.
-  Your testCode will be inserted into an outer describe() wrapper by the merger. Write ONLY it()/test() calls, with any vi.mock() and imports on separate lines BEFORE the first it() call, never INSIDE it().
-- Do NOT wrap your test case(s) in a describe() block. The file merger already provides an outer describe() wrapper — your testCode must contain ONLY it()/test() call(s) (plus any vi.mock() calls at the top), never its own describe(). Your tests will be nested inside the scaffold's describe() automatically.
+  Your testCode will be inserted into an outer describe() wrapper by the merger. Write imports, mocks, THEN it()/test() calls only.
+- Do NOT wrap your test case(s) in a describe() block. The file merger already provides an outer describe() wrapper — your testCode must contain ONLY it()/test() call(s) (plus any vi.mock() calls and imports at the very top), never its own describe(). Your tests will be nested inside the scaffold's describe() automatically.
 
 JSON formatting (CRITICAL):
 Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
@@ -147,7 +245,7 @@ Response format (exact shape required):
       "purpose": "one sentence: what behavior this test verifies and why it matters given the change",
       "targetSymbol": "the symbol name this test exercises",
       "addressesGap": "copied verbatim from the gap label this test satisfies",
-      "testCode": "complete, runnable test code as a string"
+      "testCode": "imports and vi.mock() calls (ONE TIME at the start), then all it() test cases. No describe() wrapper. MUST be syntactically valid."
     }
   ]
 }`;
@@ -177,12 +275,35 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
 
   // Extract component imports that should be auto-mocked
   const componentsToMock = extractComponentImportsToMock(target.sourceFileContent);
+  
+  // Extract symbols used in changed code and their import sources
+  const usedSymbols = extractUsedSymbols(target.changedCode);
+  const importMap = extractImportMap(target.sourceFileContent);
+  
+  // Build list of required imports for the LLM
+  const requiredImports: Array<{ symbol: string; source: string }> = [];
+  for (const symbol of usedSymbols) {
+    if (importMap[symbol] && importMap[symbol] !== 'builtin') {
+      requiredImports.push({ symbol, source: importMap[symbol] });
+    }
+  }
 
   const sections: string[] = [];
 
   sections.push(`## Changed symbol\n${target.symbol} (in ${target.sourceFile})`);
 
   sections.push(`## Import path for tests (CRITICAL — use EXACTLY this path)\nTest file location: ${target.testFile}\nSource file location: ${target.sourceFile}\n\nWhen writing test imports, use this relative path from the test file:\n\`\`\`typescript\nimport { ${target.symbol} } from '${relativeImportPath}';\n\`\`\`\n\nThis is the ONLY correct import path for this test. Do not generate any other import path, even if it looks correct. Use exactly: ${relativeImportPath}`);
+  
+  // Add section for required imports extracted from changed code
+  if (requiredImports.length > 0) {
+    const importsSection = requiredImports
+      .map((imp) => `import { ${imp.symbol} } from '${imp.source}';`)
+      .join('\n');
+    
+    sections.push(
+      `## Required imports (extracted from the changed code)\n\nThese symbols are used in the changed code and MUST be imported in your generated tests:\n\n\`\`\`typescript\n${importsSection}\n\`\`\`\n\nAdd these imports at the very top of your test code, before any it() blocks but after any vi.mock() calls.`
+    );
+  }
 
   if (target.commitMessage) {
     sections.push(`## Commit message\n${target.commitMessage}`);

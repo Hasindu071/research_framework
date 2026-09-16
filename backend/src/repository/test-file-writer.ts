@@ -50,12 +50,32 @@ function stripOuterDescribeWrapper(code: string): string {
 }
 
 /**
+ * Fix common syntax errors in LLM-generated test code.
+ * - Double commas: `</>,, ` → `</>, `
+ * - Trailing commas in function calls
+ * - Malformed JSX fragments
+ */
+function fixCommonSyntaxErrors(code: string): string {
+  // Fix double commas in JSX/function calls (e.g., "</>,," or "arg,,")
+  code = code.replace(/,{2,}/g, ",");
+  
+  // Fix trailing commas before closing parens (e.g., "render(...,)")
+  code = code.replace(/,(\s*\))/g, "$1");
+  
+  // Fix malformed JSX fragments like "<>......</>,,"
+  code = code.replace(/<\/>\s*,+\s*,/g, "</>");
+  
+  return code;
+}
+
+/**
  * Clean generated test code before writing it to disk.
  * - Removes outer describe() wrapper if the LLM added one (defensive strip)
  * - Removes Markdown code fences if Gemini added them
  * - Removes excess indentation from all lines
  * - Moves vi.mock() calls to the top (in case LLM put them elsewhere)
  * - Handles multi-line vi.mock() statements properly
+ * - Fixes common syntax errors
  */
 function cleanGeneratedTestCode(code: string): string {
   console.log("[Test-File-Writer] USING FIXED cleanGeneratedTestCode");
@@ -63,6 +83,9 @@ function cleanGeneratedTestCode(code: string): string {
   console.log(code.substring(0, 200));
   
   let cleaned = code.replace(/\r\n/g, "\n").trim();
+  
+  // Fix common syntax errors early
+  cleaned = fixCommonSyntaxErrors(cleaned);
 
   // Strip outer describe() wrapper if present (defensive against LLM ignoring the instruction)
   cleaned = stripOuterDescribeWrapper(cleaned);
@@ -345,8 +368,10 @@ export function mergeGeneratedTests(
         mockLines.push(mockCode);
         i++;
       } else if (trimmed.startsWith("import ")) {
-        // Extract imports separately
-        allImports.add(trimmed);
+        // Extract imports separately - store the full line normalized
+        // Normalize to handle potential variations
+        const normalizedImport = trimmed.endsWith(';') ? trimmed : trimmed + ';';
+        allImports.add(normalizedImport);
         i++;
       } else if (trimmed.length > 0 && !trimmed.startsWith("vi.")) {
         // Regular test code — skip here, process later
@@ -362,24 +387,21 @@ export function mergeGeneratedTests(
     }
   }
 
-  // Safety net: auto-mock any local component import the LLM missed
+  // Safety net: if the test code uses symbols that require imports,
+  // make sure those imports are in the file
   try {
-    const sourceFileAbsolute = path.resolve(repositoryRoot, sourceFile);
-    if (fs.existsSync(sourceFileAbsolute)) {
-      const sourceFileContent = fs.readFileSync(sourceFileAbsolute, "utf8");
-      const combinedTestCode = cleanedTests.map((t) => t.testCode).join("\n");
-      const missingMocks = buildMissingMockStubs(sourceFileContent, combinedTestCode);
-      if (missingMocks.length > 0) {
-        console.log(
-          `[Test-File-Writer] Auto-mocking ${missingMocks.length} local component import(s) the LLM didn't mock`
-        );
-        allMocks.push(...missingMocks);
+    for (const t of cleanedTests) {
+      const code = t.testCode;
+      // Check if code uses common symbols that need imports
+      if (code.includes('createWithEqualityFn') && !allImports.has('import { createWithEqualityFn } from \'zustand/traditional\';')) {
+        // Add the import since it's used in the test code
+        allImports.add('import { createWithEqualityFn } from \'zustand/traditional\';');
+        console.log('[Test-File-Writer] Auto-added missing import for createWithEqualityFn');
       }
+      // Add more checks as needed for other commonly used symbols
     }
   } catch (err) {
-    console.log(
-      `[Test-File-Writer] Auto-mock safety net skipped: ${err instanceof Error ? err.message : String(err)}`
-    );
+    console.log(`[Test-File-Writer] Auto-import safety net skipped: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   // Build import and mock block at file top
@@ -484,12 +506,17 @@ export function mergeGeneratedTests(
 
   // Add imports and mocks at the top of the file if not already present
   let finalContent: string;
-  if (topLevelBlock.trim().length > 0) {
-    const existingImports = originalContent.match(/^import .+$/gm) || [];
+  if (topLevelBlock.trim().length > 0 || allImports.size > 0 || allMocks.length > 0) {
+    // Extract existing imports from the file, normalized for comparison
+    const existingImportsRaw = originalContent.match(/^import .+$/gm) || [];
+    const existingImports = new Set(
+      existingImportsRaw.map((imp) => (imp.trim().endsWith(';') ? imp.trim() : imp.trim() + ';'))
+    );
     const existingMockStarts = originalContent.match(/^vi\.mock\(/gm) || [];
     
+    // Find imports that are not already in the file
     const newImports = Array.from(allImports).filter(
-      (imp) => !existingImports.some((existing) => existing.trim() === imp)
+      (imp) => !existingImports.has(imp)
     );
     
     // Only add mocks if we don't have roughly the same number
