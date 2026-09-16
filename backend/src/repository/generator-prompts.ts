@@ -29,6 +29,18 @@ export function extractUsedSymbols(changedCode: string): string[] {
     }
   }
   
+  // Also match standalone identifiers that are used as arguments or values
+  // This catches things like: expect(getResponsesFromOldBooking).toBeDefined()
+  const valueRegex = /(?:^|\s|\(|,|=|:|\?)([a-zA-Z_$][a-zA-Z0-9_$]*)(?=\s*(?:\)|,|;|:|\.|\)|$|\n))/gm;
+  while ((match = valueRegex.exec(changedCode)) !== null) {
+    const symbol = match[1] || '';
+    if (symbol && 
+        !['if', 'for', 'while', 'const', 'let', 'var', 'function', 'return', 'async', 'await', 'true', 'false', 'null', 'undefined', 'this', 'new'].includes(symbol) &&
+        symbol.length > 2) {  // Skip very short names
+      symbols.add(symbol);
+    }
+  }
+  
   return Array.from(symbols);
 }
 
@@ -214,10 +226,50 @@ Hard rules (in priority order):
   - Every comma must be followed by a value or newline, not another comma
 - Mock placement (CRITICAL for vitest): ALL import statements and vi.mock() calls MUST appear at the very top of your entire testCode output, BEFORE any it() blocks. In vitest, vi.mock() must be at top-level module scope to work correctly. The file structure MUST be:
   1. import statements (for vitest, testing library, your symbol, AND any required imports listed in "Required imports")
-  2. vi.mock() calls (if needed) — keep each mock on one line if possible, or format it complete and properly (opening paren on first line, closing paren with semicolon on last line)
+  2. vi.mock() calls (if needed) — CRITICAL: Mock return values MUST have balanced braces and parentheses. Every { must have a }, every ( must have a ). Test this by counting: if you have 3 opening braces, you must have exactly 3 closing braces. Unbalanced mocks will cause esbuild syntax errors.
   3. it()/test() blocks for all test cases
   Do NOT put vi.mock() inside it() blocks or nested anywhere — it will fail. Do NOT put vi.mock() inside test cases — they must be at the absolute top of the entire output, BEFORE any it() call.
-  CRITICAL: Mock return values that are objects MUST be formatted correctly: the entire mock definition must parse as complete JavaScript. A mock statement must be complete with all braces and parentheses balanced.
+  
+  CRITICAL: Mock return values that are objects MUST be formatted correctly with all braces and parentheses balanced. NEVER leave a closing brace or paren off the end of a mock. ALWAYS count: { } must be equal, ( ) must be equal.
+  
+  **MOCK STRUCTURE RULES — MANDATORY:**
+  
+  Before you generate any mock, verify these rules:
+  1. Every vi.mock() call is a complete statement: \`vi.mock(..., () => ({ ... }));\`
+  2. Mock return functions ALWAYS return an object with balanced braces
+  3. Example CORRECT mock (braces/parens balanced):
+     \`\`\`
+     vi.mock('@package/module', () => ({
+       default: { functionName: vi.fn(() => ({ result: 'value' })) }
+     }));
+     \`\`\`
+     Count: { = 4, } = 4, ( = 3, ) = 3 ✓
+  
+  4. Example WRONG mock (UNBALANCED — DO NOT generate this):
+     \`\`\`
+     vi.mock('@package/module', () => ({
+       default: { functionName: vi.fn(() => ({ result: 'value' })  // MISSING } and );
+     \`\`\`
+     This will cause: SyntaxError: Unexpected end of input
+  
+  5. Before outputting ANY mock, manually verify:
+     - Count opening braces { : _count_
+     - Count closing braces } : _count_ (must equal opening)
+     - Count opening parens ( : _count_
+     - Count closing parens ) : _count_ (must equal opening)
+     - If any count doesn't match, DO NOT include the mock
+  
+  6. For nested mocks with multiple levels:
+     \`\`\`
+     vi.mock('@components/Deep', () => ({
+       Component: vi.fn(() => null),
+       Helper: {
+         method: vi.fn(() => ({}))
+       }
+     }));
+     \`\`\`
+     Always end outer mock with \`}));\` — verify the closing } and ) and ;
+  
   Your testCode will be inserted into an outer describe() wrapper by the merger. Write imports, mocks, THEN it()/test() calls only.
 - Do NOT wrap your test case(s) in a describe() block. The file merger already provides an outer describe() wrapper — your testCode must contain ONLY it()/test() call(s) (plus any vi.mock() calls and imports at the very top), never its own describe(). Your tests will be nested inside the scaffold's describe() automatically.
 
@@ -456,10 +508,66 @@ it('test 2', () => {
 });
 \`\`\`
 
+---
+
+**CRITICAL: Mock syntax errors (will break the test file):**
+
+WRONG (UNBALANCED BRACES):
+\`\`\`typescript
+// Missing closing brace and paren — esbuild will fail to parse
+vi.mock('@calcom/api', () => ({
+  useQuery: vi.fn(() => ({ data: undefined })
+}));
+// ERROR: SyntaxError: Unexpected token, expected ";"
+\`\`\`
+
+To count: Count { and }: opening has 2, closing has 1 — NOT BALANCED! ✗
+
+RIGHT (BALANCED BRACES):
+\`\`\`typescript
+// All braces and parens are balanced
+vi.mock('@calcom/api', () => ({
+  useQuery: vi.fn(() => ({ data: undefined }))
+}));
+\`\`\`
+
+To count: Count { = 2, count } = 2 ✓. Count ( = 2, count ) = 2 ✓. ALL BALANCED!
+
+---
+
+WRONG (COMPLEX MOCK WITH UNBALANCED):
+\`\`\`typescript
+vi.mock('@components/Deep', () => ({
+  Component: vi.fn(() => null),
+  Helper: {
+    method: vi.fn(() => ({}))  // MISSING closing paren and brace
+}));
+\`\`\`
+
+RIGHT (COMPLEX MOCK BALANCED):
+\`\`\`typescript
+vi.mock('@components/Deep', () => ({
+  Component: vi.fn(() => null),
+  Helper: {
+    method: vi.fn(() => ({}))
+  }
+}));
+\`\`\`
+
+---
+
+**BEFORE OUTPUTTING ANY MOCK: Manually verify brace/paren balance:**
+1. For each vi.mock() call you generate, count opening and closing characters
+2. { must equal }
+3. ( must equal )
+4. If any mismatch, DO NOT output that mock — skip it entirely
+5. Unbalanced mocks will cause the entire test file to fail to parse
+
 **Structure reminder:** All imports, vi.mock() calls, and helper function/component definitions MUST come before any it() blocks.
 
 **Always check the existing test file first and copy that pattern exactly.** Your generated tests must blend seamlessly with the existing code.`
   );
+
 
   if (target.notes && target.notes.length > 0) {
     sections.push(`## Static analysis notes\n${target.notes.map((n) => `- ${n}`).join("\n")}`);

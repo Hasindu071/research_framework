@@ -64,6 +64,34 @@ function stripOuterDescribeWrapper(code: string): string {
 function fixLLMPatternMistakes(code: string): string {
   let fixed = code;
 
+  // Fix 0: Validate and warn about malformed vi.mock() statements
+  // The LLM sometimes generates mocks with unbalanced braces/parens
+  // This will cause esbuild syntax errors - we detect and log but cannot fix
+  const mockRegex = /vi\.mock\([^;]+;/g;
+  const mockMatches = Array.from(fixed.matchAll(mockRegex));
+  
+  for (const match of mockMatches) {
+    const mockCode = match[0];
+    let braceCount = 0;
+    let parenCount = 0;
+    
+    for (const char of mockCode) {
+      if (char === '{') braceCount++;
+      if (char === '}') braceCount--;
+      if (char === '(') parenCount++;
+      if (char === ')') parenCount--;
+    }
+    
+    // If unbalanced, this will cause syntax errors
+    if (braceCount !== 0 || parenCount !== 0) {
+      console.log(`[Test-File-Writer] ⚠️ CRITICAL: Malformed vi.mock() detected!`);
+      console.log(`[Test-File-Writer]    Brace imbalance: { count: ${mockCode.split('{').length - 1}, } count: ${mockCode.split('}').length - 1}`);
+      console.log(`[Test-File-Writer]    Paren imbalance: ( count: ${mockCode.split('(').length - 1}, ) count: ${mockCode.split(')').length - 1}`);
+      console.log(`[Test-File-Writer]    Mock code (first 150 chars): ${mockCode.substring(0, 150)}...`);
+      console.log(`[Test-File-Writer]    This mock will cause esbuild SyntaxError. The LLM prompt should prevent this.`);
+    }
+  }
+
   // Fix 1: Add vi.useFakeTimers() before vi.advanceTimersByTimeAsync()
   if (fixed.includes("vi.advanceTimersByTimeAsync")) {
     const hasBeforeEachWithFakeTimers = /beforeEach\s*\(\s*\(\)\s*=>\s*{\s*vi\.useFakeTimers\(\)/.test(fixed);
@@ -78,7 +106,7 @@ function fixLLMPatternMistakes(code: string): string {
           const beforeEachCode = `beforeEach(() => {\n${indent}  vi.useFakeTimers();\n${indent}});\n\n${indent}`;
           fixed = fixed.substring(0, lineStart) + beforeEachCode + fixed.substring(lineStart);
           
-          console.log("[Test-File-Writer] Added beforeEach with vi.useFakeTimers() for timer-based tests");
+          console.log("[Test-File-Writer] ✓ Added beforeEach with vi.useFakeTimers() for timer-based tests");
         }
       }
     }
@@ -115,7 +143,7 @@ function fixLLMPatternMistakes(code: string): string {
           );
         }
         
-        console.log("[Test-File-Writer] Fixed screen.getByX pattern: replaced with destructured methods");
+        console.log("[Test-File-Writer] ✓ Fixed screen.getByX pattern: replaced with destructured methods");
       }
     }
   }
@@ -133,13 +161,14 @@ function fixLLMPatternMistakes(code: string): string {
           !fixed.includes(`import.*${hookName}`) &&
           !fixed.includes(`function ${hookName}`) &&
           !fixed.match(new RegExp(`\\b${hookName}\\s*=`))) {
-        console.log(`[Test-File-Writer] WARNING: Component uses undefined hook '${hookName}'. LLM test may fail.`);
+        console.log(`[Test-File-Writer] ⚠️ WARNING: Component uses undefined hook '${hookName}'. LLM test may fail.`);
       }
     }
   }
   
   return fixed;
 }
+
 
 function fixCommonSyntaxErrors(code: string): string {
   // Fix double commas in JSX/function calls (e.g., "</>,," or "arg,,")
@@ -487,6 +516,11 @@ export function mergeGeneratedTests(
         // React
         ['React', "import React from 'react';"],
         ['StrictMode', "import { StrictMode } from 'react';"],
+        ['useState', "import { useState } from 'react';"],
+        ['useEffect', "import { useEffect } from 'react';"],
+        ['useContext', "import { useContext } from 'react';"],
+        ['useCallback', "import { useCallback } from 'react';"],
+        ['useMemo', "import { useMemo } from 'react';"],
         // Zustand
         ['create', "import { create } from 'zustand';"],
         ['createWithEqualityFn', "import { createWithEqualityFn } from 'zustand/traditional';"],
@@ -516,19 +550,31 @@ export function mergeGeneratedTests(
         ['test', "import { test } from 'vitest';"],
         // Common test utilities
         ['sleep', "import { sleep } from './test-utils';"],
+        // Commonly used in mocks and complex applications
+        ['vi.fn', "import { vi } from 'vitest';"],
+        ['vi.spyOn', "import { vi } from 'vitest';"],
+        ['vi.mock', "import { vi } from 'vitest';"],
+        ['vi.mocked', "import { vi } from 'vitest';"],
       ]);
       
       // Check for used symbols and add missing imports
       for (const [symbol, importStatement] of symbolImportMap) {
         // Check if symbol is used in the code
         // Look for the symbol as a standalone identifier (not part of another word)
-        // Be generous: look for it in common contexts
+        // Be VERY generous: look for ANY context where the symbol appears as a word boundary
         const symbolPatterns = [
           new RegExp(`\\b${symbol}\\s*\\(`),  // symbol(...)
           new RegExp(`\\b${symbol}\\s*\\)`),  // )symbol...
           new RegExp(`\\b${symbol}\\s*,`),    // symbol,
+          new RegExp(`\\b${symbol}\\s*;`),    // symbol;
           new RegExp(`\\s${symbol}\\b`),      // leading whitespace + symbol
           new RegExp(`\\b${symbol}$`, 'm'),   // symbol at line end
+          new RegExp(`\\b${symbol}\\.`),      // symbol. (property access)
+          new RegExp(`\\(${symbol}`),         // (symbol
+          new RegExp(`\\[${symbol}`),         // [symbol
+          new RegExp(`${symbol}\\]`),         // symbol]
+          new RegExp(`${symbol}\\}`),         // symbol}
+          new RegExp(`\\{\\s*${symbol}`),     // { symbol
         ];
         
         const isUsed = symbolPatterns.some(pattern => pattern.test(code));
@@ -536,6 +582,39 @@ export function mergeGeneratedTests(
         if (isUsed && !allImports.has(importStatement)) {
           allImports.add(importStatement);
           console.log(`[Test-File-Writer] Auto-added missing import for ${symbol}`);
+        }
+      }
+      
+      // Additionally, scan for common function calls that might not match above patterns
+      const functionCallRegex = /\b(\w+)\s*\(/g;
+      let funcMatch;
+      const localFunctionsAndImports = new Set<string>();
+      
+      // Collect all defined variables and imported names
+      for (const importStmt of allImports) {
+        const importMatch = importStmt.match(/(?:import|from)\s+(?:\{([^}]+)\}|(\w+))/);
+        if (importMatch) {
+          const imported = importMatch[1] || importMatch[2];
+          if (imported) {
+            imported.split(',').forEach(name => {
+              localFunctionsAndImports.add(name.trim().split(' as ')[0]?.trim() || '');
+            });
+          }
+        }
+      }
+      
+      // Check for function calls that might need imports
+      while ((funcMatch = functionCallRegex.exec(code)) !== null) {
+        const funcName = funcMatch[1];
+        if (funcName && !localFunctionsAndImports.has(funcName)) {
+          // Check if this is in our symbol map
+          if (symbolImportMap.has(funcName)) {
+            const importStatement = symbolImportMap.get(funcName);
+            if (importStatement && !allImports.has(importStatement)) {
+              allImports.add(importStatement);
+              console.log(`[Test-File-Writer] Auto-added missing import for function ${funcName}`);
+            }
+          }
         }
       }
     }
