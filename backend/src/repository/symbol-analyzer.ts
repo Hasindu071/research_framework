@@ -54,6 +54,26 @@ export function analyzeSymbol(
   for (const discovered of discoveredFiles) {
     const { absolutePath, relativePath } = discovered;
 
+    // Skip if path is a directory (EISDIR check)
+    // This can happen if usage finder returns directory paths with file extensions
+    let isDirectory = false;
+    try {
+      const fs = require("fs");
+      const stat = fs.statSync(absolutePath);
+      if (stat.isDirectory()) {
+        console.warn(
+          `Skipping directory path (expected file): ${absolutePath}`
+        );
+        continue;
+      }
+    } catch (statError) {
+      console.warn(
+        `Could not stat ${absolutePath}:`,
+        statError instanceof Error ? statError.message : String(statError)
+      );
+      continue;
+    }
+
     const project = new Project({
       skipAddingFilesFromTsConfig: true,
     });
