@@ -839,6 +839,27 @@ async function executeTestFile(
   resolution: FrameworkResolution,
   options: TestRunnerOptions
 ): Promise<Partial<TestExecutionResult>> {
+  // PRE-EXECUTION CHECK: Detect if this is a stub test (always passes, doesn't test real behavior)
+  const fileContent = fs.readFileSync(testFilePath, "utf8");
+  const isStubTest = /expect\s*\(\s*(?:true|false|1|0|null|undefined|'[^']*'|"[^"]*")\s*\)\s*\.toBe(?:Null|Undefined|NaN|Truthy|Falsy|InstanceOf|Defined|Called|CalledTimes|CalledWith|CalledOnce)?\s*\(\s*(?:true|false|1|0|null|undefined|'[^']*'|"[^"]*")\s*\)/.test(fileContent);
+  
+  if (isStubTest) {
+    console.log(`[test-runner] ⚠️ STUB TEST DETECTED: This test doesn't verify real function behavior`);
+    console.log(`[test-runner]    File: ${testFilePath}`);
+    console.log(`[test-runner]    Skipping execution (stub tests always pass but don't provide value)`);
+    return {
+      exitCode: 1,
+      status: "failed",
+      passed: false,
+      failed: true,
+      errors: 1,
+      stdout: "SKIPPED: Stub test detected (expect(true).toBe(true) pattern)",
+      stderr: "This test was generated without understanding the function behavior. It should be rewritten or skipped.",
+      testFilePath,
+      duration: 0,
+    };
+  }
+
   // Convert absolute testFilePath to workspace-relative path
   let testPathRelativeToWorkspace = path.relative(
     resolution.workspaceDir,
