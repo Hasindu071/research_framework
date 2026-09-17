@@ -849,14 +849,11 @@ async function executeTestFile(
     console.log(`[test-runner]    Skipping execution (stub tests always pass but don't provide value)`);
     return {
       exitCode: 1,
-      status: "failed",
-      passed: false,
-      failed: true,
-      errors: 1,
+      status: "failed" as const,
       stdout: "SKIPPED: Stub test detected (expect(true).toBe(true) pattern)",
       stderr: "This test was generated without understanding the function behavior. It should be rewritten or skipped.",
-      testFilePath,
       duration: 0,
+      notes: "Stub test detected — no real function behavior verification. Generated test should be rewritten or skipped.",
     };
   }
 
