@@ -54,23 +54,19 @@ export function analyzeSymbol(
   for (const discovered of discoveredFiles) {
     const { absolutePath, relativePath } = discovered;
 
-    // Skip if path is a directory (EISDIR check)
+    // Skip if path is a directory (EISDIR check) or doesn't exist
     // This can happen if usage finder returns directory paths with file extensions
-    let isDirectory = false;
+    // or if the file no longer exists
     try {
       const fs = require("fs");
       const stat = fs.statSync(absolutePath);
       if (stat.isDirectory()) {
-        console.warn(
-          `Skipping directory path (expected file): ${absolutePath}`
-        );
+        // Silently skip directories (don't warn, they're expected in some cases)
         continue;
       }
     } catch (statError) {
-      console.warn(
-        `Could not stat ${absolutePath}:`,
-        statError instanceof Error ? statError.message : String(statError)
-      );
+      // File doesn't exist or can't be accessed — skip silently
+      // This is common in large codebases where some usage references are stale
       continue;
     }
 
