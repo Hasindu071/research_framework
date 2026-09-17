@@ -213,7 +213,14 @@ Hard rules (in priority order):
 - Every test case's "addressesGap" field must be copied VERBATIM, character-for-character, from the gap's label in the list you were given. Any test whose addressesGap doesn't exactly match a provided gap will be discarded before it ever reaches the codebase.
 - If a gap's condition can't be tested with a small, well-defined test given the information you have, skip that gap entirely rather than inventing a broader or different test to cover it.
 - Match the existing test file's framework, style, imports, and conventions exactly. If no existing test file is given, use idiomatic style for the stated framework.
-- Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this."
+- Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this." Every test MUST:
+  - Make actual assertions against the function or symbol behavior
+  - Use real test data or mocks, not stub placeholders
+  - Test the actual behavior described in the coverage gap
+  - Return a meaningful result that can pass or fail based on the code being tested
+  - NEVER write tests that just do expect(true).toBe(true) or similar no-op assertions
+  
+  CRITICAL: If you cannot write a real test given the information you have (e.g., you don't understand the function's behavior, dependencies are unclear), SKIP that gap entirely rather than generating a stub test. Stub tests that always pass are worse than no tests.
 - Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
 - CRITICAL: All variables used in test code MUST be defined before use. Never reference undefined variables like \`id\`, \`someValue\`, etc. If you need a test value, define it first.
 - CRITICAL: Scope matters — if you define a component inside a test with \`function Counter() { ... }\`, that component is ONLY scoped to that test block. DO NOT reference it from another test. If multiple tests need a component, define it ONCE outside all it() blocks, at the top level (but still inside the test file), OR use a beforeEach hook.
@@ -405,7 +412,7 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
     }
   } else {
     sections.push(
-      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.\n\nGuidelines (since no existing test to reference):\n- Do NOT wrap components in StrictMode unless absolutely necessary for the test logic\n- If using timers (vi.advanceTimersByTimeAsync), MUST call vi.useFakeTimers() first\n- Use screen.getByText/findByText sparingly; prefer specific queries like getByTestId\n- If you use utility functions like \`sleep()\`, they MUST be either defined in the test OR imported from './test-utils'. Do NOT use undefined functions.\n- Keep test setup simple and focused on the changed behavior`
+      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.\n\n**CRITICAL: No stub tests allowed.** Each test must:\n- Call the actual function or symbol being tested\n- Use real test data or setup\n- Make meaningful assertions that verify behavior\n- Return a result that can actually pass or fail\n- NEVER just do expect(true).toBe(true) or similar no-op assertions\n\nIf you cannot understand the function well enough to write a real test (missing documentation, unclear parameters, complex dependencies), SKIP that gap entirely and do NOT generate a placeholder.\n\nGuidelines:\n- Do NOT wrap components in StrictMode unless absolutely necessary for the test logic\n- If using timers (vi.advanceTimersByTimeAsync), MUST call vi.useFakeTimers() first\n- Use screen.getByText/findByText sparingly; prefer specific queries like getByTestId\n- If you use utility functions like \`sleep()\`, they MUST be either defined in the test OR imported from './test-utils'. Do NOT use undefined functions.\n- Keep test setup simple and focused on the changed behavior\n- For file system operations, use mocks like \`vi.mock('node:fs')\` if needed\n- For functions that read files or directories, provide mock data or use test fixtures`
     );
   }
 

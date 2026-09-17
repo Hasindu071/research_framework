@@ -64,32 +64,27 @@ function stripOuterDescribeWrapper(code: string): string {
 function fixLLMPatternMistakes(code: string): string {
   let fixed = code;
 
-  // Fix 0: Validate and warn about malformed vi.mock() statements
-  // The LLM sometimes generates mocks with unbalanced braces/parens
-  // This will cause esbuild syntax errors - we detect and log but cannot fix
-  const mockRegex = /vi\.mock\([^;]+;/g;
-  const mockMatches = Array.from(fixed.matchAll(mockRegex));
+  // Fix 0: Detect stub tests that don't actually test anything
+  // These are tests that just do expect(true).toBe(true) or similar no-ops
+  const stubTestRegex = /it\s*\(\s*['"`][^'"`]+['"`]\s*,\s*(?:async\s*)?\(\s*\)\s*=>\s*{\s*expect\s*\(\s*(?:true|false|1|0|null|undefined|'[^']*'|"[^"]*")\s*\)\s*\.toBe(?:Null|Undefined|NaN|Truthy|Falsy|InstanceOf|Defined|Called|CalledTimes|CalledWith|CalledOnce)?\s*\(\s*(?:true|false|1|0|null|undefined|'[^']*'|"[^"]*")\s*\)\s*;\s*}\s*\);/gm;
+  const stubMatches = Array.from(fixed.matchAll(stubTestRegex));
   
-  for (const match of mockMatches) {
-    const mockCode = match[0];
-    let braceCount = 0;
-    let parenCount = 0;
-    
-    for (const char of mockCode) {
-      if (char === '{') braceCount++;
-      if (char === '}') braceCount--;
-      if (char === '(') parenCount++;
-      if (char === ')') parenCount--;
+  if (stubMatches.length > 0) {
+    console.log(`[Test-File-Writer] ⚠️ CRITICAL: Detected ${stubMatches.length} stub test(s) that don't test actual function behavior!`);
+    for (const match of stubMatches) {
+      console.log(`[Test-File-Writer]    Stub test: ${match[0].substring(0, 100)}...`);
     }
-    
-    // If unbalanced, this will cause syntax errors
-    if (braceCount !== 0 || parenCount !== 0) {
-      console.log(`[Test-File-Writer] ⚠️ CRITICAL: Malformed vi.mock() detected!`);
-      console.log(`[Test-File-Writer]    Brace imbalance: { count: ${mockCode.split('{').length - 1}, } count: ${mockCode.split('}').length - 1}`);
-      console.log(`[Test-File-Writer]    Paren imbalance: ( count: ${mockCode.split('(').length - 1}, ) count: ${mockCode.split(')').length - 1}`);
-      console.log(`[Test-File-Writer]    Mock code (first 150 chars): ${mockCode.substring(0, 150)}...`);
-      console.log(`[Test-File-Writer]    This mock will cause esbuild SyntaxError. The LLM prompt should prevent this.`);
-    }
+    console.log(`[Test-File-Writer]    These tests always pass but don't verify function behavior. They should be replaced with real tests.`);
+  }
+
+  // Fix 0b: Simpler check for common stub patterns
+  if (fixed.includes("expect(true).toBe(true)") || 
+      fixed.includes("expect(false).toBe(false)") ||
+      fixed.includes("expect(null).toBeNull()") ||
+      fixed.includes("expect(undefined).toBeUndefined()")) {
+    console.log(`[Test-File-Writer] ⚠️ CRITICAL: Generated test contains stub assertions (always pass, don't test real behavior)!`);
+    console.log(`[Test-File-Writer]    The LLM likely couldn't understand the function and generated a placeholder.`);
+    console.log(`[Test-File-Writer]    This test should be skipped or rewritten with actual function behavior verification.`);
   }
 
   // Fix 1: Add vi.useFakeTimers() before vi.advanceTimersByTimeAsync()
