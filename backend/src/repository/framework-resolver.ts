@@ -880,6 +880,22 @@ function execPrefix(
   packageManager: PackageManager,
   bin: string
 ): { command: string; args: string[] } {
+  // On Windows, prefer npx/bunx for better shell compatibility
+  // yarn exec and pnpm exec can have PATH resolution issues with shells
+  if (process.platform === "win32") {
+    switch (packageManager) {
+      case "yarn":
+      case "pnpm":
+        // Fall back to npx on Windows for better compatibility
+        return { command: "npx", args: [bin] };
+      case "bun":
+        return { command: "bunx", args: [bin] };
+      default:
+        return { command: "npx", args: [bin] };
+    }
+  }
+
+  // On Unix-like systems, use package manager exec commands
   switch (packageManager) {
     case "yarn":
       return { command: "yarn", args: ["exec", bin] };

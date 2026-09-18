@@ -532,6 +532,7 @@ function validateAndNormalize(
   const rawCases = raw.testCases ?? [];
   const valid: GeneratedTestCase[] = [];
   const seenGaps = new Set<string>();
+  const seenTestCode = new Set<string>(); // Track actual test code to prevent duplicates
 
   for (const testCase of rawCases) {
     if (
@@ -565,6 +566,23 @@ function validateAndNormalize(
       console.log(`[Test-Generator] Skipping duplicate test for gap "${gapLabel}"`);
       continue;
     }
+
+    // NEW: Check if the actual test code is already in the batch
+    // Normalize the code to detect near-duplicates (whitespace variations)
+    const normalizedCode = testCase.testCode
+      .replace(/\s+/g, " ")
+      .trim();
+    
+    if (seenTestCode.has(normalizedCode)) {
+      console.warn(
+        `[Test-Generator] ⚠️ DUPLICATE CODE: Dropping test for gap "${gapLabel}" ` +
+        `(target "${target.symbol}") — identical code already in this batch. ` +
+        `The LLM likely repeated itself. This prevents duplicate declarations.`
+      );
+      continue;
+    }
+    
+    seenTestCode.add(normalizedCode);
     seenGaps.add(gapLabel);
 
     valid.push({

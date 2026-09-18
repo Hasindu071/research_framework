@@ -363,8 +363,15 @@ export function inferNewTestFileName(sourceFile: string): string {
     return `${sourceFile}.test.ts`;
   }
 
-  const basePath = match[1];
-  const sourceExtension = match[2];
+  const basePath = match[1]!;
+  const sourceExtension = match[2]!;
+
+  // BUGFIX: If the source file is already a test file, don't double-add .test
+  // This handles cases where sourceFile is something like "onboarding.test.ts"
+  if (basePath.endsWith('.test')) {
+    // Already a test file, return as-is
+    return sourceFile;
+  }
 
   // Preserve the JSX-capable extension
   if (sourceExtension === "tsx" || sourceExtension === "jsx") {
@@ -628,7 +635,28 @@ export function mergeGeneratedTests(
   }
 
   // Build indented test block for describe
-  const generatedBlock = cleanedTests
+  // CRITICAL FIX: Deduplicate test blocks by their content (not just name)
+  // to prevent duplicate declarations when multiple tests have similar code
+  const seenTestContent = new Set<string>();
+  const uniqueTests = cleanedTests.filter((t) => {
+    // Create a normalized signature of the test (skip whitespace variation)
+    const normalized = t.testCode
+      .replace(/\s+/g, " ")
+      .trim();
+    
+    if (seenTestContent.has(normalized)) {
+      console.log(
+        `[Test-File-Writer] ⚠️ DEDUP: Skipping duplicate test "${t.name}" — ` +
+        `identical code already processed in this merge batch`
+      );
+      return false;
+    }
+    
+    seenTestContent.add(normalized);
+    return true;
+  });
+  
+  const generatedBlock = uniqueTests
     .map((t) => {
       const lines = t.testCode.split("\n");
       const testOnlyLines: string[] = [];

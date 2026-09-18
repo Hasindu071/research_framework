@@ -793,9 +793,13 @@ async function spawnTestProcess(
     let stderr = "";
     let timedOut = false;
 
+    // On Windows, use PowerShell for better environment setup and command resolution
+    // On Unix, use the default shell behavior
+    const useShell = process.platform === "win32" ? "powershell.exe" : true;
+
     const child = spawn(command, args, {
       cwd,
-      shell: process.platform === "win32",
+      shell: useShell,
     });
 
     const timer = setTimeout(() => {
@@ -839,8 +843,59 @@ async function executeTestFile(
   resolution: FrameworkResolution,
   options: TestRunnerOptions
 ): Promise<Partial<TestExecutionResult>> {
-  // PRE-EXECUTION CHECK: Detect if this is a stub test (always passes, doesn't test real behavior)
+  // PRE-EXECUTION CHECK: Detect if this is an e2e test
   const fileContent = fs.readFileSync(testFilePath, "utf8");
+  
+  // E2E tests typically use playwright or belong in e2e directories
+  const isE2eTest = 
+    testFilePath.includes("/e2e/") || 
+    testFilePath.includes("\\e2e\\") ||
+    fileContent.includes("@playwright/test") ||
+    fileContent.includes("import { test } from '@/helpers/playwright'");
+  
+  if (isE2eTest) {
+    console.log(`[test-runner] ℹ️ E2E TEST DETECTED: Running with Playwright CLI`);
+    console.log(`[test-runner]    File: ${testFilePath}`);
+    
+    // Find the e2e directory (parent directory containing playwright config)
+    let e2eDir = path.dirname(testFilePath);
+    while (e2eDir !== path.dirname(e2eDir)) {
+      if (fs.existsSync(path.join(e2eDir, "playwright.config.ts")) || 
+          fs.existsSync(path.join(e2eDir, "playwright.config.js"))) {
+        break;
+      }
+      e2eDir = path.dirname(e2eDir);
+    }
+    
+    // If no config found, assume e2e is the root
+    if (!fs.existsSync(path.join(e2eDir, "playwright.config.ts")) &&
+        !fs.existsSync(path.join(e2eDir, "playwright.config.js"))) {
+      e2eDir = path.dirname(testFilePath);
+      while (e2eDir.includes("e2e") && e2eDir !== path.dirname(e2eDir)) {
+        if (path.basename(e2eDir) === "e2e") {
+          break;
+        }
+        e2eDir = path.dirname(e2eDir);
+      }
+    }
+    
+    const testPathRelativeToE2e = path.relative(e2eDir, testFilePath);
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const commandLabel = `(cwd: ${e2eDir}) npx playwright test ${testPathRelativeToE2e}`;
+    
+    console.log(`[test-runner] Executing: ${commandLabel}`);
+    
+    const result = await spawnTestProcess(
+      "npx",
+      ["playwright", "test", testPathRelativeToE2e],
+      e2eDir,
+      timeoutMs
+    );
+    
+    return buildExecutionResult(result, commandLabel, resolution, timeoutMs);
+  }
+
+  // PRE-EXECUTION CHECK: Detect if this is a stub test (always passes, doesn't test real behavior)
   const isStubTest = /expect\s*\(\s*(?:true|false|1|0|null|undefined|'[^']*'|"[^"]*")\s*\)\s*\.toBe(?:Null|Undefined|NaN|Truthy|Falsy|InstanceOf|Defined|Called|CalledTimes|CalledWith|CalledOnce)?\s*\(\s*(?:true|false|1|0|null|undefined|'[^']*'|"[^"]*")\s*\)/.test(fileContent);
   
   if (isStubTest) {
