@@ -19,6 +19,7 @@ import {
   type TestGapAnalysis,
 } from "./test-gap-analyzer.js";
 import * as path from "path";
+import fs from "fs";
 
 /**
  * Result of building generation targets, including the gap analysis that
@@ -292,6 +293,18 @@ export async function buildGenerationTargets(
     if (seenSymbols.has(symbol.name)) {
       console.log(
         `[Test-Generator] Skipping "${symbol.name}" — already built a target for this symbol`
+      );
+      continue;
+    }
+
+    // Validate that the source file actually exists
+    const sourceFileAbsolute = path.isAbsolute(symbol.file)
+      ? symbol.file
+      : path.resolve(repositoryRoot, symbol.file);
+
+    if (!fs.existsSync(sourceFileAbsolute)) {
+      console.log(
+        `[Test-Generator] Skipping "${symbol.name}" — source file does not exist: ${sourceFileAbsolute}`
       );
       continue;
     }

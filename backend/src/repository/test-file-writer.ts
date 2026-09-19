@@ -719,13 +719,22 @@ export function mergeGeneratedTests(
     .join("\n");
 
   if (isNewFile || !fs.existsSync(testFileAbsolute)) {
+    // Ensure sourceFile is absolute for proper import calculation
+    const sourceFileAbsolute = path.isAbsolute(sourceFile) 
+      ? sourceFile 
+      : path.resolve(repositoryRoot, sourceFile);
+    
     const relativeImport = toRelativeImportSpecifier(
       testFileAbsolute,
-      path.resolve(repositoryRoot, sourceFile)
+      sourceFileAbsolute
     );
     const symbolBase = path
       .basename(sourceFile)
       .replace(/\.(ts|tsx|js|jsx)$/, "");
+
+    console.log(
+      `[Test-File-Writer] Creating new test file with import: ${relativeImport} (from ${testFileAbsolute} to ${sourceFileAbsolute})`
+    );
 
     const scaffold =
       topLevelBlock +
@@ -887,12 +896,19 @@ function toRelativeImportSpecifier(
   toFileAbsolute: string
 ): string {
   const fromDir = path.dirname(fromFileAbsolute);
+  
+  // Normalize both paths to ensure they're absolute
+  const normalizedFrom = path.resolve(fromDir);
+  const normalizedTo = path.resolve(toFileAbsolute);
+  
   let rel = path
-    .relative(fromDir, toFileAbsolute)
+    .relative(normalizedFrom, normalizedTo)
     .replace(/\.(ts|tsx|js|jsx)$/, "");
 
+  // Normalize path separators to forward slashes
   rel = rel.replace(/\\/g, "/");
 
+  // Ensure relative path starts with ./ or ../
   if (!rel.startsWith(".")) {
     rel = `./${rel}`;
   }
