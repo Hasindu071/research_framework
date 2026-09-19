@@ -26,7 +26,7 @@ async function initializeMongoDB() {
       mongoConnected = true;
       console.log("✓ MongoDB initialized successfully");
     } catch (error) {
-      console.error("⚠ Failed to initialize MongoDB:", error);
+      console.error("❌ Failed to initialize MongoDB:", error);
       mongoInitialized = true;
       mongoConnected = false;
       // Don't crash the server - continue without MongoDB
@@ -533,14 +533,19 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     };
 
     // Save to MongoDB
-    console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
-    try {
-      const documentId = await saveAnalysisResult(repoName, finalResponse);
-      finalResponse.mongoId = documentId;
-      console.log(`[MongoDB] ✓ Result saved with ID: ${documentId}`);
-    } catch (mongoError) {
-      console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
-      finalResponse.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
+    if (mongoConnected) {
+      console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
+      try {
+        const documentId = await saveAnalysisResult(repoName, finalResponse);
+        finalResponse.mongoId = documentId;
+        console.log(`[MongoDB] ✓ Result saved with ID: ${documentId}`);
+      } catch (mongoError) {
+        console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
+        finalResponse.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
+      }
+    } else {
+      console.log("[MongoDB] ⚠ Skipping MongoDB save - MongoDB not connected");
+      finalResponse.mongoError = "MongoDB connection failed during initialization";
     }
 
     res.json(finalResponse);

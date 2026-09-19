@@ -309,6 +309,32 @@ export async function buildGenerationTargets(
       continue;
     }
 
+    // CRITICAL: Validate that the source file doesn't have unresolved imports
+    // If the source file imports from non-existent paths (like ~/data-table/components),
+    // any generated tests will fail at import time, before a single test runs.
+    const sourceContent = fs.readFileSync(sourceFileAbsolute, "utf-8");
+    const unresolvedImports = checkForUnresolvedImports(sourceContent, repositoryRoot);
+    if (unresolvedImports.length > 0) {
+      console.log(
+        `[Test-Generator] ⚠️ SKIPPING "${symbol.name}" — source file has unresolved imports that will break test compilation:`
+      );
+      unresolvedImports.forEach(imp => {
+        console.log(`[Test-Generator]    - "${imp}"`);
+      });
+      console.log(`[Test-Generator]    Tests cannot be generated for files with broken imports.`);
+      continue;
+    }
+
+    // CRITICAL: Validate that the symbol is actually exported from the source file
+    // If we're trying to import a symbol that isn't exported, the test will fail with ReferenceError
+    const isExported = checkSymbolExported(sourceContent, symbol.name);
+    if (!isExported) {
+      console.log(
+        `[Test-Generator] ⚠️ SKIPPING "${symbol.name}" — symbol is not exported from source file. Tests cannot import it.`
+      );
+      continue;
+    }
+
     const matchesForFile = context.candidateTests.filter(
       (candidate) => candidate.changedFile === symbol.file
     ) as TestMatch[];
@@ -457,6 +483,64 @@ function inferFrameworkFromFileName(testFile: string): string {
     return "mocha";
   }
   return "vitest"; // default
+}
+
+/**
+ * Check if a source file has imports that would fail at runtime/compile time.
+ * Returns a list of unresolved import paths.
+ */
+function checkForUnresolvedImports(sourceContent: string, repositoryRoot: string): string[] {
+  const unresolvedImports: string[] = [];
+  
+  // Match all import statements
+  const importRegex = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)(?:\s*,\s*(?:\{[^}]*\}|\*\s+as\s+\w+|\w+))*)\s+from\s+['"`]([^'"`]+)['"`]/g;
+  let match;
+  
+  while ((match = importRegex.exec(sourceContent)) !== null) {
+    const importPath = match[1];
+    
+    if (!importPath) continue;
+    
+    // Skip node_modules and @-scoped packages (these are assumed to be installed)
+    if (importPath.startsWith("@") || importPath.includes("node_modules")) {
+      continue;
+    }
+    
+    // Check for path aliases that might not resolve
+    // Common patterns: ~/, ./, ../, or bare package names without @ scope
+    if (importPath.startsWith("~")) {
+      // Alias import - would need tsconfig/vite config to resolve, assume problematic
+      unresolvedImports.push(importPath);
+    } else if (!importPath.startsWith(".") && !importPath.startsWith("/")) {
+      // Bare package name without @ scope - might be missing
+      // Skip common patterns that are known to work
+      if (!importPath.match(/^(react|react-dom|next|@calcom|@coss|vitest|@testing-library)/)) {
+        unresolvedImports.push(importPath);
+      }
+    }
+  }
+  
+  return unresolvedImports;
+}
+
+/**
+ * Check if a symbol is exported from the source file.
+ * Looks for: export function/const/class Name, or export { Name }
+ */
+function checkSymbolExported(sourceContent: string, symbolName: string): boolean {
+  // Check for direct export: export function Name, export const Name, export class Name
+  const directExportRegex = new RegExp(`\\bexport\\s+(?:function|const|class|default)\\s+${symbolName}\\b`, "g");
+  if (directExportRegex.test(sourceContent)) {
+    return true;
+  }
+  
+  // Check for export statement: export { Name, ... }
+  const namedExportRegex = new RegExp(`\\bexport\\s*\\{[^}]*\\b${symbolName}\\b[^}]*\\}`, "g");
+  if (namedExportRegex.test(sourceContent)) {
+    return true;
+  }
+  
+  return false;
 }
 
 // ======================================================

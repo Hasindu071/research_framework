@@ -60,9 +60,86 @@ function stripOuterDescribeWrapper(code: string): string {
  * 1. vi.advanceTimersByTimeAsync without vi.useFakeTimers setup
  * 2. Component definitions inside tests that reference undefined symbols
  * 3. screen usage without import
+ * 4. JSX syntax in non-JSX test files
  */
-function fixLLMPatternMistakes(code: string): string {
+function fixLLMPatternMistakes(code: string, testFileExtension: string): string {
   let fixed = code;
+
+  // CRITICAL FIX: Remove JSX syntax if this is a .ts or .js file (not .tsx/.jsx)
+  // Check if this is a JSX-capable file
+  const isJsxCapable = /\.(tsx|jsx)$/i.test(testFileExtension);
+  
+  if (!isJsxCapable) {
+    console.log("[Test-File-Writer] ⚠️ JSX stripping: This is a non-JSX file, removing any JSX syntax...");
+    console.log(`[Test-File-Writer]    File: ${testFileExtension}`);
+    
+    // COMPREHENSIVE JSX STRIPPING - multiple passes to catch all patterns
+    
+    // Pass 1: Remove JSX from arrow functions: () => <...>...</...>
+    // This catches: () => <div>...</div>, () => <Component />, () => <>...</>
+    let pass1Count = 0;
+    let prevFixed = fixed;
+    fixed = fixed.replace(/=>\s*<[^>]*?(?:>[\s\S]*?<\/[^>]*?>|\/?>)/g, "=> null");
+    pass1Count = (prevFixed.match(/=>\s*<[^>]*?(?:>[\s\S]*?<\/[^>]*?>|\/?>)/g) || []).length;
+    if (pass1Count > 0) {
+      console.log(`[Test-File-Writer] ✓ Pass 1: Stripped ${pass1Count} JSX in arrow functions`);
+    }
+    
+    // Pass 2: Remove JSX from return statements: return <...>...</...>
+    let pass2Count = 0;
+    prevFixed = fixed;
+    fixed = fixed.replace(/return\s+<[^>]*?(?:>[\s\S]*?<\/[^>]*?>|\/?>)/g, "return null");
+    pass2Count = (prevFixed.match(/return\s+<[^>]*?(?:>[\s\S]*?<\/[^>]*?>|\/?>)/g) || []).length;
+    if (pass2Count > 0) {
+      console.log(`[Test-File-Writer] ✓ Pass 2: Stripped ${pass2Count} JSX in return statements`);
+    }
+    
+    // Pass 3: Remove JSX passed as function arguments
+    // Matches: (something, <div>...</div>) or vi.mock(..., () => ({ x: <Component /> }))
+    let pass3Count = 0;
+    prevFixed = fixed;
+    fixed = fixed.replace(/:\s*<[^>]*?(?:>[\s\S]*?<\/[^>]*?>|\/?>)/g, ": null");
+    pass3Count = (prevFixed.match(/:\s*<[^>]*?(?:>[\s\S]*?<\/[^>]*?>|\/?>)/g) || []).length;
+    if (pass3Count > 0) {
+      console.log(`[Test-File-Writer] ✓ Pass 3: Stripped ${pass3Count} JSX assigned to object properties`);
+    }
+    
+    // Pass 4: Remove JSX fragments <>...</>
+    let pass4Count = 0;
+    prevFixed = fixed;
+    fixed = fixed.replace(/<>[\s\S]*?<\/>/g, "null");
+    pass4Count = (prevFixed.match(/<>[\s\S]*?<\/>/g) || []).length;
+    if (pass4Count > 0) {
+      console.log(`[Test-File-Writer] ✓ Pass 4: Stripped ${pass4Count} JSX fragments`);
+    }
+    
+    // Pass 5: Remove any remaining HTML-like tags (as last resort)
+    // This catches any <tagname ...>...</tagname> patterns
+    let pass5Count = 0;
+    prevFixed = fixed;
+    fixed = fixed.replace(/<[a-zA-Z][^>]*?(?:>[\s\S]*?<\/[a-zA-Z][^>]*?>|\/?>)/g, "null");
+    pass5Count = (prevFixed.match(/<[a-zA-Z][^>]*?(?:>[\s\S]*?<\/[a-zA-Z][^>]*?>|\/?>)/g) || []).length;
+    if (pass5Count > 0) {
+      console.log(`[Test-File-Writer] ✓ Pass 5: Stripped ${pass5Count} remaining JSX/HTML elements`);
+    }
+    
+    // Pass 6: Emergency fallback - replace any remaining < followed by letter or /
+    // This is aggressive but catches edge cases
+    let pass6Count = 0;
+    prevFixed = fixed;
+    const emergencyMatches = fixed.match(/<\s*[a-zA-Z/][^}]*?>/g) || [];
+    pass6Count = emergencyMatches.length;
+    if (pass6Count > 0) {
+      console.log(`[Test-File-Writer] ⚠️  Pass 6 (Emergency): Found ${pass6Count} potential JSX tags:`, emergencyMatches.slice(0, 3));
+      // Very aggressive: replace any < followed by letter or / and everything until >
+      fixed = fixed.replace(/<\s*[a-zA-Z/][^}]*?>/g, "(");
+    }
+    
+    const totalStripped = pass1Count + pass2Count + pass3Count + pass4Count + pass5Count + pass6Count;
+    console.log(`[Test-File-Writer] ✓ JSX STRIPPING COMPLETE: ${totalStripped} total replacements made`);
+  } else {
+    console.log(`[Test-File-Writer] JSX file (.tsx/.jsx) detected - skipping JSX stripping`);
+  }
 
   // Fix 0: Detect stub tests that don't actually test anything
   // These are tests that just do expect(true).toBe(true) or similar no-ops
@@ -187,15 +264,29 @@ function fixCommonSyntaxErrors(code: string): string {
  * - Handles multi-line vi.mock() statements properly
  * - Fixes common syntax errors
  */
-function cleanGeneratedTestCode(code: string): string {
+function cleanGeneratedTestCode(code: string, testFileExtension: string = ".ts"): string {
   console.log("[Test-File-Writer] USING FIXED cleanGeneratedTestCode");
+  console.log("[Test-File-Writer] testFileExtension parameter:", testFileExtension);
+  console.log("[Test-File-Writer] Is JSX file?", testFileExtension.match(/\.(tsx|jsx)$/i) !== null);
   console.log("[Test-File-Writer] Raw testCode from LLM (first 200 chars):");
   console.log(code.substring(0, 200));
   
   let cleaned = code.replace(/\r\n/g, "\n").trim();
   
-  // Fix LLM pattern mistakes early (screen.getByText, timer setup, etc.)
-  cleaned = fixLLMPatternMistakes(cleaned);
+  // DEFENSIVE: Run minimal JSX sanitization on ALL code for safety
+  // This catches cases where the LLM might have snuck JSX into non-JSX files
+  if (!testFileExtension.match(/\.(tsx|jsx)$/i)) {
+    console.log("[Test-File-Writer] Running aggressive JSX sanitization for non-JSX file...");
+    
+    // Do a quick scan first
+    const hasJSX = /=>\s*<[^>]|\breturn\s+<[^>]|:\s*<[^>]|<[a-zA-Z]/m.test(cleaned);
+    if (hasJSX) {
+      console.log("[Test-File-Writer] ⚠️ Detected JSX syntax in non-JSX file - will strip");
+    }
+  }
+  
+  // Fix LLM pattern mistakes early (screen.getByText, timer setup, JSX in .ts files, etc.)
+  cleaned = fixLLMPatternMistakes(cleaned, testFileExtension);
   
   // Fix common syntax errors
   cleaned = fixCommonSyntaxErrors(cleaned);
@@ -284,6 +375,18 @@ function cleanGeneratedTestCode(code: string): string {
   const result = reassembledLines.map((line) => line.slice(minIndent)).join("\n").trim();
   console.log("[Test-File-Writer] Cleaned testCode (first 200 chars):");
   console.log(result.substring(0, 200));
+  
+  // SAFETY CHECK: If still contains JSX after all cleaning, log a warning
+  if (result.match(/<[a-zA-Z][^>]*>/)) {
+    console.log("[Test-File-Writer] ⚠️⚠️⚠️ WARNING: Code still contains JSX-like syntax after cleaning!");
+    console.log("[Test-File-Writer] Lines with potential JSX:");
+    result.split("\n").forEach((line, idx) => {
+      if (line.match(/<[a-zA-Z]/)) {
+        console.log(`  Line ${idx + 1}: ${line.substring(0, 100)}`);
+      }
+    });
+  }
+  
   return result;
 }
 
@@ -427,8 +530,10 @@ export function mergeGeneratedTests(
   // Clean all generated test code first
   const cleanedTests = generatedTests.map((t) => ({
     ...t,
-    testCode: cleanGeneratedTestCode(t.testCode),
+    testCode: cleanGeneratedTestCode(t.testCode, testFile),
   }));
+  
+  console.log("[Test-File-Writer] MERGE: Cleaned", generatedTests.length, "test(s), testFile parameter:", testFile);
 
   // Extract all imports and vi.mock() calls from all tests
   const allImports = new Set<string>();

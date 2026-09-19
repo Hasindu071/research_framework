@@ -237,6 +237,12 @@ Hard rules (in priority order):
   3. it()/test() blocks for all test cases
   Do NOT put vi.mock() inside it() blocks or nested anywhere — it will fail. Do NOT put vi.mock() inside test cases — they must be at the absolute top of the entire output, BEFORE any it() call.
   
+  **CRITICAL: Do NOT use JSX syntax in non-JSX files.** If the test file is \`.ts\` or \`.js\` (not \`.tsx\` or \`.jsx\`), you CANNOT use JSX syntax like \`<div>\` in vi.mock() calls. Instead, use plain JavaScript:
+  - WRONG (in a .ts file): \`vi.mock('@components/Button', () => ({ default: () => <div>Button</div> }));\`
+  - RIGHT (in a .ts file): \`vi.mock('@components/Button', () => ({ default: vi.fn(() => null) }));\`
+  
+  For non-JSX test files, all mocks must use pure JavaScript functions or objects, never JSX markup.
+  
   CRITICAL: Mock return values that are objects MUST be formatted correctly with all braces and parentheses balanced. NEVER leave a closing brace or paren off the end of a mock. ALWAYS count: { } must be equal, ( ) must be equal.
   
   **MOCK STRUCTURE RULES — MANDATORY:**
@@ -387,16 +393,32 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
   sections.push(`## Test framework\n${target.framework}`);
 
   if (componentsToMock.length > 0) {
-    const mockStatements = componentsToMock
-      .map((source) => {
-        // Generate a simple mock for this import
-        const componentName = path.basename(source);
-        return `vi.mock('${source}', () => ({ default: () => <div data-testid="${componentName}">Mocked</div> }));`;
-      })
-      .join("\n");
+    // Check if this is a JSX file (.tsx, .jsx)
+    const isJSXFile = /\.(tsx|jsx)$/.test(target.testFile);
+    
+    let mockStatements: string;
+    if (isJSXFile) {
+      // JSX files can use JSX in mocks
+      mockStatements = componentsToMock
+        .map((source) => {
+          return `vi.mock('${source}', () => ({ default: vi.fn(() => null) }));`;
+        })
+        .join("\n");
+    } else {
+      // Non-JSX files (.ts, .js) MUST use functions that return null or objects
+      mockStatements = componentsToMock
+        .map((source) => {
+          return `vi.mock('${source}', () => ({ default: vi.fn(() => null) }));`;
+        })
+        .join("\n");
+    }
+
+    const mockDescription = isJSXFile
+      ? `These imports come from the changed code and should be mocked so the test only exercises \`${target.symbol}\`'s own logic, not its full child tree:\n\n\`\`\`typescript\n${mockStatements}\n\`\`\`\n\nPlace all vi.mock() calls at the very top of the test file, BEFORE any describe() or it() blocks. This is critical for vitest to intercept the imports correctly.`
+      : `These imports come from the changed code and should be mocked so the test only exercises \`${target.symbol}\`'s own logic. Since this is a TypeScript file (not JSX), use function mocks:\n\n\`\`\`typescript\n${mockStatements}\n\`\`\`\n\nPlace all vi.mock() calls at the very top of the test file, BEFORE any describe() or it() blocks. This is critical for vitest to intercept the imports correctly.\n\nIMPORTANT: Use ONLY \`vi.fn(() => null)\` or \`vi.fn(() => ({}))\` — DO NOT use JSX syntax in .ts files.`;
 
     sections.push(
-      `## Components to stub (auto-mock these paths)\n\nThese imports come from the changed code and should be mocked so the test only exercises \`${target.symbol}\`'s own logic, not its full child tree. Mock each with a simple functional component:\n\n\`\`\`typescript\n${mockStatements}\n\`\`\`\n\nPlace all vi.mock() calls at the very top of the test file, BEFORE any describe() or it() blocks. This is critical for vitest to intercept the imports correctly.\n\nIMPORTANT: Also mock any imports that the source file itself has (not just child components). For example, if the source imports from @components/*, @calcom/*, or other workspace paths, those MUST be mocked too, even if they're not React components. Use simple mocks like () => ({}) for non-components, or stubs that return empty objects/functions.`
+      `## Components/imports to stub (auto-mock these paths)\n\n${mockDescription}`
     );
   }
 
