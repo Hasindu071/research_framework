@@ -99,6 +99,10 @@ export interface GeneratedTestInput extends PrioritizedTestInput {
   sourceFile: string;
   /** True if `testFile` doesn't exist yet and must be scaffolded from scratch. */
   isNewTestFile: boolean;
+  /** Number of repair attempts already made (0 for initial generation). */
+  repairAttempt?: number;
+  /** Source file content for context during repairs. */
+  sourceFileContent?: string;
 }
 
 export interface TestExecutionResult {
@@ -388,9 +392,10 @@ async function runGeneratedTest(
     merge = mergeGeneratedTests(
       options.repositoryRoot,
       generated.testFile,
-      generated.isNewTestFile,
+      !fs.existsSync(path.resolve(options.repositoryRoot, generated.testFile)), // Check actual file existence
       generated.sourceFile,
-      [{ name: generated.testName, testCode: generated.testCode }]
+      [{ name: generated.testName, testCode: generated.testCode }],
+      generated.targetSymbol
     );
 
     // Verify the merge actually landed on disk before trusting it enough
@@ -398,6 +403,29 @@ async function runGeneratedTest(
     // MergeResult, since a writer bug could report success without
     // actually persisting the change.
     const writtenContent = fs.readFileSync(merge.testFileAbsolute, "utf8");
+    
+    // If all tests were rejected, don't try to verify
+    if (merge.finalContent === "") {
+      console.log(
+        `[Test-Writer] ℹ️ All tests were rejected during validation for "${generated.testName}"`
+      );
+      return {
+        testFile: generated.testFile,
+        priority: generated.priority,
+        framework: null,
+        command: "[SKIPPED] all generated tests were rejected during validation",
+        status: "skipped",
+        duration: 0,
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        notes: "Test failed validation checks (stub test, weak assertion, or doesn't call target function)",
+        generated: true,
+        generatedTestName: generated.testName,
+        keptInTestFile: false,
+      };
+    }
+
     const testNameFound = generated.testName && writtenContent.includes(generated.testName);
     const codeSnippet = generated.testCode.trim().slice(0, 60);
     const codeFound = codeSnippet.length > 0 && writtenContent.includes(codeSnippet);
@@ -476,6 +504,29 @@ async function runGeneratedTest(
         `(cwd: ${resolution.workspaceRelative})...`
     );
     const result = await executeTestFile(merge.testFileAbsolute, resolution, options);
+
+    // If test failed and we haven't exceeded max repair attempts, return a repair request
+    const repairAttempt = (generated.repairAttempt ?? 0) + 1;
+    const MAX_REPAIR_ATTEMPTS = 3;
+    
+    if (result.status === "failed" && repairAttempt < MAX_REPAIR_ATTEMPTS) {
+      console.log(
+        `[Test-Repair] ⚠️ Test failed (attempt ${repairAttempt}/${MAX_REPAIR_ATTEMPTS}). Requesting repair from LLM...`
+      );
+      
+      // Mark this as needing repair instead of final failure
+      return {
+        ...result,
+        testFile: generated.testFile,
+        priority: generated.priority,
+        generated: true,
+        generatedTestName: generated.testName,
+        keptInTestFile: false,
+        needsRepair: true,
+        repairAttempt,
+        repairError: result.stderr,
+      } as any as TestExecutionResult;
+    }
 
     // Keep generated tests if:
     // 1. They passed

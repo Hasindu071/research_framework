@@ -174,6 +174,72 @@ export function extractComponentImportsToMock(sourceFileContent: string): string
   return Array.from(results);
 }
 
+/**
+ * Extract all Prisma imports from the source file with their exact import styles.
+ * Returns an array of objects with the full import statement and the export style.
+ * 
+ * Examples of what we extract:
+ * - import { prisma } from "@calcom/prisma" → { statement: "import { prisma } from '@calcom/prisma';", style: 'named', name: 'prisma' }
+ * - import prisma from "@calcom/prisma" → { statement: "import prisma from '@calcom/prisma';", style: 'default', name: 'prisma' }
+ * - import { PrismaClient } from "@prisma/client" → { statement: "import { PrismaClient } from '@prisma/client';", style: 'named', name: 'PrismaClient' }
+ */
+export function extractPrismaImports(sourceFileContent: string): Array<{ statement: string; style: 'default' | 'named'; name: string; source: string }> {
+  const results: Array<{ statement: string; style: 'default' | 'named'; name: string; source: string }> = [];
+  
+  // Match all Prisma-related imports
+  const importRegex = /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["'](@?(?:@calcom\/)?prisma[^"']*|@prisma\/[^"']*)['"]/g;
+  let match: RegExpExecArray | null;
+  
+  while ((match = importRegex.exec(sourceFileContent)) !== null) {
+    const named = match[1];           // { prisma }
+    const defaultImport = match[2];   // prisma
+    const starAs = match[3];          // * as something
+    const source = match[4] || '';    // @calcom/prisma or @prisma/client etc
+    
+    if (!source) continue;
+    
+    // Handle default imports
+    if (defaultImport) {
+      results.push({
+        statement: `import ${defaultImport} from '${source}';`,
+        style: 'default',
+        name: defaultImport,
+        source
+      });
+    }
+    
+    // Handle namespace imports
+    if (starAs) {
+      results.push({
+        statement: `import * as ${starAs} from '${source}';`,
+        style: 'default',
+        name: starAs,
+        source
+      });
+    }
+    
+    // Handle named imports
+    if (named) {
+      // Split by comma and process each name
+      const names = named.split(',').map(n => n.trim());
+      for (const nameClause of names) {
+        // Handle 'as' aliases: { prisma as db }
+        const [importName] = nameClause.split(/\s+as\s+/);
+        if (importName) {
+          results.push({
+            statement: `import { ${nameClause} } from '${source}';`,
+            style: 'named',
+            name: importName,
+            source
+          });
+        }
+      }
+    }
+  }
+  
+  return results;
+}
+
 // ======================================================
 // SYSTEM PROMPT
 // ======================================================
@@ -350,6 +416,9 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
   // Extract component imports that should be auto-mocked
   const componentsToMock = extractComponentImportsToMock(target.sourceFileContent);
   
+  // Extract actual Prisma imports from production code
+  const prismaImports = extractPrismaImports(target.sourceFileContent);
+  
   // Extract symbols used in changed code and their import sources
   const usedSymbols = extractUsedSymbols(target.changedCode);
   const importMap = extractImportMap(target.sourceFileContent);
@@ -364,9 +433,98 @@ export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): stri
 
   const sections: string[] = [];
 
+  sections.push(`## CRITICAL RULE: Always call the actual production function\n\nYour test MUST directly invoke the actual function being tested: ${target.symbol}(...)\n\n❌ DON'T do this:\nconst mockResult = true; // fake logic\nexpect(mockResult).toBe(true);\n\n✓ DO this instead:\nconst result = await ${target.symbol}(...);\nexpect(result).toBeDefined();\n\nThe test must exercise the ACTUAL PRODUCTION CODE of ${target.symbol}, not just mock logic. This is essential for your research.\n`);
+
+  sections.push(`## IMPROVED TEST GENERATION RULES
+
+Generate executable unit/integration tests for the actual production function.
+
+### Critical Rules:
+1. **Always import and call the exact production function being tested**
+   - Do NOT recreate or copy the production function's internal logic inside the test
+   - Do NOT create placeholder tests
+   
+2. **Reject these patterns - they are NOT valid tests:**
+   - \`expect(true).toBe(true)\` - tautological assertions
+   - \`expect(result).toBeDefined()\` as the ONLY assertion - this is too weak
+   - Empty test bodies
+   - Tests with TODO/FIXME comments or "placeholder" labels
+   - Tests that only describe a branch without verifying actual behavior
+
+3. **Use the actual expected return value or observable behavior in assertions**
+   - Inspect the production file to understand what the function actually returns
+   - Generate realistic input data that reaches the intended branch
+   - Generate both positive and negative cases when the production logic supports them
+   - Assert on the actual return value, not just that something exists
+
+4. **CRITICAL: Preserve import styles from the production file**
+   - If the production code uses a default import, the test mock must provide a default export
+   - If the production code uses a named import, the test mock must provide the named export
+   - Example:
+     - Production: \`import prisma from "@calcom/prisma"\`
+     - Test: \`vi.mock("@calcom/prisma", () => ({ default: { booking: { findUnique: vi.fn() } } }))\`
+   - Example:
+     - Production: \`import { prisma } from "@calcom/prisma"\`
+     - Test: \`vi.mock("@calcom/prisma", () => ({ prisma: { booking: { findUnique: vi.fn() } } }))\`
+
+5. **IMPORTANT: DO NOT mock @calcom/prisma/enums**
+   - NEVER mock the entire "@calcom/prisma/enums" module
+   - NEVER replace Prisma enum exports with custom mocks
+   - If you must mock enums, use partial mocking with importOriginal:
+     \`\`\`typescript
+     vi.mock("@calcom/prisma/enums", async (importOriginal) => {
+       const actual = await importOriginal();
+       return {
+         ...actual,
+         // only override specific enums if absolutely required
+       };
+     });
+     \`\`\`
+   - For most tests, do NOT mock "@calcom/prisma/enums" at all
+
+6. **Mock external dependencies** (like Prisma) instead of connecting to a real database
+   - Mock only the specific Prisma data operations (e.g., prisma.booking.findUnique)
+   - Provide realistic mock return values that match the expected data shape
+   - Every generated test must execute the target production function
+
+7. **Generate realistic test scenarios**
+   - Instead of: \`it('returns Number(queryDuration)', () => { ... }\`
+   - Do: \`it('returns the configured duration when seat reference is null', async () => { ... }\`
+   - Instead of: \`it('branches on bookingSeatReferenceUid', () => { ... }\`
+   - Do: \`it('uses the seat reference ID when available, otherwise falls back to user ID', async () => { ... }\`
+   - Include realistic setup data that the function actually needs
+   - Test observable function behavior, not individual code branches
+
+### A generated test is valid ONLY if it:
+- Imports the target production function
+- Calls the target production function at least once
+- Contains meaningful assertions (not just \`toBeDefined()\`)
+- Can execute with its dependencies mocked
+- Generates realistic test data, not placeholders
+`);
+
   sections.push(`## Changed symbol\n${target.symbol} (in ${target.sourceFile})`);
 
   sections.push(`## Import path for tests (CRITICAL — use EXACTLY this path)\nTest file location: ${target.testFile}\nSource file location: ${target.sourceFile}\n\nWhen writing test imports, use this relative path from the test file:\n\`\`\`typescript\nimport { ${target.symbol} } from '${relativeImportPath}';\n\`\`\`\n\nThis is the ONLY correct import path for this test. Do not generate any other import path, even if it looks correct. Use exactly: ${relativeImportPath}`);
+  
+  // Add section for Prisma imports found in production code
+  if (prismaImports.length > 0) {
+    const prismaSection = prismaImports
+      .map((imp) => `${imp.statement}`)
+      .join('\n');
+    
+    const prismaMockInstructions = prismaImports.map((imp) => {
+      if (imp.style === 'default') {
+        return `- Production: \`${imp.statement}\`\n  Mock MUST use default export: \`vi.mock('${imp.source}', () => ({ default: { /* mock methods */ } }))\``;
+      } else {
+        return `- Production: \`${imp.statement}\`\n  Mock MUST use named export: \`vi.mock('${imp.source}', () => ({ ${imp.name}: { /* mock methods */ } }))\``;
+      }
+    }).join('\n\n');
+    
+    sections.push(
+      `## CRITICAL: Actual Prisma imports from production code (PRESERVE THIS STYLE IN YOUR MOCKS)\n\nThe production code uses these Prisma imports:\n\n\`\`\`typescript\n${prismaSection}\n\`\`\`\n\nIMPORTANT: If your tests need to mock Prisma, you MUST preserve the exact export style:\n\n${prismaMockInstructions}\n\nThe mock's export structure must exactly match how the production code imports it. Do NOT replace module exports with incompatible structures.`
+    );
+  }
   
   // Add section for required imports extracted from changed code
   if (requiredImports.length > 0) {

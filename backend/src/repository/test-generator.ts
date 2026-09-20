@@ -231,6 +231,74 @@ async function findTemplateTestFile(
 // ======================================================
 
 /**
+ * Repair context for a failed test — sent to LLM to fix the issue
+ */
+export interface TestRepairRequest {
+  failedTestCode: string;
+  viestError: string;
+  targetFunctionName: string;
+  sourceFileContent: string;
+  testFileName: string;
+  attemptNumber: number;
+  maxAttempts: number;
+}
+
+/**
+ * Build a repair prompt for the LLM to fix a failed test
+ */
+export function buildTestRepairPrompt(request: TestRepairRequest): string {
+  return `
+## Test Repair Request
+
+The following generated test failed during execution. Your task is to repair it.
+
+### Attempt ${request.attemptNumber}/${request.maxAttempts}
+
+### Failed Test Code
+\`\`\`typescript
+${request.failedTestCode}
+\`\`\`
+
+### Vitest Error
+\`\`\`
+${request.viestError}
+\`\`\`
+
+### Target Function Being Tested
+\`\`\`typescript
+${request.sourceFileContent}
+\`\`\`
+
+### Test File Name
+${request.testFileName}
+
+### Your Task
+Fix the test code to resolve the error.
+
+**Rules:**
+1. Do NOT modify the production source code
+2. Fix only the test code
+3. Preserve all required imports and exports
+4. Identify the root cause of the error and fix it
+5. Do NOT mock @calcom/prisma/enums - preserve all enum exports
+6. The test MUST call the target function and verify actual behavior
+7. Return ONLY the corrected test code in a TypeScript code block
+
+**If the error is about a missing export:**
+- Check if you're mocking the entire module
+- Use partial mocks with importOriginal() if needed
+- Preserve all existing exports
+
+**If the error is about undefined symbols:**
+- Add missing imports
+- Check the production file for the correct import paths
+- Verify mock return values match expected types
+
+Return the fixed test code:
+`;
+}
+
+/**
  * Turns prioritized test results + LLMContext into concrete generation
  * targets. Each target is one changed symbol referenced by a prioritized
  * test that has at least one verified (Tier-1) coverage gap.
@@ -610,6 +678,19 @@ async function generateTestsForTarget(
   };
 }
 
+/**
+ * Validate that the generated test actually references the target function.
+ * Rejects tests that don't use the function being tested.
+ */
+function validateTargetFunctionUsed(
+  testCode: string,
+  targetFunctionName: string
+): boolean {
+  // Check if the target function name appears in the test code
+  // This ensures we're testing the actual production function, not just mocking logic
+  return testCode.includes(targetFunctionName);
+}
+
 // ======================================================
 // VALIDATION
 // ======================================================
@@ -643,6 +724,15 @@ function validateAndNormalize(
     if (!looksLikeTestCode(testCase.testCode)) {
       console.warn(
         `[Test-Generator] Dropping suspicious test case for "${target.symbol}" — doesn't look like test code`
+      );
+      continue;
+    }
+
+    // NEW VALIDATION: Check if the test actually calls the target function
+    if (!validateTargetFunctionUsed(testCase.testCode, target.symbol)) {
+      console.warn(
+        `[Test-Generator] ⚠️ REJECTED: Test for "${target.symbol}" does not call the target function. ` +
+        `Generated test must directly invoke ${target.symbol}(...), not just mock it or test surrounding logic.`
       );
       continue;
     }

@@ -1,5 +1,7 @@
 import "dotenv/config";
 import express from "express";
+import path from "path";
+import fs from "fs";
 import { analyzeCommit } from "./repository/analyzer.js";
 import { buildLLMContext } from "./repository/context-builder.js";
 import { analyzeDependencyChanges } from "./repository/dependencyAnalyzer.js";
@@ -326,14 +328,29 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       );
 
       for (const generatedTest of result.generatedTests) {
+        // Get source file content for repair context
+        const sourceFileAbsolute = path.isAbsolute(target?.sourceFile ?? "")
+          ? target?.sourceFile
+          : path.resolve(repositoryPath, target?.sourceFile ?? "");
+        let sourceContent = "";
+        if (sourceFileAbsolute) {
+          try {
+            sourceContent = fs.readFileSync(sourceFileAbsolute, "utf8");
+          } catch {
+            // Source file not readable, will skip repair context
+          }
+        }
+
         generatedTestInputs.push({
-          testFile: result.testFile,  // Correct: from result.testFile, not result.existingTestFile
+          testFile: result.testFile,
           priority: 0,
           testCode: generatedTest.testCode,
-          testName: generatedTest.name,  // Correct: from .name, not .testName
+          testName: generatedTest.name,
           targetSymbol: generatedTest.targetSymbol ?? result.targetSymbol,
-          sourceFile: target?.sourceFile ?? "",  // From the generation target
-          isNewTestFile: target?.isNewTestFile ?? false,  // From the generation target
+          sourceFile: target?.sourceFile ?? "",
+          isNewTestFile: target?.isNewTestFile ?? false,
+          repairAttempt: 0,
+          sourceFileContent: sourceContent,
         });
       }
     }
@@ -361,6 +378,87 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
         timeoutMs: 120_000,  // 2 min timeout (accounts for monorepo startup time)
         keepGeneratedTests: true,  // Keep files for inspection
       });
+
+      // ========================================
+      // Repair loop: retry failed tests with LLM fixes
+      // ========================================
+      console.log("[Step 6/6] Checking for tests that need repair...");
+      
+      const failedTests = generatedExecution.testExecution.filter(
+        (r: any) => (r as any).needsRepair === true
+      );
+      
+      if (failedTests.length > 0) {
+        console.log(`[Step 6/6] Found ${failedTests.length} test(s) that need repair. Requesting fixes from LLM...`);
+        
+        const repairBatch: GeneratedTestInput[] = [];
+        
+        for (const failedTest of failedTests) {
+          const originalInput = enrichedGeneratedInputs.find(
+            (t) => t.testFile === failedTest.testFile && t.testName === failedTest.generatedTestName
+          );
+          
+          if (originalInput) {
+            // Build repair request for LLM
+            const { buildTestRepairPrompt } = await import("./repository/test-generator.js");
+            
+            const repairPrompt = buildTestRepairPrompt({
+              failedTestCode: originalInput.testCode,
+              viestError: (failedTest as any).repairError || failedTest.stderr || "",
+              targetFunctionName: originalInput.targetSymbol,
+              sourceFileContent: originalInput.sourceFileContent ?? "",
+              testFileName: originalInput.testFile,
+              attemptNumber: ((originalInput.repairAttempt ?? 0) + 1),
+              maxAttempts: 3,
+            });
+            
+            console.log(`[Step 6/6] Sending repair request for "${originalInput.testName}" (attempt ${(originalInput.repairAttempt ?? 0) + 1}/3)`);
+            
+            // Add delay to respect rate limits (2 seconds between requests)
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Call LLM to repair the test
+            const repairResponse = await llmClient.generateJSON<{
+              repairedTestCode: string;
+            }>(
+              "You are a test repair assistant. Fix the failing test code based on the error message and context provided.",
+              repairPrompt
+            );
+            
+            if (repairResponse?.repairedTestCode) {
+              // Create new input with repaired code and incremented attempt counter
+              repairBatch.push({
+                ...originalInput,
+                testCode: repairResponse.repairedTestCode,
+                repairAttempt: (originalInput.repairAttempt ?? 0) + 1,
+              });
+              console.log(`[Step 6/6] ✓ Received repaired test code for "${originalInput.testName}"`);
+            }
+          }
+        }
+        
+        // Re-execute repaired tests
+        if (repairBatch.length > 0) {
+          console.log(`[Step 6/6] Re-executing ${repairBatch.length} repaired test(s)...`);
+          
+          const repairedExecution = await runPrioritizedTests(repairBatch, {
+            repositoryRoot: repositoryPath,
+            stopOnFailure: false,
+            timeoutMs: 120_000,
+            keepGeneratedTests: true,
+          });
+          
+          // Replace failed results with repair results in generatedExecution
+          for (const repaired of repairedExecution.testExecution) {
+            const failedIndex = generatedExecution.testExecution.findIndex(
+              (r: any) => r.testFile === repaired.testFile && r.generatedTestName === repaired.generatedTestName
+            );
+            if (failedIndex !== -1) {
+              generatedExecution.testExecution[failedIndex] = repaired;
+            }
+          }
+        }
+      }
 
       // Calculate full breakdown instead of hiding other buckets
       const genSummary = {
@@ -401,19 +499,25 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     ).length;
 
     console.log("========================================");
-    console.log("Full pipeline completed successfully ✓");
+    console.log("Pipeline execution completed");
     console.log("========================================");
     console.log("");
     console.log("EXISTING TEST RESULTS");
     console.log("========================================");
+    const existingPassed = prioritizedExecution.testExecution.filter((r: any) => r.status === "passed").length;
+    const existingExecuted = prioritizedExecution.testExecution.length;
+    const existingPassRate = existingExecuted > 0 ? ((existingPassed / existingExecuted) * 100).toFixed(1) : "0.0";
     console.log(
       `Selected: ${prioritizedTestInputs.length}`
     );
     console.log(
-      `Executed: ${prioritizedExecution.testExecution.length}`
+      `Executed: ${existingExecuted}`
     );
     console.log(
-      `Passed: ${prioritizedExecution.testExecution.filter((r: any) => r.status === "passed").length}`
+      `Passed: ${existingPassed}`
+    );
+    console.log(
+      `Pass Rate: ${existingPassRate}%`
     );
     console.log(
       `Failed: ${prioritizedExecution.testExecution.filter((r: any) => r.status === "failed").length}`
@@ -421,14 +525,39 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     console.log("");
     console.log("GENERATED TEST RESULTS");
     console.log("========================================");
+    const totalGenerated = generationResult.results.reduce(
+      (sum: number, r: any) => sum + (r.generatedTests?.length ?? 0),
+      0
+    );
+    const validGenerated = enrichedGeneratedInputs.length; // Tests that passed validation and were written
+    const rejectedGenerated = totalGenerated - validGenerated; // Tests that were rejected during validation
+    const generatedPassed = generatedExecution.testExecution.filter((r: any) => r.status === "passed").length;
+    const generatedExecuted = generatedExecution.testExecution.length;
+    const generatedPassRate = generatedExecuted > 0 ? ((generatedPassed / generatedExecuted) * 100).toFixed(1) : "0.0";
+    const generationValidityRate = totalGenerated > 0 ? ((validGenerated / totalGenerated) * 100).toFixed(1) : "0.0";
+    
     console.log(
-      `Generated: ${generatedCount}`
+      `Generated: ${totalGenerated}`
     );
     console.log(
-      `Executed: ${generatedExecution.testExecution.length}`
+      `Valid (passed validation): ${validGenerated}`
+    );
+    if (rejectedGenerated > 0) {
+      console.log(
+        `Rejected (failed validation): ${rejectedGenerated}`
+      );
+    }
+    console.log(
+      `Generation Validity Rate: ${generationValidityRate}%`
     );
     console.log(
-      `Passed: ${generatedExecution.testExecution.filter((r: any) => r.status === "passed").length}`
+      `Executed: ${generatedExecuted}`
+    );
+    console.log(
+      `Passed: ${generatedPassed}`
+    );
+    console.log(
+      `Execution Success Rate: ${generatedPassRate}%`
     );
     console.log(
       `Failed: ${generatedExecution.testExecution.filter((r: any) => r.status === "failed").length}`
