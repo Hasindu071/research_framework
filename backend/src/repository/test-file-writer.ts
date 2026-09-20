@@ -403,6 +403,7 @@ function usesTargetFunction(testCode: string, targetSymbol: string | undefined):
 }
 
 function validateTestQuality(testCode: string): { valid: boolean; reason?: string } {
+  // Reject tautological assertions
   if (testCode.includes("expect(true).toBe(true)")) {
     return { valid: false, reason: "Tautological assertion: expect(true).toBe(true)" };
   }
@@ -411,23 +412,36 @@ function validateTestQuality(testCode: string): { valid: boolean; reason?: strin
     return { valid: false, reason: "Tautological assertion: expect(false).toBe(false)" };
   }
 
+  // Reject tests with only toBeDefined assertions
   const assertionMatches = testCode.match(/expect\([^)]+\)\.\w+/g) || [];
   const isDefinedMatches = testCode.match(/expect\([^)]+\)\.toBeDefined\(\)/g) || [];
 
   if (assertionMatches.length === 1 && isDefinedMatches.length === 1) {
-    return { valid: false, reason: "Weak assertion: only expects result to be defined" };
+    return { valid: false, reason: "Weak assertion: only expects result to be defined (must assert on actual value or behavior)" };
   }
 
+  // Reject placeholder tests
   if (testCode.includes("TODO") || testCode.includes("FIXME") || testCode.includes("placeholder")) {
     return { valid: false, reason: "Placeholder test with TODO/FIXME comments" };
   }
 
+  // Reject empty test bodies
   const itMatches = testCode.match(/it\s*\([^)]+\)\s*,?\s*(?:async\s*)?\(\s*\)\s*=>\s*{([^}]*)}/g) || [];
   for (const match of itMatches) {
     const body = match.split('{')[1]?.split('}')[0]?.trim();
     if (!body || body.length === 0) {
       return { valid: false, reason: "Test with empty body" };
     }
+  }
+
+  // New: Reject tests that only do type checking without behavior verification
+  if (/expect\([^)]*\)\.toHaveBeenCalled\(\)/.test(testCode) && assertionMatches.length === 1) {
+    return { valid: false, reason: "Weak assertion: only checks if function was called without verifying result or side effects" };
+  }
+
+  // New: Reject tests that don't actually make any assertions
+  if (!testCode.includes("expect(")) {
+    return { valid: false, reason: "No assertions found: test must use expect() to verify behavior" };
   }
 
   return { valid: true };
@@ -745,7 +759,45 @@ export function mergeGeneratedTests(
     }
   }
 
-  // Safety net: auto-import commonly-missed symbols
+  // CRITICAL: Filter out test framework imports from generated code.
+  // These are always provided by the test file and should NEVER be re-imported.
+  // This is a critical safety net to prevent duplicate imports that break the merge.
+  const TEST_FRAMEWORK_IMPORTS = new Set([
+    "import { it } from 'vitest';",
+    'import { it } from "vitest";',
+    "import { expect } from 'vitest';",
+    'import { expect } from "vitest";',
+    "import { describe } from 'vitest';",
+    'import { describe } from "vitest";',
+    "import { vi } from 'vitest';",
+    'import { vi } from "vitest";',
+    "import { beforeEach } from 'vitest';",
+    'import { beforeEach } from "vitest";',
+    "import { afterEach } from 'vitest';",
+    'import { afterEach } from "vitest";',
+    "import { beforeAll } from 'vitest';",
+    'import { beforeAll } from "vitest";',
+    "import { afterAll } from 'vitest';",
+    'import { afterAll } from "vitest";',
+    "import { test } from 'vitest';",
+    'import { test } from "vitest";',
+  ]);
+
+  // Remove test framework imports from allImports
+  const filteredImports = new Set<string>();
+  let removedFrameworkImports = 0;
+  for (const imp of allImports) {
+    if (TEST_FRAMEWORK_IMPORTS.has(imp)) {
+      removedFrameworkImports++;
+      console.log(`[Test-File-Writer] ⚠️ Filtered out test framework import (already provided): ${imp}`);
+    } else {
+      filteredImports.add(imp);
+    }
+  }
+  
+  if (removedFrameworkImports > 0) {
+    console.log(`[Test-File-Writer] ✓ Removed ${removedFrameworkImports} duplicate test framework import(s)`);
+  }
   try {
     for (const t of cleanedTests) {
       const code = t.testCode;
@@ -773,20 +825,10 @@ export function mergeGeneratedTests(
         ['fireEvent', "import { fireEvent } from '@testing-library/react';"],
         ['within', "import { within } from '@testing-library/react';"],
         ['userEvent', "import userEvent from '@testing-library/user-event';"],
-        ['vi', "import { vi } from 'vitest';"],
-        ['it', "import { it } from 'vitest';"],
-        ['describe', "import { describe } from 'vitest';"],
-        ['expect', "import { expect } from 'vitest';"],
-        ['beforeEach', "import { beforeEach } from 'vitest';"],
-        ['afterEach', "import { afterEach } from 'vitest';"],
-        ['beforeAll', "import { beforeAll } from 'vitest';"],
-        ['afterAll', "import { afterAll } from 'vitest';"],
-        ['test', "import { test } from 'vitest';"],
         ['sleep', "import { sleep } from './test-utils';"],
-        ['vi.fn', "import { vi } from 'vitest';"],
-        ['vi.spyOn', "import { vi } from 'vitest';"],
-        ['vi.mock', "import { vi } from 'vitest';"],
-        ['vi.mocked', "import { vi } from 'vitest';"],
+        // NOTE: Deliberately omit test framework globals (vi, it, describe, expect, beforeEach, etc.)
+        // These are ALWAYS provided by the test file framework and should never be re-imported.
+        // They are handled separately by the TEST_FRAMEWORK_IMPORTS filter above.
       ]);
 
       for (const [symbol, importStatement] of symbolImportMap) {
@@ -807,8 +849,8 @@ export function mergeGeneratedTests(
 
         const isUsed = symbolPatterns.some(pattern => pattern.test(code));
 
-        if (isUsed && !allImports.has(importStatement)) {
-          allImports.add(importStatement);
+        if (isUsed && !filteredImports.has(importStatement)) {
+          filteredImports.add(importStatement);
           console.log(`[Test-File-Writer] Auto-added missing import for ${symbol}`);
         }
       }
@@ -816,7 +858,7 @@ export function mergeGeneratedTests(
       // prisma-specific auto-import (varies by export style, so it isn't
       // in the generic map above).
       const referencesPrisma = /\bprisma\s*\./.test(code);
-      const alreadyHasPrismaImport = Array.from(allImports).some((imp) =>
+      const alreadyHasPrismaImport = Array.from(filteredImports).some((imp) =>
         /@calcom\/prisma|@prisma\/client/.test(imp)
       );
 
@@ -826,10 +868,10 @@ export function mergeGeneratedTests(
             prismaImportStyle.style === "default"
               ? `import ${prismaImportStyle.name} from '${prismaImportStyle.source}';`
               : `import { ${prismaImportStyle.name} } from '${prismaImportStyle.source}';`;
-          allImports.add(stmt);
+          filteredImports.add(stmt);
           console.log(`[Test-File-Writer] ✓ Auto-added missing prisma import (${prismaImportStyle.style}): ${stmt}`);
         } else {
-          allImports.add(`import { prisma } from '@calcom/prisma';`);
+          filteredImports.add(`import { prisma } from '@calcom/prisma';`);
           console.log(`[Test-File-Writer] ⚠️ Auto-added fallback named prisma import — could not detect source import style`);
         }
       }
@@ -838,7 +880,7 @@ export function mergeGeneratedTests(
       let funcMatch;
       const localFunctionsAndImports = new Set<string>();
 
-      for (const importStmt of allImports) {
+      for (const importStmt of filteredImports) {
         const importMatch = importStmt.match(/(?:import|from)\s+(?:\{([^}]+)\}|(\w+))/);
         if (importMatch) {
           const imported = importMatch[1] || importMatch[2];
@@ -855,8 +897,8 @@ export function mergeGeneratedTests(
         if (funcName && !localFunctionsAndImports.has(funcName)) {
           if (symbolImportMap.has(funcName)) {
             const importStatement = symbolImportMap.get(funcName);
-            if (importStatement && !allImports.has(importStatement)) {
-              allImports.add(importStatement);
+            if (importStatement && !filteredImports.has(importStatement)) {
+              filteredImports.add(importStatement);
               console.log(`[Test-File-Writer] Auto-added missing import for function ${funcName}`);
             }
           }
@@ -884,8 +926,8 @@ export function mergeGeneratedTests(
     }
 
     const targetImportStatement = `import { ${targetSymbol} } from '${relativeImportPath}';`;
-    if (!allImports.has(targetImportStatement)) {
-      allImports.add(targetImportStatement);
+    if (!filteredImports.has(targetImportStatement)) {
+      filteredImports.add(targetImportStatement);
       console.log(`[Test-File-Writer] ✓ Added target function import: ${targetImportStatement}`);
     }
   }
@@ -909,8 +951,8 @@ export function mergeGeneratedTests(
   }
 
   let topLevelBlock = "";
-  if (allImports.size > 0) {
-    topLevelBlock += Array.from(allImports).join("\n") + "\n\n";
+  if (filteredImports.size > 0) {
+    topLevelBlock += Array.from(filteredImports).join("\n") + "\n\n";
   }
   if (allMocks.length > 0) {
     topLevelBlock += allMocks.join("\n\n") + "\n\n";
@@ -1077,13 +1119,13 @@ export function mergeGeneratedTests(
   }
 
   let finalContent: string;
-  if (topLevelBlock.trim().length > 0 || allImports.size > 0 || allMocks.length > 0) {
+  if (topLevelBlock.trim().length > 0 || filteredImports.size > 0 || allMocks.length > 0) {
     const existingImportsRaw = originalContent.match(/^import .+$/gm) || [];
     const existingImports = new Set(
       existingImportsRaw.map((imp) => (imp.trim().endsWith(';') ? imp.trim() : imp.trim() + ';'))
     );
 
-    const newImports = Array.from(allImports).filter(
+    const newImports = Array.from(filteredImports).filter(
       (imp) => !existingImports.has(imp)
     );
 

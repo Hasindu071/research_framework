@@ -57,6 +57,15 @@ export interface ChangedBehavior {
    * (use `cases` for the partial picture in that situation).
    */
   overallStatus: CoverageStatus;
+  /**
+   * Clear behavioral description for test generation.
+   * Structured as: "Function X does Y when Z"
+   * Examples:
+   * - "Function getReplyHeader returns email when includeEmail is true"
+   * - "Function formatDate handles null dates by returning empty string"
+   * - "Function filterEvents filters when predicate is falsy"
+   */
+  behaviorDescription?: string;
 }
 
 /** A single, verified, addressable gap — this is what reaches the generator. */
@@ -68,6 +77,15 @@ export interface CoverageGap {
   evidence: string;
   /** The specific uncovered case, e.g. "value is nullish → falls back to true". */
   condition: string;
+  /**
+   * Clear description of WHAT behavior to test and HOW to verify it.
+   * Structured as: "When X, the function should Y"
+   * Examples:
+   * - "When value is nullish, shouldUseDefault should return the default value"
+   * - "When count is zero, shouldProcess should return false"
+   * - "When error is thrown, handleError should catch and log it"
+   */
+  testableAssertion?: string;
 }
 
 export interface GapAnalysisInput {
@@ -102,8 +120,16 @@ export interface TestGapAnalysis {
 export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LLMClient): Promise<TestGapAnalysis> {
   const testCode = input.existingTestCode ?? "";
 
-  const fallbackBehaviors = await extractFallbackBehaviors(input.diffText, input.symbol, testCode, llmClient);
-  const lexicalBehaviors = extractLexicalBehaviors(input.diffText);
+  // Extract only the relevant diff section for this symbol
+  const symbolDiff = extractSymbolDiff(input.diffText, input.symbol);
+  
+  console.log(
+    `[GapAnalyzer] Extracted symbol-specific diff for "${input.symbol}": ` +
+    `${symbolDiff.length} chars (original diffText: ${input.diffText?.length ?? 0} chars)`
+  );
+
+  const fallbackBehaviors = await extractFallbackBehaviors(symbolDiff, input.symbol, testCode, llmClient);
+  const lexicalBehaviors = extractLexicalBehaviors(symbolDiff);
   const changedBehaviors = [...fallbackBehaviors, ...lexicalBehaviors];
 
   const existingCoverage = extractExistingCoverage(testCode);
@@ -116,6 +142,12 @@ export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LL
         kind: behavior.kind,
         evidence: behavior.evidence,
         condition: c.condition,
+        testableAssertion: generateTestableAssertion(
+          input.symbol,
+          behavior,
+          c.condition,
+          behavior.behaviorDescription
+        ),
       }))
   );
 
@@ -128,26 +160,27 @@ export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LL
         kind: lexBehavior.kind,
         evidence: lexBehavior.evidence,
         condition: `Not covered — no existing test file to verify against`,
+        testableAssertion: generateLexicalTestableAssertion(input.symbol, lexBehavior),
       });
     }
   }
 
   console.log(
     `[GapAnalyzer] Symbol: "${input.symbol}" | ` +
-      `diffText length: ${input.diffText?.length ?? 0} chars | ` +
+      `symbolDiff length: ${symbolDiff?.length ?? 0} chars | ` +
       `testCode length: ${testCode.length} chars | ` +
       `fallback behaviors: ${fallbackBehaviors.length} | ` +
       `lexical (unverified) behaviors: ${lexicalBehaviors.length} | ` +
       `verified coverage gaps: ${coverageGaps.length}`
   );
 
-  if (input.diffText && input.diffText.length > 0 && changedBehaviors.length === 0) {
+  if (symbolDiff && symbolDiff.length > 0 && changedBehaviors.length === 0) {
     console.warn(
-      `[GapAnalyzer] ⚠️ WARNING: Diff extracted (${input.diffText.length} chars) but no behaviors detected. ` +
+      `[GapAnalyzer] ⚠️ WARNING: Symbol diff extracted (${symbolDiff.length} chars) but no behaviors detected. ` +
         `Regex patterns may not match this diff format or structure.`
     );
-    console.warn(`[GapAnalyzer] DEBUG: Raw diffText for "${input.symbol}":\n${input.diffText.substring(0, 500)}`);
-    const addedLines = getAddedLines(input.diffText);
+    console.warn(`[GapAnalyzer] DEBUG: Raw symbol diff for "${input.symbol}":\n${symbolDiff.substring(0, 500)}`);
+    const addedLines = getAddedLines(symbolDiff);
     console.warn(`[GapAnalyzer] DEBUG: Added lines (${addedLines.length}): ${JSON.stringify(addedLines.slice(0, 10))}`);
   }
 
@@ -158,6 +191,22 @@ export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LL
   }
 
   if (lexicalBehaviors.length > 0 && testCode.trim().length > 0) {
+    // OPTION 1: Convert unverified lexical behaviors to gaps (more aggressive test generation)
+    // Uncomment the code below to enable this mode and generate tests for all code changes
+    
+    // for (const lexBehavior of lexicalBehaviors) {
+    //   coverageGaps.push({
+    //     label: lexBehavior.label,
+    //     kind: lexBehavior.kind,
+    //     evidence: lexBehavior.evidence,
+    //     condition: `Modified behavior (unverified) — existing tests may not cover all scenarios`,
+    //   });
+    // }
+    // console.log(
+    //   `[GapAnalyzer] ℹ️ Added ${lexicalBehaviors.length} unverified behavior(s) to gaps for generation.`
+    // );
+
+    // OPTION 2: Keep current conservative approach (existing behavior)
     console.log(
       `[GapAnalyzer] ℹ️ ${lexicalBehaviors.length} Tier-2 (unverified) behavior(s) detected for ` +
         `"${input.symbol}" — not sent to generator (existing tests present), coverage status unknown by design.`
@@ -396,7 +445,7 @@ Determine coverage for these two cases based on the test code provided.`;
     const response = await llmClient.generateJSON<LLMCoverageResponse>(systemPrompt, userPrompt);
 
     console.log(
-      `[GapAnalyzer-LLM] Coverage verification for "${fb.property}": ` +
+      `[GapAnalyzer-LLM] Coverage verification for symbol "${symbolName}", property "${fb.property}": ` +
         `${response.cases?.length ?? 0} verdict(s) provided`
     );
 
@@ -553,6 +602,9 @@ async function extractFallbackBehaviors(
     const passThroughCondition = `${fb.property} is provided and not ${nullishOrFalsy}`;
     const fallbackCondition = `${fb.property} is ${nullishOrFalsy} → falls back to \`${truncate(fb.fallbackExpr, 30)}\``;
 
+    // Generate clear behavioral description
+    const behaviorDesc = `When ${fb.property} is ${nullishOrFalsy}, ${symbolName} should use ${truncate(fb.fallbackExpr, 40)} as fallback`;
+
     // If there's no existing test code, both cases are not-covered without asking the model
     if (!testCode || testCode.trim().length === 0) {
       const cases: BehaviorCase[] = [
@@ -574,6 +626,7 @@ async function extractFallbackBehaviors(
         evidence: line,
         cases,
         overallStatus: "not-covered",
+        behaviorDescription: behaviorDesc,
       });
       continue;
     }
@@ -598,6 +651,7 @@ async function extractFallbackBehaviors(
       evidence: line,
       cases,
       overallStatus: allCovered ? "covered" : noneCovered ? "not-covered" : allUnknown ? "unknown" : "unknown",
+      behaviorDescription: behaviorDesc,
     });
   }
 
@@ -864,4 +918,158 @@ export function buildGapAnalysisInputsFromAnalysis(
 
     return input;
   });
+}
+
+
+// ======================================================
+// ENHANCEMENT: Generate testable assertions from gaps
+// ======================================================
+
+/**
+ * Generate a clear, actionable assertion description for a fallback behavior gap.
+ * This describes WHAT the test should verify in plain English.
+ * Format: "When X, assert that Y happens"
+ */
+export function generateTestableAssertion(
+  symbolName: string,
+  behavior: ChangedBehavior,
+  condition: string,
+  behaviorDescription?: string
+): string {
+  if (behaviorDescription) {
+    return `Assert that: ${behaviorDescription}`;
+  }
+  
+  // Fallback descriptions based on condition
+  if (condition.includes("nullish")) {
+    return `Assert that: ${symbolName} correctly uses fallback when value is nullish`;
+  }
+  if (condition.includes("falsy")) {
+    return `Assert that: ${symbolName} correctly uses fallback when value is falsy`;
+  }
+  return `Assert that: ${symbolName} correctly implements ${truncate(behavior.label, 50)}`;
+}
+
+/**
+ * Generate a testable assertion for lexical behavior gaps.
+ * These are more general behavioral descriptions.
+ */
+export function generateLexicalTestableAssertion(symbolName: string, behavior: ChangedBehavior): string {
+  switch (behavior.kind) {
+    case "branch":
+      return `Assert that: ${symbolName} handles all conditional branches correctly`;
+    case "loop":
+      return `Assert that: ${symbolName} correctly iterates over collections`;
+    case "error-handling":
+      return `Assert that: ${symbolName} properly catches and handles errors`;
+    case "return":
+      return `Assert that: ${symbolName} returns the correct value`;
+    case "param":
+      return `Assert that: ${symbolName} correctly uses all required parameters`;
+    default:
+      return `Assert that: ${symbolName} implements ${truncate(behavior.label, 50)}`;
+  }
+}
+
+/**
+ * Convert a CoverageGap to a format optimized for test generation.
+ * Ensures testable assertions are included.
+ */
+export interface TestableGap {
+  symbol: string;
+  kind: BehaviorKind;
+  condition: string;
+  assertion: string;
+  evidence: string;
+  sourceFile: string;
+}
+
+export function gapToTestableFormat(gap: CoverageGap, symbol: string, sourceFile: string): TestableGap {
+  return {
+    symbol,
+    kind: gap.kind,
+    condition: gap.condition,
+    assertion: gap.testableAssertion || gap.label,
+    evidence: gap.evidence,
+    sourceFile,
+  };
+}
+
+
+// ======================================================
+// SYMBOL-SPECIFIC DIFF EXTRACTION
+// ======================================================
+
+/**
+ * Extract only the relevant diff section for a specific symbol.
+ * Returns the changed function/method/declaration with surrounding context,
+ * not just isolated added lines.
+ *
+ * Strategy:
+ * 1. Find all "@@" hunk headers (these mark sections of the diff)
+ * 2. For each hunk, check if it contains changes related to this symbol
+ * 3. Return only the hunks that affect this symbol
+ * 4. Include surrounding context lines (unchanged lines near the changes)
+ *
+ * This ensures the analyzer sees:
+ *   function isAtomStateInitialized(atomState) {
+ *     const key = ...
+ * -   const value = atomState[key]
+ * +   const value = atomState[key] ?? defaultValue
+ *     return !!value
+ *   }
+ *
+ * NOT just:
+ * +   const value = atomState[key] ?? defaultValue
+ */
+export function extractSymbolDiff(diffText: string, symbolName: string): string {
+  if (!diffText || diffText.trim().length === 0) {
+    return "";
+  }
+
+  // Split by hunk headers (@@  -START,COUNT +START,COUNT @@)
+  const hunkRegex = /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/m;
+  const hunks = diffText.split(hunkRegex).slice(1); // skip text before first hunk
+
+  if (hunks.length === 0) {
+    // No hunks found, return original (might be a unified diff without hunk markers)
+    return diffText;
+  }
+
+  const relevantHunks: string[] = [];
+
+  for (const hunk of hunks) {
+    // Check if this hunk mentions the symbol name
+    // Look for:
+    // - function/const/class declarations: "function symbolName" or "const symbolName ="
+    // - method names: ".symbolName" or " symbolName("
+    // - variable/property usage: " symbolName"
+    const symbolDeclRegex = new RegExp(
+      `\\b(?:function|const|let|var|class|async)\\s+${escapeRegex(symbolName)}\\b` +  // declaration
+      `|\\b${escapeRegex(symbolName)}\\s*[=(\\{]` +                                      // assignment or call
+      `|\\w\\.${escapeRegex(symbolName)}\\b` +                                           // method call
+      `|\\s${escapeRegex(symbolName)}\\b`,                                               // standalone usage
+      'g'
+    );
+
+    if (symbolDeclRegex.test(hunk)) {
+      relevantHunks.push(hunk);
+    }
+  }
+
+  // If no hunks match the symbol, return empty (symbol not in this diff)
+  if (relevantHunks.length === 0) {
+    return "";
+  }
+
+  // Reconstruct the diff hunks
+  const result = relevantHunks
+    .map((hunk) => {
+      // Trim leading/trailing whitespace but preserve the content structure
+      const trimmed = hunk.trim();
+      return trimmed;
+    })
+    .join("\n\n");
+
+  return result;
 }
