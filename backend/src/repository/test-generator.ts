@@ -726,6 +726,52 @@ function validateTargetFunctionUsed(
   return testCode.includes(targetFunctionName);
 }
 
+/**
+ * Validate that the generated test contains at least one explicit assertion.
+ * Rejects tests that only call functions without verifying behavior.
+ * 
+ * Checks for:
+ * - expect(...) calls (Jest/Vitest standard)
+ * - assert(...) calls (Node assert module)
+ * - Ensures it's not just a tautological expect(true).toBe(true)
+ */
+function validateHasExplicitAssertion(testCode: string): boolean {
+  // Check for expect() calls - the most common assertion pattern
+  const hasExpect = /\bexpect\s*\(/.test(testCode);
+  
+  // Check for assert() calls - Node.js assert module
+  const hasAssert = /\bassert\s*\(/.test(testCode);
+  
+  if (!hasExpect && !hasAssert) {
+    return false;
+  }
+  
+  // If we found expect() or assert(), verify it's not ONLY tautological assertions
+  // Skip tests that only do things like: expect(true).toBe(true) or expect(result).toBeDefined()
+  // These are too weak and don't actually verify behavior
+  
+  // Extract all expect/assert calls to check if ANY are meaningful
+  const expectCalls = /expect\s*\([^)]+\)\.[a-zA-Z]+\([^)]*\)/g;
+  const matches = testCode.match(expectCalls) || [];
+  
+  for (const match of matches) {
+    // Reject obvious no-op assertions
+    if (/expect\s*\(\s*(true|false|1|0|undefined)\s*\)/.test(match)) {
+      continue;
+    }
+    if (/\.toBeDefined\(\)$/.test(match) && !match.includes("expect(result)") && !match.includes("expect(data)")) {
+      // toBeDefined() alone is too weak, unless it's a specific result
+      continue;
+    }
+    
+    // If we get here, it's a meaningful assertion
+    return true;
+  }
+  
+  // If all assertions were tautological/weak, reject
+  return matches.length > 0 && !testCode.match(/expect\s*\(\s*true\s*\)\.toBe\s*\(\s*true\s*\)/);
+}
+
 // ======================================================
 // VALIDATION
 // ======================================================
@@ -763,11 +809,22 @@ function validateAndNormalize(
       continue;
     }
 
-    // NEW VALIDATION: Check if the test actually calls the target function
+    // VALIDATION: Check if the test actually calls the target function
     if (!validateTargetFunctionUsed(testCase.testCode, target.symbol)) {
       console.warn(
         `[Test-Generator] ⚠️ REJECTED: Test for "${target.symbol}" does not call the target function. ` +
         `Generated test must directly invoke ${target.symbol}(...), not just mock it or test surrounding logic.`
+      );
+      continue;
+    }
+
+    // VALIDATION: Check if the test contains at least one explicit assertion
+    if (!validateHasExplicitAssertion(testCase.testCode)) {
+      console.warn(
+        `[Test-Generator] ⚠️ REJECTED: Test for "${target.symbol}" (gap: "${testCase.addressesGap}") ` +
+        `has NO ASSERTIONS. Generated tests MUST include explicit expect() or assert() calls that verify behavior. ` +
+        `A test without assertions cannot verify that the code works correctly. ` +
+        `The test must contain expect(result).toBe(...), expect(value).toEqual(...), or similar meaningful assertions.`
       );
       continue;
     }

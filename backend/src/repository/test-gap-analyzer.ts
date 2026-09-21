@@ -767,7 +767,7 @@ export function buildGapAnalysisInputsFromAnalysis(
   for (const symbol of changedSymbols) {
     console.log(`\n[GapAnalysisBuilder] Processing symbol: "${symbol.name}"`);
     
-    const symbolRange = findSymbolRange(symbol.file, symbol.name);
+    const symbolRange = findSymbolRange(repositoryRoot, symbol.file, symbol.name);
     console.log(`[GapAnalysisBuilder]   Symbol range: lines ${symbolRange?.startLine ?? "unknown"}–${symbolRange?.endLine ?? "unknown"}`);
     
     const symbolDiff = symbolRange

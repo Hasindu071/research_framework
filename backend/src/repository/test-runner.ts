@@ -1113,7 +1113,10 @@ async function executeTestFile(
         `[test-runner] Detected unresolved import/alias. Attempting to inject auto-mock...`
       );
       
-      // Try two remediation strategies
+      // Try alias resolution retry with override config
+      // NOTE: DO NOT USE AUTO-MOCK INJECTION (Strategy 2) for existing tests.
+      // Existing tests should run against real repository code, not modified with fake dependencies.
+      // If imports fail, we should report the real error, not mask it with a fake mock.
       
       // Strategy 1: Alias resolution retry with override config
       if (originalConfigPath) {
@@ -1178,45 +1181,17 @@ async function executeTestFile(
         }
       }
       
-      // Strategy 2: Inject auto-mock into test file
-      console.log(`[test-runner] Strategy 2: Injecting auto-mock for unresolved import...`);
-      const injectionResult = injectAutoMockForUnresolvedImport(
-        testFilePath,
-        unresolvedAlias,
-        result.stderr
-      );
-      
-      if (injectionResult.success) {
-        console.log(`[test-runner] Auto-mock injected. Retrying test execution...`);
-        const retryLabel = `(cwd: ${executionCwd}, retry after auto-mock injection) ${command} ${args.join(" ")}`;
-        const retryResult = await spawnTestProcess(
-          command,
-          args,
-          executionCwd,
-          timeoutMs
-        );
-        
-        // Restore original test file
-        if (injectionResult.backupContent) {
-          fs.writeFileSync(testFilePath, injectionResult.backupContent, "utf8");
-        }
-        
-        if (
-          retryResult.exitCode === 0 ||
-          !detectImportOrSetupError(retryResult.stdout, retryResult.stderr)
-        ) {
-          console.log(`[test-runner] Retry succeeded with auto-mock injection`);
-          return buildExecutionResult(
-            retryResult,
-            retryLabel,
-            resolution,
-            timeoutMs
-          );
-        }
-        
-        // If still failed, use original result
-        return buildExecutionResult(result, commandLabel, resolution, timeoutMs);
-      }
+      // NOTE: STRATEGY 2 (Auto-mock injection) DISABLED
+      // For research framework, existing tests should be executed against the real repository code.
+      // If imports cannot be resolved, we report the ERROR rather than masking it with a fake mock.
+      // This ensures:
+      // 1. Tests run against real code (not corrupted by fake dependencies)
+      // 2. Import/config errors are visible for debugging
+      // 3. Repository code is never modified during test execution
+      //
+      // COMMENTED OUT CODE:
+      // const injectionResult = injectAutoMockForUnresolvedImport(...);
+      // This previously corrupted tests like Jotai by injecting "const } = async () => {};"
     }
   }
 

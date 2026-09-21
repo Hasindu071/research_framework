@@ -1,8 +1,12 @@
 import { simpleGit } from "simple-git";
+import { Project } from "ts-morph";
+import path from "path";
+
 import { analyzeSymbol } from "./symbol-analyzer.js";
 import { analyzeDependencyChanges } from "./dependencyAnalyzer.js";
 import { analyzeTests } from "./test-analyzer.js";
 import { discoverSourceFiles } from "./file-discovery.js";
+
 import type { DependencyChange } from "./dependencyAnalyzer.js";
 import type { TestAnalysisResult } from "./test-analyzer.js";
 
@@ -14,7 +18,7 @@ interface SymbolChange {
   oldName: string;
   newName: string;
   file: string;
-  type: "rename";
+  type: "rename" | "modified";
 }
 
 interface ChangedLine {
@@ -99,11 +103,11 @@ export async function analyzeCommit(
 
   const latestCommit = log.latest;
 
-    if (!latestCommit) {
-      throw new Error(
-        `Commit not found: ${commitHash}`
-      );
-    }
+  if (!latestCommit) {
+    throw new Error(
+      `Commit not found: ${commitHash}`
+    );
+  }
 
   // ==================================================
   // 2. Get raw diff
@@ -123,30 +127,53 @@ export async function analyzeCommit(
   console.log("Parsing diff...");
 
   const changes = parseDiff(rawDiff);
-  const dependencyChanges = analyzeDependencyChanges(rawDiff);
 
-  const testAnalysis = analyzeTests(
-    changes,
-    repositoryPath
-  );
+  const dependencyChanges =
+    analyzeDependencyChanges(rawDiff);
+
+  const testAnalysis =
+    analyzeTests(
+      changes,
+      repositoryPath
+    );
 
   console.log(
     `Files changed: ${changes.length}`
   );
 
   // ==================================================
-  // 4. Detect REAL symbol renames
+  // 4. Detect symbol changes
   // ==================================================
 
-  const symbolChanges =
+  const renameChanges =
     detectSymbolRenames(changes);
 
+  const modifiedChanges =
+    detectModifiedSymbols(
+      changes,
+      repositoryPath
+    );
+
+  const symbolChanges =
+    mergeSymbolChanges(
+      renameChanges,
+      modifiedChanges
+    );
+
   console.log(
-    `Symbol renames detected: ${symbolChanges.length}`
+    `Symbol changes detected: ${symbolChanges.length}`
+  );
+
+  console.log(
+    `  - Renames: ${renameChanges.length}`
+  );
+
+  console.log(
+    `  - Modified: ${modifiedChanges.length}`
   );
 
   // ==================================================
-  // 5. Analyze renamed symbols
+  // 5. Analyze changed symbols
   // ==================================================
 
   const symbolAnalysis: {
@@ -154,11 +181,13 @@ export async function analyzeCommit(
     analysis: ReturnType<typeof analyzeSymbol>;
   }[] = [];
 
-  // Discover all source files once (reuse for all symbol analyses)
-  const discoveredFiles = discoverSourceFiles(repositoryPath);
+  // Discover all source files once
+  // and reuse them for symbol analysis.
+  const discoveredFiles =
+    discoverSourceFiles(repositoryPath);
 
   // --------------------------------------------------
-  // Prevent analyzing the same new symbol repeatedly
+  // Prevent analyzing the same symbol repeatedly
   // --------------------------------------------------
 
   const analyzedSymbols =
@@ -169,19 +198,25 @@ export async function analyzeCommit(
     const symbolName =
       symbolChange.newName;
 
-    if (analyzedSymbols.has(symbolName)) {
+    // Include file in the key so two files
+    // can have symbols with the same name.
+    const symbolKey =
+      `${symbolChange.file}:${symbolName}`;
 
+    if (
+      analyzedSymbols.has(symbolKey)
+    ) {
       console.log(
-        `Skipping duplicate symbol: ${symbolName}`
+        `Skipping duplicate symbol: ${symbolName} in ${symbolChange.file}`
       );
 
       continue;
     }
 
-    analyzedSymbols.add(symbolName);
+    analyzedSymbols.add(symbolKey);
 
     console.log(
-      `Analyzing symbol: ${symbolName}`
+      `Analyzing symbol: ${symbolName} in ${symbolChange.file}`
     );
 
     const analysis =
@@ -218,35 +253,34 @@ export async function analyzeCommit(
   // 7. Return result
   // ==================================================
 
-    console.log("======================================");
-    console.log("Commit analysis completed");
-    console.log("======================================");
+  console.log("======================================");
+  console.log("Commit analysis completed");
+  console.log("======================================");
 
-    const result: CommitAnalysis = {
-      commit: {
-        hash: latestCommit.hash || "",
-        message: latestCommit.message || "",
-        author: latestCommit.author_name || "",
-        date: latestCommit.date || "",
-      },
+  const result: CommitAnalysis = {
+    commit: {
+      hash: latestCommit.hash || "",
+      message: latestCommit.message || "",
+      author: latestCommit.author_name || "",
+      date: latestCommit.date || "",
+    },
 
-      summary: {
-        filesChanged: changes.length,
-        totalInsertions,
-        totalDeletions,
-      },
+    summary: {
+      filesChanged: changes.length,
+      totalInsertions,
+      totalDeletions,
+    },
 
-      changes,
-      symbolChanges,
-      symbolAnalysis,
-      dependencyChanges,
-      testAnalysis,
-      rawDiff,
-    };
+    changes,
+    symbolChanges,
+    symbolAnalysis,
+    dependencyChanges,
+    testAnalysis,
+    rawDiff,
+  };
 
-    return result;
-  }
-
+  return result;
+}
 
 // ======================================================
 // DIFF PARSER
@@ -355,29 +389,45 @@ function parseDiff(
 
     let insertions = 0;
     let deletions = 0;
+
     let newLineNumber = 0;
     let oldLineNumber = 0;
 
     for (const line of lines) {
 
-      // Parse hunk headers to track line numbers
-      // Format: @@ -oldStart,oldCount +newStart,newCount @@
+      // Parse hunk headers
+      //
+      // Example:
+      // @@ -10,5 +10,7 @@
 
       if (line.startsWith("@@")) {
-        const match = line.match(
-          /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/
-        );
+
+        const match =
+          line.match(
+            /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/
+          );
+
         if (match?.[1]) {
-          newLineNumber = parseInt(match[1]) - 1;
+          newLineNumber =
+            parseInt(match[1]) - 1;
         }
-        const oldMatch = line.match(/-(\d+)/);
+
+        const oldMatch =
+          line.match(
+            /-(\d+)/
+          );
+
         if (oldMatch?.[1]) {
-          oldLineNumber = parseInt(oldMatch[1]) - 1;
+          oldLineNumber =
+            parseInt(oldMatch[1]) - 1;
         }
+
         continue;
       }
 
+      // ==================================================
       // Ignore Git metadata
+      // ==================================================
 
       if (
         line.startsWith("+++ ") ||
@@ -392,11 +442,14 @@ function parseDiff(
         continue;
       }
 
+      // ==================================================
       // Added line
+      // ==================================================
 
       if (line.startsWith("+")) {
 
         insertions++;
+
         newLineNumber++;
 
         changedLines.push({
@@ -406,11 +459,14 @@ function parseDiff(
         });
       }
 
+      // ==================================================
       // Deleted line
+      // ==================================================
 
       else if (line.startsWith("-")) {
 
         deletions++;
+
         oldLineNumber++;
 
         changedLines.push({
@@ -419,9 +475,12 @@ function parseDiff(
         });
       }
 
-      // Context line (unchanged)
+      // ==================================================
+      // Context line
+      // ==================================================
 
       else if (line.startsWith(" ")) {
+
         newLineNumber++;
         oldLineNumber++;
       }
@@ -470,8 +529,6 @@ function detectSymbolRenames(
 ): SymbolChange[] {
 
   const symbolChanges: SymbolChange[] = [];
-
-  // Prevent duplicate records
 
   const detected =
     new Set<string>();
@@ -522,7 +579,9 @@ function detectSymbolRenames(
           continue;
         }
 
-        if (oldSymbol === newSymbol) {
+        if (
+          oldSymbol === newSymbol
+        ) {
           continue;
         }
 
@@ -542,11 +601,9 @@ function detectSymbolRenames(
             newSymbol
           );
 
-        // If the lines become identical after replacing
-        // the symbol names with __SYMBOL__, then the only
-        // meaningful change is the symbol name.
-        //
-        // Therefore this is a strong rename candidate.
+        // If the lines become identical after
+        // replacing the symbol names, this is
+        // a strong rename candidate.
 
         if (
           normalizedOld !== normalizedNew
@@ -557,7 +614,9 @@ function detectSymbolRenames(
         const key =
           `${change.file}:${oldSymbol}->${newSymbol}`;
 
-        if (detected.has(key)) {
+        if (
+          detected.has(key)
+        ) {
           continue;
         }
 
@@ -574,6 +633,390 @@ function detectSymbolRenames(
   }
 
   return symbolChanges;
+}
+
+// ======================================================
+// DETECT MODIFIED SYMBOLS
+// ======================================================
+//
+// Finds functions, classes, methods, and variables
+// whose source ranges contain changed lines.
+//
+// Example:
+//
+// function calculateTotal() {    <-- line 10
+//   ...                          <-- line 11
+//   return total;                <-- line 12 changed
+// }                              <-- line 13
+//
+// Since line 12 is inside the function range,
+// calculateTotal is considered modified.
+//
+// ======================================================
+
+function detectModifiedSymbols(
+  changes: FileChange[],
+  repositoryRoot: string
+): SymbolChange[] {
+
+  const symbolChanges: SymbolChange[] = [];
+
+  const detected =
+    new Set<string>();
+
+  const project =
+    new Project({
+      skipAddingFilesFromTsConfig: true,
+    });
+
+  for (const change of changes) {
+
+    // ==================================================
+    // Skip binary files
+    // ==================================================
+
+    if (change.binary) {
+      continue;
+    }
+
+    // ==================================================
+    // Deleted files do not exist in the checked-out
+    // target commit, so there is no AST to inspect.
+    // ==================================================
+
+    if (
+      change.status === "deleted"
+    ) {
+      continue;
+    }
+
+    // ==================================================
+    // Skip files without changes
+    // ==================================================
+
+    if (
+      change.changedLines.length === 0
+    ) {
+      continue;
+    }
+
+    // ==================================================
+    // Get absolute path
+    // ==================================================
+
+    const absolutePath =
+      path.resolve(
+        repositoryRoot,
+        change.file
+      );
+
+    let sourceFile;
+
+    try {
+
+      sourceFile =
+        project.addSourceFileAtPath(
+          absolutePath
+        );
+
+    } catch (error) {
+
+      console.warn(
+        `[SymbolDetection] Could not parse ${change.file}:`,
+        error instanceof Error
+          ? error.message
+          : String(error)
+      );
+
+      continue;
+    }
+
+    // ==================================================
+    // Only added lines are used because the repository
+    // is currently checked out at the target commit.
+    // ==================================================
+
+    const changedLineNumbers =
+      change.changedLines
+        .filter(
+          (line) =>
+            line.type === "added" &&
+            line.newLineNumber !== undefined
+        )
+        .map(
+          (line) =>
+            line.newLineNumber!
+        );
+
+    if (
+      changedLineNumbers.length === 0
+    ) {
+      continue;
+    }
+
+    console.log(
+      `[SymbolDetection] ${change.file}: ` +
+      `${changedLineNumbers.length} changed line(s)`
+    );
+
+    // ==================================================
+    // FUNCTIONS
+    // ==================================================
+
+    for (
+      const fn
+      of sourceFile.getFunctions()
+    ) {
+
+      const start =
+        fn.getStartLineNumber();
+
+      const end =
+        fn.getEndLineNumber();
+
+      const changed =
+        changedLineNumbers.some(
+          (line) =>
+            line >= start &&
+            line <= end
+        );
+
+      if (!changed) {
+        continue;
+      }
+
+      const name =
+        fn.getName();
+
+      if (!name) {
+        continue;
+      }
+
+      const key =
+        `${change.file}:${name}`;
+
+      if (
+        detected.has(key)
+      ) {
+        continue;
+      }
+
+      detected.add(key);
+
+      symbolChanges.push({
+        oldName: name,
+        newName: name,
+        file: change.file,
+        type: "modified",
+      });
+
+      console.log(
+        `[SymbolDetection] ✓ Function modified: ${name} (${change.file}:${start}-${end})`
+      );
+    }
+
+    // ==================================================
+    // CLASSES
+    // ==================================================
+
+    for (
+      const cls
+      of sourceFile.getClasses()
+    ) {
+
+      const classStart =
+        cls.getStartLineNumber();
+
+      const classEnd =
+        cls.getEndLineNumber();
+
+      const classChanged =
+        changedLineNumbers.some(
+          (line) =>
+            line >= classStart &&
+            line <= classEnd
+        );
+
+      const className =
+        cls.getName();
+
+      if (
+        classChanged &&
+        className
+      ) {
+
+        const key =
+          `${change.file}:${className}`;
+
+        if (
+          !detected.has(key)
+        ) {
+
+          detected.add(key);
+
+          symbolChanges.push({
+            oldName: className,
+            newName: className,
+            file: change.file,
+            type: "modified",
+          });
+
+          console.log(
+            `[SymbolDetection] ✓ Class modified: ${className} (${change.file}:${classStart}-${classEnd})`
+          );
+        }
+      }
+
+      // ==================================================
+      // METHODS
+      // ==================================================
+
+      for (
+        const method
+        of cls.getMethods()
+      ) {
+
+        const start =
+          method.getStartLineNumber();
+
+        const end =
+          method.getEndLineNumber();
+
+        const changed =
+          changedLineNumbers.some(
+            (line) =>
+              line >= start &&
+              line <= end
+          );
+
+        if (!changed) {
+          continue;
+        }
+
+        const name =
+          method.getName();
+
+        const key =
+          `${change.file}:${name}`;
+
+        if (
+          detected.has(key)
+        ) {
+          continue;
+        }
+
+        detected.add(key);
+
+        symbolChanges.push({
+          oldName: name,
+          newName: name,
+          file: change.file,
+          type: "modified",
+        });
+
+        console.log(
+          `[SymbolDetection] ✓ Method modified: ${name} (${change.file}:${start}-${end})`
+        );
+      }
+    }
+
+    // ==================================================
+    // VARIABLES
+    // ==================================================
+
+    for (
+      const variable
+      of sourceFile.getVariableDeclarations()
+    ) {
+
+      const start =
+        variable.getStartLineNumber();
+
+      const end =
+        variable.getEndLineNumber();
+
+      const changed =
+        changedLineNumbers.some(
+          (line) =>
+            line >= start &&
+            line <= end
+        );
+
+      if (!changed) {
+        continue;
+      }
+
+      const name =
+        variable.getName();
+
+      const key =
+        `${change.file}:${name}`;
+
+      if (
+        detected.has(key)
+      ) {
+        continue;
+      }
+
+      detected.add(key);
+
+      symbolChanges.push({
+        oldName: name,
+        newName: name,
+        file: change.file,
+        type: "modified",
+      });
+
+      console.log(
+        `[SymbolDetection] ✓ Variable modified: ${name} (${change.file}:${start}-${end})`
+      );
+    }
+  }
+
+  return symbolChanges;
+}
+
+// ======================================================
+// MERGE SYMBOL CHANGES
+// ======================================================
+//
+// Prevent duplicate symbols when the same symbol is
+// detected both as a rename and as a modified symbol.
+//
+// ======================================================
+
+function mergeSymbolChanges(
+  renameChanges: SymbolChange[],
+  modifiedChanges: SymbolChange[]
+): SymbolChange[] {
+
+  const result: SymbolChange[] = [];
+
+  const seen =
+    new Set<string>();
+
+  for (
+    const change of [
+      ...renameChanges,
+      ...modifiedChanges,
+    ]
+  ) {
+
+    const key =
+      `${change.file}:${change.newName}`;
+
+    if (
+      seen.has(key)
+    ) {
+      continue;
+    }
+
+    seen.add(key);
+
+    result.push(change);
+  }
+
+  return result;
 }
 
 // ======================================================
@@ -598,7 +1041,9 @@ function extractChangedSymbol(
       /(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/
     );
 
-  if (declarationMatch) {
+  if (
+    declarationMatch
+  ) {
     return declarationMatch[1];
   }
 
@@ -611,14 +1056,14 @@ function extractChangedSymbol(
       /(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/
     );
 
-  if (classMatch) {
+  if (
+    classMatch
+  ) {
     return classMatch[1];
   }
 
   // ==================================================
   // Import
-  //
-  // import { foo } from ...
   // ==================================================
 
   const namedImportMatch =
@@ -626,14 +1071,14 @@ function extractChangedSymbol(
       /import\s*\{\s*([A-Za-z_$][\w$]*)/
     );
 
-  if (namedImportMatch) {
+  if (
+    namedImportMatch
+  ) {
     return namedImportMatch[1];
   }
 
   // ==================================================
   // Function call
-  //
-  // foo(...)
   // ==================================================
 
   const callMatch =
@@ -641,7 +1086,9 @@ function extractChangedSymbol(
       /\b([A-Za-z_$][\w$]*)\s*\(/
     );
 
-  if (callMatch) {
+  if (
+    callMatch
+  ) {
     return callMatch[1];
   }
 
@@ -679,4 +1126,3 @@ function normalizeSymbolLine(
     )
     .trim();
 }
-
