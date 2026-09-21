@@ -184,6 +184,8 @@ const IMPORT_ERROR_PATTERNS = [
   /SyntaxError/i,
   /ERR_MODULE_NOT_FOUND/i,
   /Error: Could not resolve/i,
+  /Failed to load custom Reporter/i,  // Vitest reporter loading errors
+  /Error: Failed to load url/i,  // Vitest URL loading errors
 ];
 
 const CONFIG_ERROR_PATTERNS = [
@@ -787,38 +789,74 @@ function injectAutoMockForUnresolvedImport(
     const testContent = fs.readFileSync(testFilePath, "utf8");
     const backup = testContent;
     
-    // Create a generic mock for this import
-    const mockStatement = `vi.mock('${fullImportPath}', () => ({ default: () => null }));`;
+    // Strategy: Replace the problematic import with a functional mock
+    // Find and replace import statements for this module
+    let modifiedContent = testContent;
     
-    // Find the first import or vi.mock statement and insert before it
-    // Or insert right after the opening comments
-    const lines = testContent.split("\n");
-    let insertIndex = 0;
+    // Create a smart mock that provides common testing-library methods
+    const mockFactory = `(() => {
+  const noop = () => {};
+  const asyncNoop = async () => {};
+  return {
+    default: {
+      click: asyncNoop,
+      type: asyncNoop,
+      clear: asyncNoop,
+      selectOptions: asyncNoop,
+      deselectOptions: asyncNoop,
+      upload: asyncNoop,
+      keyboard: asyncNoop,
+      pointer: asyncNoop,
+      tripleClick: asyncNoop,
+      dblClick: asyncNoop,
+      hover: asyncNoop,
+      unhover: asyncNoop,
+      tab: asyncNoop,
+    },
+    click: asyncNoop,
+    type: asyncNoop,
+    clear: asyncNoop,
+    selectOptions: asyncNoop,
+    deselectOptions: asyncNoop,
+    upload: asyncNoop,
+    keyboard: asyncNoop,
+    pointer: asyncNoop,
+    tripleClick: asyncNoop,
+    dblClick: asyncNoop,
+    hover: asyncNoop,
+    unhover: asyncNoop,
+    tab: asyncNoop,
+  };
+})()`;
     
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i] || "";
-      // Skip empty lines and comments at the top
-      if (line.trim() === "" || line.trim().startsWith("//") || line.trim().startsWith("/*")) {
-        insertIndex = i + 1;
-        continue;
+    // Pattern 1: import identifier from "module"
+    modifiedContent = modifiedContent.replace(
+      new RegExp(`import\\s+([\\w{},\\s*$]+?)\\s+from\\s+['"]${fullImportPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`, 'g'),
+      (match, imports) => {
+        // Extract the imported names
+        const isDefaultImport = !imports.includes('{');
+        if (isDefaultImport) {
+          // import userEvent from "@testing-library/user-event"
+          // becomes: const userEvent = { click: async () => {}, ... }
+          return `const ${imports.trim()} = ${mockFactory};`;
+        } else {
+          // import { click, type } from "@testing-library/user-event"
+          // becomes: const click = async () => {}; const type = async () => {};
+          const names = imports.split(',').map((n: string) => n.trim().split(' ').pop() || '');
+          return names.filter((n: string) => n).map((name: string) => `const ${name} = async () => {};`).join('\n');
+        }
       }
-      // Insert before first import or vi.mock
-      if (line.trim().startsWith("import ") || line.trim().startsWith("vi.mock")) {
-        insertIndex = i;
-        break;
-      }
-      // If we hit any other code, insert after current line
-      insertIndex = i + 1;
-      break;
-    }
+    );
     
-    // Insert the mock statement
-    lines.splice(insertIndex, 0, mockStatement);
-    const modifiedContent = lines.join("\n");
+    // Pattern 2: import "module" (side-effect only)
+    modifiedContent = modifiedContent.replace(
+      new RegExp(`import\\s+['"]${fullImportPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"];`, 'g'),
+      '// Side-effect import removed'
+    );
     
     // Write the modified content back
     fs.writeFileSync(testFilePath, modifiedContent, "utf8");
-    console.log(`[test-runner] Injected mock for "${fullImportPath}" at line ${insertIndex}`);
+    console.log(`[test-runner] ✓ Injected mock for "${fullImportPath}" by replacing import statement with functional mock`);
     
     return { success: true, backupContent: backup };
   } catch (err) {
@@ -843,19 +881,27 @@ async function spawnTestProcess(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let resolved = false;
 
-    // On Windows, use PowerShell for better environment setup and command resolution
-    // On Unix, use the default shell behavior
-    const useShell = process.platform === "win32" ? "powershell.exe" : true;
+    // Use cmd on Windows, sh on Unix for better environment setup
+    const shell = process.platform === "win32" ? true : true;
 
     const child = spawn(command, args, {
       cwd,
-      shell: useShell,
+      shell,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true, // Prevent console window on Windows
     });
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      child.kill("SIGTERM");
+      // Force kill after 1 second if SIGTERM didn't work
+      setTimeout(() => {
+        if (!resolved) {
+          child.kill("SIGKILL");
+        }
+      }, 1000);
     }, timeoutMs);
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -867,19 +913,31 @@ async function spawnTestProcess(
     });
 
     child.on("close", (exitCode) => {
-      clearTimeout(timer);
-      const elapsed = (Date.now() - start) / 1000;
-      resolve({ exitCode, stdout, stderr, timedOut });
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        const elapsed = (Date.now() - start) / 1000;
+        
+        // If timed out, add timeout message to stderr
+        if (timedOut) {
+          stderr = `${stderr}\n[TIMEOUT] Test did not complete within ${timeoutMs}ms`;
+        }
+        
+        resolve({ exitCode: timedOut ? null : exitCode, stdout, stderr, timedOut });
+      }
     });
 
     child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: null,
-        stdout,
-        stderr: `${stderr}\n${error.message}`,
-        timedOut: false,
-      });
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({
+          exitCode: null,
+          stdout,
+          stderr: `${stderr}\n[SPAWN ERROR] ${error.message}`,
+          timedOut: false,
+        });
+      }
     });
   });
 }
@@ -1026,6 +1084,13 @@ async function executeTestFile(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const commandLabel = `(cwd: ${executionCwd}) ${command} ${args.join(" ")}`;
 
+  // For Vitest, add reporter flag to override config-defined reporters
+  // that may not be resolvable in the current environment (e.g., custom reporters)
+  if (resolution.framework === "vitest" && !args.some(arg => arg.includes("--reporter"))) {
+    args.push("--reporter=verbose");
+    console.log(`[test-runner] Added --reporter=verbose to override config reporters`);
+  }
+
   console.log(`[test-runner] Executing: ${commandLabel}`);
 
   // Initial attempt
@@ -1039,6 +1104,10 @@ async function executeTestFile(
     detectImportOrSetupError(result.stdout, result.stderr)
   ) {
     const unresolvedAlias = extractUnresolvedAlias(result.stderr);
+    console.log(
+      `[test-runner] ⚠️ IMPORT ERROR DETECTED. Extracted alias: "${unresolvedAlias}"`
+    );
+    
     if (unresolvedAlias) {
       console.log(
         `[test-runner] Detected unresolved import/alias. Attempting to inject auto-mock...`
