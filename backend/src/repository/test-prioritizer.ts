@@ -1,5 +1,5 @@
 import type { LLMContext } from "./context-builder.js";
-import type { LLMClient } from "./llm-client.js";
+import type { ILLMClient } from "./llm-client.js";
 import {
   TEST_PRIORITIZER_SYSTEM_PROMPT,
   buildTestPrioritizerUserPrompt,
@@ -49,7 +49,7 @@ interface RawLLMResponse {
 
 export async function prioritizeTests(
   context: LLMContext,
-  llmClient: LLMClient
+  llmClient: ILLMClient
 ): Promise<TestPrioritizationResult> {
   // Nothing to rank — skip the LLM call entirely rather than paying
   // for a round trip that can only return an empty list.

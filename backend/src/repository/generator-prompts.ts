@@ -7,111 +7,138 @@ import path from "path";
 
 /**
  * Extract all identifiers that look like function or class names used in the changed code.
- * This helps us determine what needs to be imported in generated tests.
- * 
- * Matches patterns like:
- * - create(...) - function calls
- * - Object.is - static method references
- * - capitalizedIdentifier(...) - function calls
  */
 export function extractUsedSymbols(changedCode: string): string[] {
   const symbols = new Set<string>();
-  
-  // Match identifiers followed by ( or . (function calls, method access)
-  const identifierRegex = /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[\.(]/g;
+
+  const identifierRegex =
+    /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[\.(]/g;
+
   let match: RegExpExecArray | null;
-  
+
   while ((match = identifierRegex.exec(changedCode)) !== null) {
-    const symbol = match[1] || '';
-    // Skip common keywords and React/test utilities
-    if (symbol && !['if', 'for', 'while', 'const', 'let', 'var', 'function', 'return', 'async', 'await'].includes(symbol)) {
+    const symbol = match[1] || "";
+
+    if (
+      symbol &&
+      ![
+        "if",
+        "for",
+        "while",
+        "const",
+        "let",
+        "var",
+        "function",
+        "return",
+        "async",
+        "await",
+      ].includes(symbol)
+    ) {
       symbols.add(symbol);
     }
   }
-  
-  // Also match standalone identifiers that are used as arguments or values
-  // This catches things like: expect(getResponsesFromOldBooking).toBeDefined()
-  const valueRegex = /(?:^|\s|\(|,|=|:|\?)([a-zA-Z_$][a-zA-Z0-9_$]*)(?=\s*(?:\)|,|;|:|\.|\)|$|\n))/gm;
+
+  const valueRegex =
+    /(?:^|\s|\(|,|=|:|\?)([a-zA-Z_$][a-zA-Z0-9_$]*)(?=\s*(?:\)|,|;|:|\.|\)|$|\n))/gm;
+
   while ((match = valueRegex.exec(changedCode)) !== null) {
-    const symbol = match[1] || '';
-    if (symbol && 
-        !['if', 'for', 'while', 'const', 'let', 'var', 'function', 'return', 'async', 'await', 'true', 'false', 'null', 'undefined', 'this', 'new'].includes(symbol) &&
-        symbol.length > 2) {  // Skip very short names
+    const symbol = match[1] || "";
+
+    if (
+      symbol &&
+      ![
+        "if",
+        "for",
+        "while",
+        "const",
+        "let",
+        "var",
+        "function",
+        "return",
+        "async",
+        "await",
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "this",
+        "new",
+      ].includes(symbol) &&
+      symbol.length > 2
+    ) {
       symbols.add(symbol);
     }
   }
-  
+
   return Array.from(symbols);
 }
 
-/**
- * Extract imports from source file and map symbols to their sources.
- * Returns a map of {symbol} -> {import source}.
- * 
- * Examples:
- * - { createWithEqualityFn: 'zustand/traditional' }
- * - { Object: 'builtin' }
- */
-export function extractImportMap(sourceFileContent: string): Record<string, string> {
+// ======================================================
+// IMPORT MAP
+// ======================================================
+
+export function extractImportMap(
+  sourceFileContent: string
+): Record<string, string> {
   const importMap: Record<string, string> = {};
-  
-  // Match various import styles
-  const importRegex = /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["']([^"']+)["']/g;
+
+  const importRegex =
+    /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["']([^"']+)["']/g;
+
   let match: RegExpExecArray | null;
-  
+
   while ((match = importRegex.exec(sourceFileContent)) !== null) {
-    const named = match[1];      // named imports: { foo, bar }
-    const defaultImport = match[2]; // default import: foo
-    const starAs = match[3];       // namespace: * as foo
-    const source = match[4] || ''; // 'path/to/module'
-    
-    if (source) {
-      if (defaultImport) {
-        importMap[defaultImport] = source;
-      }
-      if (starAs) {
-        importMap[starAs] = source;
-      }
-      if (named) {
-        // Split named imports and add each one
-        const names = (named as string).split(',');
-        for (const name of names) {
-          const cleanName = (name.trim().split(' as ')[0] ?? '').trim();
-          if (cleanName) {
-            importMap[cleanName] = source;
-          }
+    const named = match[1];
+    const defaultImport = match[2];
+    const starAs = match[3];
+    const source = match[4] || "";
+
+    if (!source) continue;
+
+    if (defaultImport) {
+      importMap[defaultImport] = source;
+    }
+
+    if (starAs) {
+      importMap[starAs] = source;
+    }
+
+    if (named) {
+      const names = named.split(",");
+
+      for (const name of names) {
+        const cleanName = (
+          name.trim().split(" as ")[0] ?? ""
+        ).trim();
+
+        if (cleanName) {
+          importMap[cleanName] = source;
         }
       }
     }
   }
-  
-  // Add builtins
-  importMap['Object'] = 'builtin';
-  importMap['Array'] = 'builtin';
-  importMap['String'] = 'builtin';
-  importMap['Number'] = 'builtin';
-  importMap['Boolean'] = 'builtin';
-  
+
+  importMap["Object"] = "builtin";
+  importMap["Array"] = "builtin";
+  importMap["String"] = "builtin";
+  importMap["Number"] = "builtin";
+  importMap["Boolean"] = "builtin";
+
   return importMap;
 }
 
 // ======================================================
-// COMPONENT IMPORT EXTRACTION FOR AUTO-MOCKING
+// COMPONENT IMPORT EXTRACTION
 // ======================================================
 
-/**
- * Extract capitalized (component-like) imports from workspace/relative paths.
- * These are what the LLM should stub out so a render test doesn't depend on
- * the full real dependency tree.
- * 
- * Includes:
- * - Relative imports: ./Foo, ../Foo
- * - Scoped packages: @calcom/*, @components/*, etc.
- * - Workspace monorepo imports: Any import that looks like a local path
- */
-export function extractComponentImportsToMock(sourceFileContent: string): string[] {
-  const importRegex = /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["']([^"']+)["']/g;
+export function extractComponentImportsToMock(
+  sourceFileContent: string
+): string[] {
+  const importRegex =
+    /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["']([^"']+)["']/g;
+
   const results = new Set<string>();
+
   let match: RegExpExecArray | null;
 
   while ((match = importRegex.exec(sourceFileContent)) !== null) {
@@ -122,48 +149,62 @@ export function extractComponentImportsToMock(sourceFileContent: string): string
 
     if (!source) continue;
 
-    // Skip external packages (lodash, react, etc.) unless they're workspace packages
-    const isExternalPackage = 
+    const isExternalPackage =
       !source.startsWith(".") &&
       !source.startsWith("@") &&
-      !source.startsWith("@calcom") &&
-      !source.startsWith("@components") &&
       !source.startsWith("app/") &&
       !source.startsWith("packages/");
-    
+
     if (isExternalPackage) continue;
 
-    // For relative imports, always include if there's a capitalized import
     if (source.startsWith(".")) {
-      if (defaultImport && /^[A-Z]/.test(defaultImport)) {
+      if (
+        defaultImport &&
+        /^[A-Z]/.test(defaultImport)
+      ) {
         results.add(source);
       }
+
       if (starAs && /^[A-Z]/.test(starAs)) {
         results.add(source);
       }
+
       if (named) {
-        const names = (named as string).split(",");
+        const names = named.split(",");
+
         for (const name of names) {
-          const n = (name.trim().split(" as ")[0] ?? "").trim();
+          const n = (
+            name.trim().split(" as ")[0] ?? ""
+          ).trim();
+
           if (n && /^[A-Z]/.test(n)) {
             results.add(source);
           }
         }
       }
+
       continue;
     }
 
-    // For scoped packages (@calcom/*, @components/*, etc.) and workspace paths
-    if (defaultImport && /^[A-Z]/.test(defaultImport)) {
+    if (
+      defaultImport &&
+      /^[A-Z]/.test(defaultImport)
+    ) {
       results.add(source);
     }
+
     if (starAs && /^[A-Z]/.test(starAs)) {
       results.add(source);
     }
+
     if (named) {
-      const names = (named as string).split(",");
+      const names = named.split(",");
+
       for (const name of names) {
-        const n = (name.trim().split(" as ")[0] ?? "").trim();
+        const n = (
+          name.trim().split(" as ")[0] ?? ""
+        ).trim();
+
         if (n && /^[A-Z]/.test(n)) {
           results.add(source);
         }
@@ -174,69 +215,77 @@ export function extractComponentImportsToMock(sourceFileContent: string): string
   return Array.from(results);
 }
 
-/**
- * Extract all Prisma imports from the source file with their exact import styles.
- * Returns an array of objects with the full import statement and the export style.
- * 
- * Examples of what we extract:
- * - import { prisma } from "@calcom/prisma" → { statement: "import { prisma } from '@calcom/prisma';", style: 'named', name: 'prisma' }
- * - import prisma from "@calcom/prisma" → { statement: "import prisma from '@calcom/prisma';", style: 'default', name: 'prisma' }
- * - import { PrismaClient } from "@prisma/client" → { statement: "import { PrismaClient } from '@prisma/client';", style: 'named', name: 'PrismaClient' }
- */
-export function extractPrismaImports(sourceFileContent: string): Array<{ statement: string; style: 'default' | 'named'; name: string; source: string }> {
-  const results: Array<{ statement: string; style: 'default' | 'named'; name: string; source: string }> = [];
-  
-  // Match all Prisma-related imports
-  const importRegex = /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["'](@?(?:@calcom\/)?prisma[^"']*|@prisma\/[^"']*)['"]/g;
+// ======================================================
+// PRISMA IMPORT EXTRACTION
+// ======================================================
+
+export function extractPrismaImports(
+  sourceFileContent: string
+): Array<{
+  statement: string;
+  style: "default" | "named";
+  name: string;
+  source: string;
+}> {
+  const results: Array<{
+    statement: string;
+    style: "default" | "named";
+    name: string;
+    source: string;
+  }> = [];
+
+  const importRegex =
+    /import\s+(?:{([^}]+)}|(\w+)|\*\s+as\s+(\w+))\s+from\s+["'](@?(?:@calcom\/)?prisma[^"']*|@prisma\/[^"']*)['"]/g;
+
   let match: RegExpExecArray | null;
-  
+
   while ((match = importRegex.exec(sourceFileContent)) !== null) {
-    const named = match[1];           // { prisma }
-    const defaultImport = match[2];   // prisma
-    const starAs = match[3];          // * as something
-    const source = match[4] || '';    // @calcom/prisma or @prisma/client etc
-    
+    const named = match[1];
+    const defaultImport = match[2];
+    const starAs = match[3];
+    const source = match[4] || "";
+
     if (!source) continue;
-    
-    // Handle default imports
+
     if (defaultImport) {
       results.push({
         statement: `import ${defaultImport} from '${source}';`,
-        style: 'default',
+        style: "default",
         name: defaultImport,
-        source
+        source,
       });
     }
-    
-    // Handle namespace imports
+
     if (starAs) {
       results.push({
         statement: `import * as ${starAs} from '${source}';`,
-        style: 'default',
+        style: "default",
         name: starAs,
-        source
+        source,
       });
     }
-    
-    // Handle named imports
+
     if (named) {
-      // Split by comma and process each name
-      const names = named.split(',').map(n => n.trim());
+      const names = named
+        .split(",")
+        .map((n) => n.trim());
+
       for (const nameClause of names) {
-        // Handle 'as' aliases: { prisma as db }
-        const [importName] = nameClause.split(/\s+as\s+/);
+        const [importName] =
+          nameClause.split(/\s+as\s+/);
+
         if (importName) {
           results.push({
             statement: `import { ${nameClause} } from '${source}';`,
-            style: 'named',
+            style: "named",
             name: importName,
-            source
+            source,
           });
         }
       }
     }
   }
-  
+
   return results;
 }
 
@@ -244,686 +293,863 @@ export function extractPrismaImports(sourceFileContent: string): Array<{ stateme
 // SYSTEM PROMPT
 // ======================================================
 
-export const TEST_GENERATOR_SYSTEM_PROMPT = `You are a senior software engineer generating targeted unit tests for a single changed function or symbol in a codebase.
+export const TEST_GENERATOR_SYSTEM_PROMPT = `
+You are a senior software engineer generating ONE targeted test case for a single changed function or symbol in an existing JavaScript/TypeScript test file.
 
 You will be given:
-- The symbol that changed and the file it lives in
-- The actual changed code (diff or full body)
-- The EXACT import path to use for this symbol (pre-calculated from test file location to source file location)
-- A list of required imports that MUST be included (extracted from the changed code)
-- An existing test file for that area of code, if one exists
-- The test framework in use
-- A list called "Coverage gaps to fill" — behaviors that static analysis has PROVEN are not exercised by any existing test, with the exact diff evidence for each
 
-Your job is narrow and specific: generate exactly ONE test case per entry in "Coverage gaps to fill" — no more, no fewer.
+- The symbol that changed
+- The source file containing the symbol
+- The actual changed code
+- The existing test file
+- The test framework
+- Coverage gaps that static analysis has identified
+- The exact behavior that each test must verify
 
-## CRITICAL: EVERY TEST MUST HAVE EXPLICIT ASSERTIONS
+======================================================
+CRITICAL OUTPUT RULE
+======================================================
 
-**This is the #1 failure point. Tests without assertions will be rejected and never reach the codebase.**
+The generated test will be inserted DIRECTLY into an EXISTING TEST FILE.
 
-Every test you generate MUST contain at least one explicit assertion that verifies the behavior described in the coverage gap.
+Therefore, your output MUST contain ONLY the new test case.
 
-### What counts as a valid assertion:
-- \`expect(result).toBe(expectedValue)\` ✓ Verifies exact value
-- \`expect(result).toEqual({ foo: 'bar' })\` ✓ Verifies object structure
-- \`expect(result).toContain('text')\` ✓ Verifies array/string contains value
-- \`expect(fn).toHaveBeenCalledWith(arg)\` ✓ Verifies function was called with specific args
-- \`expect(value).toBeNull()\` ✓ Verifies null value
-- \`expect(value).toBeTruthy()\` ✓ Verifies truthiness (with a variable, not literal true)
-- \`expect(array).toHaveLength(3)\` ✓ Verifies array length
-- \`assert(condition, message)\` ✓ Node.js assert module (less preferred than expect)
+DO NOT generate:
 
-### What does NOT count as valid:
-- \`expect(true).toBe(true)\` ✗ Tautological - always passes
-- \`expect(false).toBe(false)\` ✗ Tautological - always passes
-- \`expect(result).toBeDefined()\` ✗ Too weak - doesn't verify actual behavior
-- \`expect(result).not.toBeNull()\` ✗ Too weak - only checks existence
-- \`// just rendering a component without checking output\` ✗ No assertion at all
-- \`const value = fn();\` ✗ No assertion, just calling code
+- import statements
+- export statements
+- vi.mock() statements
+- describe() blocks
+- markdown code fences
+- explanations
+- comments outside the test
+- the existing test file
+- existing imports
+- existing helper functions
+- a complete replacement test file
 
-### Required test structure:
-Every test MUST follow this pattern:
+The generated testCode MUST start with:
 
-\`\`\`javascript
-it('verifies the fallback behavior when value is null', () => {
-  // ARRANGE: Set up test data
-  const input = null;
-  const defaultValue = 'expected-default';
-  
-  // ACT: Call the function being tested
-  const result = myFunction(input, defaultValue);
-  
-  // ASSERT: Verify the result matches expected behavior
-  expect(result).toBe('expected-default');
+it(
+
+or:
+
+test(
+
+Example:
+
+it('uses the fallback value', () => {
+  const result = someFunction(null);
+  expect(result).toBe('fallback');
 });
-\`\`\`
 
-EVERY test MUST have:
-1. **ACT section**: A line that calls the function being tested
-2. **ASSERT section**: At least one expect() or assert() that verifies the result
-3. **Meaningful assertion**: The expect() checks the actual behavior, not just that something exists
+======================================================
+ABSOLUTE testCode RULES
+======================================================
 
-CRITICAL: Each coverage gap includes a "**What to test:**" description that tells you EXACTLY what assertion your test should make. This is your specification. The assertion description is pre-generated by static analysis of the code change and tells you:
-- WHEN a condition occurs (the input)
-- WHAT behavior should result (the expected output/side effect)
+The testCode:
 
-Example gap specification:
-- "**What to test:** Assert that: When value is nullish, shouldUseDefault should return the default value"
-- Your test MUST check exactly this: call shouldUseDefault with a nullish value, assert that it returns the default value
+1. MUST start with it( or test(
+2. MUST contain exactly ONE test case
+3. MUST NOT contain import statements
+4. MUST NOT contain export statements
+5. MUST NOT contain vi.mock()
+6. MUST NOT contain describe()
+7. MUST NOT contain markdown fences
+8. MUST NOT reproduce the existing test file
+9. MUST call the actual production symbol
+10. MUST contain at least one meaningful expect() or assert()
+11. MUST test the behavior described by the coverage gap
+12. MUST use only imports, mocks, helpers, and utilities already available in the existing test file
+13. MUST follow the existing test file's style
+14. MUST use real test data
+15. MUST not create fake placeholder behavior
 
-The assertion is non-negotiable. Your test code MUST directly verify the behavior stated in "What to test".
+If the gap cannot be tested using the existing test file setup, SKIP that gap instead of inventing imports, mocks, APIs, or fixtures.
 
-DO NOT deviate from the "What to test" description. This is your contract.
+======================================================
+ASSERTION REQUIREMENT
+======================================================
 
-Hard rules (in priority order):
-1. MATCH THE EXISTING TEST PATTERN EXACTLY: If an existing test file is provided, this is your PRIMARY DIRECTIVE. Copy its exact approach to writing tests. Do not invent new patterns. If existing tests use \`{ findByText } = render(...)\` instead of \`screen.getByText\`, use that exact pattern. If existing tests avoid \`vi.advanceTimersByTimeAsync()\`, do not use it. If existing tests do NOT wrap components in \`StrictMode\`, do NOT add it. Follow the existing file's conventions 100%. The existing test file shows you EXACTLY what is acceptable in this codebase — your job is to match it perfectly, not to improve or deviate.
-- Import path is CRITICAL: Use the EXACT import path provided in "Import path for tests (CRITICAL...)". Do not generate your own import path, do not modify it, do not try to infer a different path based on file names or guesses. The import path has been mathematically calculated from the test file location to the source file location. Any deviation will cause the tests to fail to resolve the import.
-- Required imports are MANDATORY: If the section "Required imports (extracted from the changed code)" is provided, you MUST include ALL of those import statements at the very start of your response, BEFORE ANY it() blocks. These symbols are used in the changed code and the tests will fail if they're not imported. Do not invent or guess imports — only use the ones provided.
-  CRITICAL: Place import statements ONLY at the absolute top of your entire testCode output, not repeated per test. All imports go at the beginning, then all it() calls follow. Example structure:
-  import { createWithEqualityFn } from 'zustand/traditional';
-  
-  it('first test', () => { ... });
-  
-  it('second test', () => { ... });
+Every generated test MUST contain at least one meaningful assertion.
 
-- CRITICAL PROHIBITED PATTERNS (do NOT use these):
-  * Do NOT wrap component tests in \`<StrictMode>...</StrictMode>\` unless the existing test file explicitly does this. StrictMode is rarely used in existing tests; check the template first. If the template does not use StrictMode, do not add it to your generated tests.
-  * Do NOT use \`vi.advanceTimersByTimeAsync()\` unless the existing test file already uses it and shows \`vi.useFakeTimers()\` being called first. If you need to advance timers, ALWAYS call \`vi.useFakeTimers()\` in a \`beforeEach\` or at the start of the test. The pattern MUST be: \`vi.useFakeTimers(); ... vi.advanceTimersByTimeAsync(...);\`
-  * Do NOT use \`screen.getByText(...)\` or \`screen.findByText(...)\` unless the existing test file does. If the existing file destructures \`{ getByText, findByText } = render(...)\` or \`{ findByText } = await screen.findByText(...)\`, follow that pattern exactly. Check what the existing tests use and do NOT mix patterns.
-  * Do NOT invent new assertion patterns. Use \`expect()\` with the same matchers as the existing tests.
-  * CRITICAL: Never import \`screen\` from @testing-library/react unless the existing test file explicitly uses it. Most tests destructure from render() instead. When in doubt, DO NOT import screen.
+VALID:
 
-- Do NOT generate a test for anything not listed in "Coverage gaps to fill", even if the source code suggests other edge cases exist, even if it seems related, even if you think it would improve coverage. Those judgments have already been made upstream by static analysis; your job is execution, not discovery.
-- Every test case's "addressesGap" field must be copied VERBATIM, character-for-character, from the gap's label in the list you were given. Any test whose addressesGap doesn't exactly match a provided gap will be discarded before it ever reaches the codebase.
-- If a gap's condition can't be tested with a small, well-defined test given the information you have, skip that gap entirely rather than inventing a broader or different test to cover it.
-- Match the existing test file's framework, style, imports, and conventions exactly. If no existing test file is given, use idiomatic style for the stated framework.
-- Write complete, runnable test code for each case — not descriptions, not pseudocode, not "// TODO: implement this." Every test MUST:
-  - Make actual assertions against the function or symbol behavior
-  - Use real test data or mocks, not stub placeholders
-  - Test the actual behavior described in the coverage gap
-  - Return a meaningful result that can pass or fail based on the code being tested
-  - NEVER write tests that just do expect(true).toBe(true) or similar no-op assertions
-  
-  CRITICAL: If you cannot write a real test given the information you have (e.g., you don't understand the function's behavior, dependencies are unclear), SKIP that gap entirely rather than generating a stub test. Stub tests that always pass are worse than no tests.
-- Do not invent APIs, imports, or fixtures that aren't implied by the changed code or the existing test file.
-- CRITICAL: All variables used in test code MUST be defined before use. Never reference undefined variables like \`id\`, \`someValue\`, etc. If you need a test value, define it first.
-- CRITICAL: Scope matters — if you define a component inside a test with \`function Counter() { ... }\`, that component is ONLY scoped to that test block. DO NOT reference it from another test. If multiple tests need a component, define it ONCE outside all it() blocks, at the top level (but still inside the test file), OR use a beforeEach hook.
-- CRITICAL: Syntax correctness is essential. Generate valid JavaScript/TypeScript that will parse without errors:
-  - NO double commas: (\`</>,, \` is WRONG, \`</>, \` is CORRECT)
-  - NO trailing commas in function arguments: (\`render(...,)\` is WRONG, \`render(...)\` is CORRECT)
-  - NO missing closing parens/brackets
-  - NO malformed JSX
-  - Every opening paren/bracket must have a matching close
-  - Every comma must be followed by a value or newline, not another comma
-- Mock placement (CRITICAL for vitest): ALL import statements and vi.mock() calls MUST appear at the very top of your entire testCode output, BEFORE any it() blocks. In vitest, vi.mock() must be at top-level module scope to work correctly. The file structure MUST be:
-  1. import statements (for vitest, testing library, your symbol, AND any required imports listed in "Required imports")
-  2. vi.mock() calls (if needed) — CRITICAL: Mock return values MUST have balanced braces and parentheses. Every { must have a }, every ( must have a ). Test this by counting: if you have 3 opening braces, you must have exactly 3 closing braces. Unbalanced mocks will cause esbuild syntax errors.
-  3. it()/test() blocks for all test cases
-  Do NOT put vi.mock() inside it() blocks or nested anywhere — it will fail. Do NOT put vi.mock() inside test cases — they must be at the absolute top of the entire output, BEFORE any it() call.
-  
-  **CRITICAL: Do NOT use JSX syntax in non-JSX files.** If the test file is \`.ts\` or \`.js\` (not \`.tsx\` or \`.jsx\`), you CANNOT use JSX syntax like \`<div>\` in vi.mock() calls. Instead, use plain JavaScript:
-  - WRONG (in a .ts file): \`vi.mock('@components/Button', () => ({ default: () => <div>Button</div> }));\`
-  - RIGHT (in a .ts file): \`vi.mock('@components/Button', () => ({ default: vi.fn(() => null) }));\`
-  
-  For non-JSX test files, all mocks must use pure JavaScript functions or objects, never JSX markup.
-  
-  CRITICAL: Mock return values that are objects MUST be formatted correctly with all braces and parentheses balanced. NEVER leave a closing brace or paren off the end of a mock. ALWAYS count: { } must be equal, ( ) must be equal.
-  
-  **MOCK STRUCTURE RULES — MANDATORY:**
-  
-  Before you generate any mock, verify these rules:
-  1. Every vi.mock() call is a complete statement: \`vi.mock(..., () => ({ ... }));\`
-  2. Mock return functions ALWAYS return an object with balanced braces
-  3. Example CORRECT mock (braces/parens balanced):
-     \`\`\`
-     vi.mock('@package/module', () => ({
-       default: { functionName: vi.fn(() => ({ result: 'value' })) }
-     }));
-     \`\`\`
-     Count: { = 4, } = 4, ( = 3, ) = 3 ✓
-  
-  4. Example WRONG mock (UNBALANCED — DO NOT generate this):
-     \`\`\`
-     vi.mock('@package/module', () => ({
-       default: { functionName: vi.fn(() => ({ result: 'value' })  // MISSING } and );
-     \`\`\`
-     This will cause: SyntaxError: Unexpected end of input
-  
-  5. Before outputting ANY mock, manually verify:
-     - Count opening braces { : _count_
-     - Count closing braces } : _count_ (must equal opening)
-     - Count opening parens ( : _count_
-     - Count closing parens ) : _count_ (must equal opening)
-     - If any count doesn't match, DO NOT include the mock
-  
-  6. For nested mocks with multiple levels:
-     \`\`\`
-     vi.mock('@components/Deep', () => ({
-       Component: vi.fn(() => null),
-       Helper: {
-         method: vi.fn(() => ({}))
-       }
-     }));
-     \`\`\`
-     Always end outer mock with \`}));\` — verify the closing } and ) and ;
-  
-  Your testCode will be inserted into an outer describe() wrapper by the merger. Write imports, mocks, THEN it()/test() calls only.
-- Do NOT wrap your test case(s) in a describe() block. The file merger already provides an outer describe() wrapper — your testCode must contain ONLY it()/test() call(s) (plus any vi.mock() calls and imports at the very top), never its own describe(). Your tests will be nested inside the scaffold's describe() automatically.
+expect(result).toBe(expectedValue);
 
-JSON formatting (CRITICAL):
-Return ONLY valid, strict JSON — no markdown code fences, no comments, no trailing commas.
+expect(result).toEqual(expectedObject);
 
-WRONG:
-{
-  "testCases": [
-    {
-      "name": "test 1",
-      "testCode": "it('test') { expect(true).toBe(true); }",
-    }
-  ]
-}
+expect(result).toContain(expectedValue);
 
-RIGHT:
-{
-  "testCases": [
-    {
-      "name": "test 1",
-      "testCode": "it('test') { expect(true).toBe(true); }"
-    }
-  ]
-}
+expect(mockFunction).toHaveBeenCalledWith(expectedArgument);
 
-Every array and object must have no comma after its final element. No markdown code fences around the JSON.
+expect(array).toHaveLength(3);
 
-Response format (exact shape required):
+INVALID:
+
+expect(true).toBe(true);
+
+expect(false).toBe(false);
+
+expect(result).toBeDefined();
+
+expect(result).not.toBeNull();
+
+A test containing only toBeDefined() or not.toBeNull() is NOT acceptable unless existence itself is explicitly the behavior being tested.
+
+The assertion must verify the actual behavior described in "What to test".
+
+======================================================
+ACTUAL PRODUCTION FUNCTION
+======================================================
+
+The test MUST execute the actual production symbol.
+
+For example:
+
+it('returns the expected value', () => {
+  const result = actualProductionFunction(input);
+  expect(result).toBe(expected);
+});
+
+DO NOT recreate the production function inside the test.
+
+DO NOT write fake logic such as:
+
+const result = true;
+expect(result).toBe(true);
+
+The purpose of the generated test is to exercise the real production implementation.
+
+======================================================
+EXISTING TEST FILE IS THE PRIMARY SOURCE OF TRUTH
+======================================================
+
+If an existing test file is provided, follow its patterns exactly.
+
+Copy its:
+
+- assertion style
+- rendering style
+- async style
+- mocking approach
+- variable naming
+- setup approach
+- cleanup approach
+- query style
+- test naming style
+- framework conventions
+
+Do NOT introduce patterns that are not already used by the existing test file.
+
+For example:
+
+If the existing file uses:
+
+const { getByText } = render(...);
+
+then use that style.
+
+Do NOT introduce:
+
+screen.getByText(...)
+
+unless the existing test file already uses screen.
+
+If the existing test file does not use StrictMode, do NOT add StrictMode.
+
+If the existing test file uses vi.useFakeTimers(), follow that pattern.
+
+Do NOT introduce new timer APIs unless the existing test file already demonstrates them.
+
+======================================================
+NO NEW IMPORTS
+======================================================
+
+This is extremely important.
+
+The existing test file already contains imports.
+
+Therefore NEVER output:
+
+import { useAtomsDevtools } from "...";
+
+NEVER output:
+
+import { render } from "@testing-library/react";
+
+NEVER output:
+
+import { expect } from "vitest";
+
+NEVER output:
+
+import { it } from "vitest";
+
+NEVER output:
+
+import { vi } from "vitest";
+
+All required imports must already exist in the provided test file.
+
+If the required symbol or dependency is not available, SKIP the gap.
+
+======================================================
+NO NEW MOCKS
+======================================================
+
+Do NOT generate vi.mock() calls.
+
+Do NOT create new module mocks.
+
+Use only mocks that already exist in the provided test file.
+
+If the production code requires a dependency that is not already available through the existing test setup, skip the gap.
+
+This prevents invented or invalid imports and mocks.
+
+======================================================
+NO DESCRIBE WRAPPER
+======================================================
+
+Do NOT generate:
+
+describe('...', () => {
+  it('...', () => {
+    ...
+  });
+});
+
+Only generate the individual test:
+
+it('...', () => {
+  ...
+});
+
+The existing file/merger will handle the surrounding structure.
+
+======================================================
+SYNTAX REQUIREMENTS
+======================================================
+
+The generated test MUST be valid JavaScript/TypeScript.
+
+Make sure:
+
+- parentheses are balanced
+- braces are balanced
+- brackets are balanced
+- strings are closed
+- JSX is valid when the existing test file uses JSX
+- all variables are defined
+- no undefined helper functions are introduced
+- no undefined imports are introduced
+- no fake APIs are introduced
+
+======================================================
+COVERAGE GAP REQUIREMENT
+======================================================
+
+Generate exactly ONE test for each supplied coverage gap.
+
+Do NOT invent additional tests.
+
+Do NOT test unrelated behavior.
+
+The coverage gap is the specification.
+
+The test MUST directly exercise the behavior described in:
+
+"What to test"
+
+The test should fail if the changed production behavior is broken.
+
+======================================================
+ADDRESSES GAP
+======================================================
+
+The addressesGap field MUST be copied VERBATIM from the supplied coverage gap label.
+
+Do not rewrite it.
+
+Do not shorten it.
+
+Do not change punctuation.
+
+======================================================
+JSON OUTPUT
+======================================================
+
+Return ONLY valid JSON.
+
+No markdown.
+
+No code fences.
+
+No explanation.
+
+Exact structure:
+
 {
   "testCases": [
     {
       "name": "short descriptive test name",
-      "purpose": "one sentence: what behavior this test verifies and why it matters given the change",
-      "targetSymbol": "the symbol name this test exercises",
-      "addressesGap": "copied verbatim from the gap label this test satisfies",
-      "testCode": "imports and vi.mock() calls (ONE TIME at the start), then all it() test cases. No describe() wrapper. MUST be syntactically valid."
+      "purpose": "one sentence describing the behavior verified",
+      "targetSymbol": "the symbol name",
+      "addressesGap": "copied verbatim from the coverage gap label",
+      "testCode": "it('...', () => { ... });"
     }
   ]
-}`;
+}
+
+The testCode value MUST contain ONLY ONE test block.
+
+The first characters of testCode MUST be:
+
+it(
+
+or:
+
+test(
+
+Never:
+
+import
+
+Never:
+
+describe
+
+Never:
+
+export
+
+Never:
+
+\`\`\`
+
+======================================================
+FINAL SELF-CHECK
+======================================================
+
+Before returning the JSON, verify:
+
+[ ] testCode starts with it( or test(
+[ ] exactly one test case exists
+[ ] no import statements exist
+[ ] no export statements exist
+[ ] no vi.mock() exists
+[ ] no describe() exists
+[ ] no markdown exists
+[ ] actual production symbol is called
+[ ] meaningful expect() or assert() exists
+[ ] assertion verifies the requested behavior
+[ ] all variables are defined
+[ ] syntax is valid
+[ ] addressesGap exactly matches the supplied label
+
+If any requirement cannot be satisfied, skip that gap instead of inventing code.
+`;
 
 // ======================================================
 // USER PROMPT
 // ======================================================
 
-export function buildTestGeneratorUserPrompt(target: TestGenerationTarget): string {
-  // Calculate relative import path from test file to source file
+export function buildTestGeneratorUserPrompt(
+  target: TestGenerationTarget
+): string {
+  // ----------------------------------------------------
+  // Calculate relative production import path
+  // ----------------------------------------------------
+
   const testDir = path.dirname(target.testFile);
   const sourceDir = path.dirname(target.sourceFile);
-  const sourceBaseName = path.basename(target.sourceFile, path.extname(target.sourceFile));
-  
+  const sourceBaseName = path.basename(
+    target.sourceFile,
+    path.extname(target.sourceFile)
+  );
+
   let relativeImportPath: string;
+
   if (testDir === sourceDir) {
-    // Same directory: use ./filename
     relativeImportPath = `./${sourceBaseName}`;
   } else {
-    // Different directory: calculate relative path
-    const relativePath = path.relative(testDir, sourceDir);
-    relativeImportPath = path.join(relativePath, sourceBaseName).replace(/\\/g, "/");
+    const relativePath = path.relative(
+      testDir,
+      sourceDir
+    );
+
+    relativeImportPath = path
+      .join(relativePath, sourceBaseName)
+      .replace(/\\/g, "/");
+
     if (!relativeImportPath.startsWith(".")) {
       relativeImportPath = `./${relativeImportPath}`;
     }
   }
 
-  // Extract component imports that should be auto-mocked
-  const componentsToMock = extractComponentImportsToMock(target.sourceFileContent);
-  
-  // Extract actual Prisma imports from production code
-  const prismaImports = extractPrismaImports(target.sourceFileContent);
-  
-  // Extract symbols used in changed code and their import sources
-  const usedSymbols = extractUsedSymbols(target.changedCode);
-  const importMap = extractImportMap(target.sourceFileContent);
-  
-  // Build list of required imports for the LLM
-  const requiredImports: Array<{ symbol: string; source: string }> = [];
+  // ----------------------------------------------------
+  // These are kept for analysis/context only.
+  // They are NOT instructions for the LLM to generate
+  // imports or mocks.
+  // ----------------------------------------------------
+
+  const componentsToMock =
+    extractComponentImportsToMock(
+      target.sourceFileContent
+    );
+
+  const prismaImports =
+    extractPrismaImports(
+      target.sourceFileContent
+    );
+
+  const usedSymbols =
+    extractUsedSymbols(target.changedCode);
+
+  const importMap =
+    extractImportMap(target.sourceFileContent);
+
+  const requiredImports: Array<{
+    symbol: string;
+    source: string;
+  }> = [];
+
   for (const symbol of usedSymbols) {
-    if (importMap[symbol] && importMap[symbol] !== 'builtin') {
-      requiredImports.push({ symbol, source: importMap[symbol] });
+    if (
+      importMap[symbol] &&
+      importMap[symbol] !== "builtin"
+    ) {
+      requiredImports.push({
+        symbol,
+        source: importMap[symbol],
+      });
     }
   }
 
   const sections: string[] = [];
 
-  sections.push(`## CRITICAL RULE: Always call the actual production function\n\nYour test MUST directly invoke the actual function being tested: ${target.symbol}(...)\n\n❌ DON'T do this:\nconst mockResult = true; // fake logic\nexpect(mockResult).toBe(true);\n\n✓ DO this instead:\nconst result = await ${target.symbol}(...);\nexpect(result).toBeDefined();\n\nThe test must exercise the ACTUAL PRODUCTION CODE of ${target.symbol}, not just mock logic. This is essential for your research.\n`);
+  // ====================================================
+  // MAIN RULE
+  // ====================================================
 
-  sections.push(`## IMPROVED TEST GENERATION RULES
+  sections.push(`
+## CRITICAL OUTPUT RULE
 
-Generate executable unit/integration tests for the actual production function.
+You are generating a test that will be inserted directly into this existing test file:
 
-### Critical Rules:
-1. **Always import and call the exact production function being tested**
-   - Do NOT recreate or copy the production function's internal logic inside the test
-   - Do NOT create placeholder tests
-   
-2. **DO NOT import test framework globals**
-   - NEVER generate: \`import { it } from 'vitest';\`
-   - NEVER generate: \`import { expect } from 'vitest';\`
-   - NEVER generate: \`import { describe } from 'vitest';\`
-   - NEVER generate: \`import { vi } from 'vitest';\`
-   - NEVER generate: \`import { beforeEach, afterEach, beforeAll, afterAll } from 'vitest';\`
-   - NEVER generate: \`import { test } from 'vitest';\`
-   - These are ALWAYS provided by the test file framework and will be automatically available
-   - If you generate these imports, they will be treated as duplicate imports and rejected during merge
-   
-3. **Reject these patterns - they are NOT valid tests:**
-   - \`expect(true).toBe(true)\` - tautological assertions
-   - \`expect(result).toBeDefined()\` as the ONLY assertion - this is too weak
-   - Empty test bodies
-   - Tests with TODO/FIXME comments or "placeholder" labels
-   - Tests that only describe a branch without verifying actual behavior
+${target.testFile}
 
-3. **Use the actual expected return value or observable behavior in assertions**
-   - Inspect the production file to understand what the function actually returns
-   - Generate realistic input data that reaches the intended branch
-   - Generate both positive and negative cases when the production logic supports them
-   - Assert on the actual return value, not just that something exists
+Therefore, generate ONLY ONE test block.
 
-4. **CRITICAL: Preserve import styles from the production file**
-   - If the production code uses a default import, the test mock must provide a default export
-   - If the production code uses a named import, the test mock must provide the named export
-   - Example:
-     - Production: \`import prisma from "@calcom/prisma"\`
-     - Test: \`vi.mock("@calcom/prisma", () => ({ default: { booking: { findUnique: vi.fn() } } }))\`
-   - Example:
-     - Production: \`import { prisma } from "@calcom/prisma"\`
-     - Test: \`vi.mock("@calcom/prisma", () => ({ prisma: { booking: { findUnique: vi.fn() } } }))\`
+DO NOT generate imports.
 
-5. **IMPORTANT: DO NOT mock @calcom/prisma/enums**
-   - NEVER mock the entire "@calcom/prisma/enums" module
-   - NEVER replace Prisma enum exports with custom mocks
-   - If you must mock enums, use partial mocking with importOriginal:
-     \`\`\`typescript
-     vi.mock("@calcom/prisma/enums", async (importOriginal) => {
-       const actual = await importOriginal();
-       return {
-         ...actual,
-         // only override specific enums if absolutely required
-       };
-     });
-     \`\`\`
-   - For most tests, do NOT mock "@calcom/prisma/enums" at all
+DO NOT generate export statements.
 
-6. **Mock external dependencies** (like Prisma) instead of connecting to a real database
-   - Mock only the specific Prisma data operations (e.g., prisma.booking.findUnique)
-   - Provide realistic mock return values that match the expected data shape
-   - Every generated test must execute the target production function
+DO NOT generate vi.mock().
 
-7. **Generate realistic test scenarios**
-   - Instead of: \`it('returns Number(queryDuration)', () => { ... }\`
-   - Do: \`it('returns the configured duration when seat reference is null', async () => { ... }\`
-   - Instead of: \`it('branches on bookingSeatReferenceUid', () => { ... }\`
-   - Do: \`it('uses the seat reference ID when available, otherwise falls back to user ID', async () => { ... }\`
-   - Include realistic setup data that the function actually needs
-   - Test observable function behavior, not individual code branches
+DO NOT generate describe().
 
-### A generated test is valid ONLY if it:
-- Imports the target production function
-- Calls the target production function at least once
-- Contains meaningful assertions (not just \`toBeDefined()\`)
-- Can execute with its dependencies mocked
-- Generates realistic test data, not placeholders
+DO NOT generate markdown.
+
+DO NOT generate the existing test file.
+
+DO NOT generate helper functions outside the test.
+
+Your testCode MUST start with:
+
+it(
+
+or:
+
+test(
+
+Example:
+
+it('verifies the changed behavior', () => {
+  const result = ${target.symbol}(...);
+  expect(result).toEqual(...);
+});
+
+If you cannot write the test using the existing test file's imports and setup, skip the gap instead of inventing imports or mocks.
 `);
 
-  sections.push(`## Changed symbol\n${target.symbol} (in ${target.sourceFile})`);
+  // ====================================================
+  // ACTUAL PRODUCTION FUNCTION
+  // ====================================================
 
-  sections.push(`## Import path for tests (CRITICAL — use EXACTLY this path)\nTest file location: ${target.testFile}\nSource file location: ${target.sourceFile}\n\nWhen writing test imports, use this relative path from the test file:\n\`\`\`typescript\nimport { ${target.symbol} } from '${relativeImportPath}';\n\`\`\`\n\nThis is the ONLY correct import path for this test. Do not generate any other import path, even if it looks correct. Use exactly: ${relativeImportPath}`);
-  
-  // Add section for Prisma imports found in production code
-  if (prismaImports.length > 0) {
-    const prismaSection = prismaImports
-      .map((imp) => `${imp.statement}`)
-      .join('\n');
-    
-    const prismaMockInstructions = prismaImports.map((imp) => {
-      if (imp.style === 'default') {
-        return `- Production: \`${imp.statement}\`\n  Mock MUST use default export: \`vi.mock('${imp.source}', () => ({ default: { /* mock methods */ } }))\``;
-      } else {
-        return `- Production: \`${imp.statement}\`\n  Mock MUST use named export: \`vi.mock('${imp.source}', () => ({ ${imp.name}: { /* mock methods */ } }))\``;
-      }
-    }).join('\n\n');
-    
-    sections.push(
-      `## CRITICAL: Actual Prisma imports from production code (PRESERVE THIS STYLE IN YOUR MOCKS)\n\nThe production code uses these Prisma imports:\n\n\`\`\`typescript\n${prismaSection}\n\`\`\`\n\nIMPORTANT: If your tests need to mock Prisma, you MUST preserve the exact export style:\n\n${prismaMockInstructions}\n\nThe mock's export structure must exactly match how the production code imports it. Do NOT replace module exports with incompatible structures.`
-    );
-  }
-  
-  // Add section for required imports extracted from changed code
-  if (requiredImports.length > 0) {
-    const importsSection = requiredImports
-      .map((imp) => `import { ${imp.symbol} } from '${imp.source}';`)
-      .join('\n');
-    
-    sections.push(
-      `## CRITICAL: Required imports (MUST be included — test will fail without these)\n\nThese symbols are USED IN THE CHANGED CODE and MUST be imported at the very TOP of your generated test code, BEFORE ANY it() blocks.\n\nIf you do not include these imports, the tests will fail with "ReferenceError: X is not defined" errors.\n\n\`\`\`typescript\n${importsSection}\n\`\`\`\n\nPlace these imports FIRST in your testCode output. Nothing else goes before these imports. Then add your it() test blocks.\n\nIf ANY import is missing, the tests WILL FAIL. These are not optional suggestions — they are MANDATORY.`
-    );
+  sections.push(`
+## ACTUAL PRODUCTION SYMBOL
+
+The changed production symbol is:
+
+${target.symbol}
+
+Source file:
+
+${target.sourceFile}
+
+The generated test MUST call the actual production symbol:
+
+${target.symbol}
+
+Do NOT recreate the production logic inside the test.
+
+Do NOT use fake values as the result.
+
+WRONG:
+
+const result = true;
+expect(result).toBe(true);
+
+RIGHT:
+
+const result = ${target.symbol}(...);
+expect(result).toBe(...);
+`);
+
+  // ====================================================
+  // IMPORT PATH CONTEXT
+  // ====================================================
+
+  sections.push(`
+## PRODUCTION SYMBOL LOCATION
+
+Production source file:
+
+${target.sourceFile}
+
+Calculated import path from the existing test file:
+
+${relativeImportPath}
+
+IMPORTANT:
+
+This path is provided only as context so you understand where the production symbol comes from.
+
+DO NOT generate an import statement.
+
+The existing test file already handles imports.
+`);
+
+  // ====================================================
+  // TEST FRAMEWORK
+  // ====================================================
+
+  sections.push(`
+## Test framework
+
+${target.framework}
+
+Use the framework conventions already demonstrated in the existing test file.
+`);
+
+  // ====================================================
+  // CHANGED CODE
+  // ====================================================
+
+  sections.push(`
+## Changed symbol
+
+${target.symbol}
+
+## Changed code
+
+\`\`\`
+${target.changedCode}
+\`\`\`
+`);
+
+  // ====================================================
+  // EXISTING TEST
+  // ====================================================
+
+  if (
+    target.existingTestFile &&
+    target.existingTestCode
+  ) {
+    if (target.existingTestCodeIsTemplate) {
+      sections.push(`
+## Existing test style template
+
+File:
+
+${target.existingTestFile}
+
+\`\`\`
+${target.existingTestCode}
+\`\`\`
+
+Use this ONLY as a style reference.
+
+Follow its:
+
+- imports
+- setup
+- mocks
+- assertions
+- rendering pattern
+- async pattern
+- naming conventions
+- query methods
+
+DO NOT copy its imports into your output.
+
+DO NOT generate imports.
+
+DO NOT generate vi.mock() calls.
+
+Your testCode must contain only ONE new it()/test() block.
+`);
+    } else {
+      sections.push(`
+## Existing test file — PRIMARY REFERENCE
+
+File:
+
+${target.existingTestFile}
+
+\`\`\`
+${target.existingTestCode}
+\`\`\`
+
+This existing file is the primary source of truth.
+
+Match its style exactly.
+
+Follow:
+
+- import usage
+- assertion style
+- rendering style
+- async behavior
+- mock patterns
+- cleanup patterns
+- variable naming
+- query methods
+- test naming
+
+IMPORTANT:
+
+The existing imports are already available.
+
+Do NOT generate imports.
+
+The existing mocks are already available.
+
+Do NOT generate vi.mock().
+
+Do NOT generate describe().
+
+Generate ONLY the new test block.
+`);
+    }
   } else {
-    // Even if no extracted imports, remind about the main symbol import
-    sections.push(
-      `## CRITICAL: Main symbol import (MUST be included at the start)\n\nYour tests MUST import the changed symbol:\n\n\`\`\`typescript\nimport { ${target.symbol} } from '${relativeImportPath}';\n\`\`\`\n\nPlace this import FIRST in your testCode output, before any it() blocks. Without this import, the test will fail.`
-    );
+    sections.push(`
+## Existing tests
+
+No existing test file was provided.
+
+Because no existing test setup is available, be conservative.
+
+Do NOT invent imports.
+
+Do NOT invent mocks.
+
+Do NOT invent helper utilities.
+
+Only generate the test if the required dependencies and APIs are clearly available from the supplied context.
+
+Otherwise skip the gap.
+`);
   }
 
-  if (target.commitMessage) {
-    sections.push(`## Commit message\n${target.commitMessage}`);
-  }
-
-  sections.push(`## Changed code\n\`\`\`\n${target.changedCode}\n\`\`\``);
-
-  sections.push(`## Test framework\n${target.framework}`);
+  // ====================================================
+  // STATIC CONTEXT
+  // ====================================================
 
   if (componentsToMock.length > 0) {
-    // Check if this is a JSX file (.tsx, .jsx)
-    const isJSXFile = /\.(tsx|jsx)$/.test(target.testFile);
-    
-    let mockStatements: string;
-    if (isJSXFile) {
-      // JSX files can use JSX in mocks
-      mockStatements = componentsToMock
-        .map((source) => {
-          return `vi.mock('${source}', () => ({ default: vi.fn(() => null) }));`;
-        })
-        .join("\n");
-    } else {
-      // Non-JSX files (.ts, .js) MUST use functions that return null or objects
-      mockStatements = componentsToMock
-        .map((source) => {
-          return `vi.mock('${source}', () => ({ default: vi.fn(() => null) }));`;
-        })
-        .join("\n");
-    }
+    sections.push(`
+## Dependency information
 
-    const mockDescription = isJSXFile
-      ? `These imports come from the changed code and should be mocked so the test only exercises \`${target.symbol}\`'s own logic, not its full child tree:\n\n\`\`\`typescript\n${mockStatements}\n\`\`\`\n\nPlace all vi.mock() calls at the very top of the test file, BEFORE any describe() or it() blocks. This is critical for vitest to intercept the imports correctly.`
-      : `These imports come from the changed code and should be mocked so the test only exercises \`${target.symbol}\`'s own logic. Since this is a TypeScript file (not JSX), use function mocks:\n\n\`\`\`typescript\n${mockStatements}\n\`\`\`\n\nPlace all vi.mock() calls at the very top of the test file, BEFORE any describe() or it() blocks. This is critical for vitest to intercept the imports correctly.\n\nIMPORTANT: Use ONLY \`vi.fn(() => null)\` or \`vi.fn(() => ({}))\` — DO NOT use JSX syntax in .ts files.`;
+Static analysis detected these component/dependency paths:
 
-    sections.push(
-      `## Components/imports to stub (auto-mock these paths)\n\n${mockDescription}`
-    );
+${componentsToMock.join("\n")}
+
+IMPORTANT:
+
+This is context only.
+
+DO NOT generate vi.mock() statements.
+
+Use only mocks already present in the existing test file.
+`);
   }
 
-  if (target.existingTestFile && target.existingTestCode) {
-    if (target.existingTestCodeIsTemplate) {
-      sections.push(
-        `## Style template (${target.existingTestFile})\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nThis is a reference from an existing test file in the same framework (${target.framework}). Use it as a template for:\n- File structure\n- Import organization\n- Test setup patterns\n- Assertion style\n- Mocking patterns\n\nBut generate the actual test code for "${target.symbol}" from scratch using the import path provided in "Import path for tests (CRITICAL...)" above.`
-      );
-    } else {
-      sections.push(
-        `## Existing test file (${target.existingTestFile}) — CRITICAL REFERENCE\n\`\`\`\n${target.existingTestCode}\n\`\`\`\n\nCRITICAL: Match this file's style, patterns, and conventions EXACTLY. Use the same:\n- Import sources and organization\n- Test setup and cleanup patterns  \n- Assertion style and libraries\n- How to handle async operations, timers, and rendering\n- Variable naming conventions\n- Mock setup patterns\n- Do NOT wrap in StrictMode unless the existing tests do (most tests do NOT)\n- Do NOT use vi.advanceTimersByTimeAsync() unless you see vi.useFakeTimers() called first in the existing tests\n\nQUERY METHOD (CRITICAL): Check this file's test queries:\n- If the file IMPORTS \`screen\` from '@testing-library/react' and USES \`screen.getByText('...')\`, then USE THAT PATTERN\n- If the file DESTRUCTURES from render like \`const { getByText } = render(...)\`, then USE THAT PATTERN\n- If you see method calls like \`getByText\`, \`findByText\`, \`queryByText\` without 'screen.' prefix, those are destructured — do the same\n- DO NOT mix patterns — pick ONE based on what this file uses\n- DO NOT use \`screen.getByText\` if this file doesn't import screen\n\nDo not deviate from the existing test's patterns even if you think an alternative is better. Your generated tests must be indistinguishable in style from the existing tests.\n\nThe import path from "Import path for tests (CRITICAL...)" above applies — do not copy imports from the existing test file if they import the symbol from a different path.`
-      );
-    }
-  } else {
-    sections.push(
-      `## Existing tests\nNone found for this symbol. Write idiomatic ${target.framework} tests from scratch. Use the import path provided in "Import path for tests (CRITICAL...)" above.\n\n**CRITICAL: No stub tests allowed.** Each test must:\n- Call the actual function or symbol being tested\n- Use real test data or setup\n- Make meaningful assertions that verify behavior\n- Return a result that can actually pass or fail\n- NEVER just do expect(true).toBe(true) or similar no-op assertions\n\nIf you cannot understand the function well enough to write a real test (missing documentation, unclear parameters, complex dependencies), SKIP that gap entirely and do NOT generate a placeholder.\n\nGuidelines:\n- Do NOT wrap components in StrictMode unless absolutely necessary for the test logic\n- If using timers (vi.advanceTimersByTimeAsync), MUST call vi.useFakeTimers() first\n- Use screen.getByText/findByText sparingly; prefer specific queries like getByTestId\n- If you use utility functions like \`sleep()\`, they MUST be either defined in the test OR imported from './test-utils'. Do NOT use undefined functions.\n- Keep test setup simple and focused on the changed behavior\n- For file system operations, use mocks like \`vi.mock('node:fs')\` if needed\n- For functions that read files or directories, provide mock data or use test fixtures`
-    );
+  if (prismaImports.length > 0) {
+    sections.push(`
+## Prisma information
+
+The production source contains these Prisma imports:
+
+${prismaImports
+  .map((imp) => imp.statement)
+  .join("\n")}
+
+IMPORTANT:
+
+This is context only.
+
+DO NOT generate Prisma imports.
+
+DO NOT generate new Prisma mocks.
+
+Use only Prisma mocks already present in the existing test file.
+`);
   }
 
-  sections.push(
-    `## Coverage gaps to fill (generate EXACTLY one test per gap, no more, no fewer)\n` +
-      target.coverageGaps
-        .map(
-          (g, i) =>
-            `${i + 1}. **What to test:** ${g.condition}\n   Code change: \`${g.evidence}\`\n   addressesGap label (copy verbatim): "${g.label}"`
-        )
-        .join("\n\n")
-  );
+  if (requiredImports.length > 0) {
+    sections.push(`
+## Dependencies detected in changed code
 
-  // Add pattern examples section emphasizing what NOT to do
-  sections.push(`## Critical Pattern Rules (DO NOT deviate)
+Static analysis detected these dependencies:
 
-**CRITICAL: Every test MUST have explicit assertions. Tests without expect() or assert() will be rejected.**
+${requiredImports
+  .map(
+    (imp) =>
+      `- ${imp.symbol} from ${imp.source}`
+  )
+  .join("\n")}
 
-WRONG (NO ASSERTIONS - WILL BE REJECTED):
-\`\`\`typescript
-// Just rendering without checking anything
-it('renders the component', () => {
-  render(<MyComponent data={null} />);
-  // No assertion! This test does nothing.
+IMPORTANT:
+
+These are provided as context only.
+
+DO NOT generate imports for them.
+
+DO NOT invent imports.
+
+Only use them if they are already available in the existing test file.
+`);
+  }
+
+  // ====================================================
+  // COMMIT MESSAGE
+  // ====================================================
+
+  if (target.commitMessage) {
+    sections.push(`
+## Commit message
+
+${target.commitMessage}
+`);
+  }
+
+  // ====================================================
+  // COVERAGE GAPS
+  // ====================================================
+
+  sections.push(`
+## Coverage gaps to fill
+
+Generate EXACTLY ONE test for each coverage gap.
+
+Do NOT generate additional tests.
+
+${target.coverageGaps
+  .map(
+    (g, i) => `
+${i + 1}. **What to test:** ${g.condition}
+
+Code change:
+
+${g.evidence}
+
+addressesGap label:
+
+"${g.label}"
+`
+  )
+  .join("\n")}
+`);
+
+  // ====================================================
+  // ASSERTION RULES
+  // ====================================================
+
+  sections.push(`
+## Assertion requirements
+
+Every generated test MUST contain a meaningful assertion.
+
+The assertion must verify the behavior described in the coverage gap.
+
+WRONG:
+
+it('calls the function', () => {
+  ${target.symbol}(...);
 });
 
-// Just calling a function without verifying output
-it('calls the API', async () => {
-  await fetchUserData(userId);
-  // No assertion! We never check what fetchUserData returned.
+There is no assertion.
+
+WRONG:
+
+it('works', () => {
+  const result = ${target.symbol}(...);
+  expect(result).toBeDefined();
 });
 
-// Tautological assertions (always pass)
-it('test passes', () => {
-  expect(true).toBe(true);  // This is meaningless
-});
-\`\`\`
+This is too weak unless existence itself is the behavior.
 
-RIGHT (EXPLICIT ASSERTIONS - WILL BE ACCEPTED):
-\`\`\`typescript
-// Rendering AND verifying behavior
-it('renders the component with fallback when data is null', () => {
-  render(<MyComponent data={null} />);
-  expect(screen.getByText('No data')).toBeInTheDocument();
+WRONG:
+
+it('works', () => {
+  expect(true).toBe(true);
 });
 
-// Calling a function AND verifying the result
-it('returns user data when API succeeds', async () => {
-  const userId = '123';
-  const result = await fetchUserData(userId);
-  expect(result).toEqual({ id: '123', name: 'John' });
-});
+This is tautological.
 
-// Meaningful assertions
+RIGHT:
+
 it('uses the fallback value when input is null', () => {
-  const result = processValue(null, 'default');
-  expect(result).toBe('default');  // Verifies actual behavior
+  const result = ${target.symbol}(...);
+  expect(result).toBe('expected-value');
 });
-\`\`\`
 
----
+The test must fail if the production behavior is broken.
+`);
 
-**Do NOT use these patterns — they will cause test failures:**
+  // ====================================================
+  // FINAL OUTPUT RULE
+  // ====================================================
 
-WRONG:
-\`\`\`typescript
-// Using undefined utility functions
-it('test', async () => {
-  await sleep(100);  // ERROR: sleep is not defined unless imported
-});
-\`\`\`
+  sections.push(`
+## FINAL TASK
 
-RIGHT:
-\`\`\`typescript
-// Import utility functions if they're needed
-import { sleep } from './test-utils';
+For "${target.symbol}", generate exactly ONE test case for each supplied coverage gap.
 
-it('test', async () => {
-  await sleep(100);  // Works — sleep is imported
-});
-\`\`\`
+Your generated test will be inserted directly into the existing test file.
 
----
+Therefore:
 
-WRONG:
-\`\`\`typescript
-// Using StrictMode without existing test precedent
-import { StrictMode } from 'react';
-it('test', () => {
-  render(<StrictMode><MyComponent /></StrictMode>);
-});
-\`\`\`
+- ONLY generate the test case.
+- Start testCode with it( or test(.
+- Do NOT generate imports.
+- Do NOT generate exports.
+- Do NOT generate vi.mock().
+- Do NOT generate describe().
+- Do NOT generate markdown.
+- Do NOT reproduce the existing test file.
+- Do NOT invent dependencies.
+- Do NOT invent APIs.
+- Use existing imports and existing mocks.
+- Call the actual production symbol.
+- Include a meaningful assertion.
+- Verify the exact behavior described by the coverage gap.
+- Copy addressesGap exactly.
 
-RIGHT (if StrictMode is not in existing tests):
-\`\`\`typescript
-it('test', () => {
-  render(<MyComponent />);
-});
-\`\`\`
-
----
-
-WRONG:
-\`\`\`typescript
-// Using screen.getByText without existing test precedent
-import { screen, render } from '@testing-library/react';
-it('test', () => {
-  render(<MyComponent />);
-  const el = screen.getByText('text');
-});
-\`\`\`
-
-RIGHT (if existing tests destructure from render):
-\`\`\`typescript
-import { render } from '@testing-library/react';
-it('test', () => {
-  const { getByText } = render(<MyComponent />);
-  const el = getByText('text');
-});
-\`\`\`
-
----
-
-WRONG:
-\`\`\`typescript
-// Defining component inside one test and trying to use it in another
-it('test 1', () => {
-  function Counter() { return <div>count</div>; }
-  render(<Counter />);
-});
-it('test 2', () => {
-  render(<Counter />);  // ERROR: Counter is not defined here!
-});
-\`\`\`
-
-RIGHT:
-\`\`\`typescript
-// Define component at the top level, before all it() blocks
-function Counter() { return <div>count</div>; }
-
-it('test 1', () => {
-  render(<Counter />);
-});
-it('test 2', () => {
-  render(<Counter />);  // Works — Counter is in scope
-});
-\`\`\`
-
----
-
-**CRITICAL: Mock syntax errors (will break the test file):**
-
-WRONG (UNBALANCED BRACES):
-\`\`\`typescript
-// Missing closing brace and paren — esbuild will fail to parse
-vi.mock('@calcom/api', () => ({
-  useQuery: vi.fn(() => ({ data: undefined })
-}));
-// ERROR: SyntaxError: Unexpected token, expected ";"
-\`\`\`
-
-To count: Count { and }: opening has 2, closing has 1 — NOT BALANCED! ✗
-
-RIGHT (BALANCED BRACES):
-\`\`\`typescript
-// All braces and parens are balanced
-vi.mock('@calcom/api', () => ({
-  useQuery: vi.fn(() => ({ data: undefined }))
-}));
-\`\`\`
-
-To count: Count { = 2, count } = 2 ✓. Count ( = 2, count ) = 2 ✓. ALL BALANCED!
-
----
-
-WRONG (COMPLEX MOCK WITH UNBALANCED):
-\`\`\`typescript
-vi.mock('@components/Deep', () => ({
-  Component: vi.fn(() => null),
-  Helper: {
-    method: vi.fn(() => ({}))  // MISSING closing paren and brace
-}));
-\`\`\`
-
-RIGHT (COMPLEX MOCK BALANCED):
-\`\`\`typescript
-vi.mock('@components/Deep', () => ({
-  Component: vi.fn(() => null),
-  Helper: {
-    method: vi.fn(() => ({}))
-  }
-}));
-\`\`\`
-
----
-
-**BEFORE OUTPUTTING ANY MOCK: Manually verify brace/paren balance:**
-1. For each vi.mock() call you generate, count opening and closing characters
-2. { must equal }
-3. ( must equal )
-4. If any mismatch, DO NOT output that mock — skip it entirely
-5. Unbalanced mocks will cause the entire test file to fail to parse
-
-**Structure reminder:** All imports, vi.mock() calls, and helper function/component definitions MUST come before any it() blocks.
-
-**Always check the existing test file first and copy that pattern exactly.** Your generated tests must blend seamlessly with the existing code.`
-  );
-
-
-  if (target.notes && target.notes.length > 0) {
-    sections.push(`## Static analysis notes\n${target.notes.map((n) => `- ${n}`).join("\n")}`);
-  }
-
-  sections.push(
-    `## ⚠️ ASSERTION REQUIREMENT — CRITICAL
-
-**NO TEST WILL BE ACCEPTED WITHOUT EXPLICIT ASSERTIONS**
-
-Every single test you generate MUST contain at least one \`expect()\` or \`assert()\` call that verifies actual behavior.
-
-Tests that lack assertions will be AUTOMATICALLY REJECTED before they ever reach the codebase.
-
-### Example: How to verify the "What to test" requirement:
-
-Gap description (from above):
-- "**What to test:** Assert that: When value is nullish, shouldUseDefault returns the default value"
-
-WRONG TEST (will be REJECTED — no assertion):
-\`\`\`typescript
-it('should use default when value is nullish', () => {
-  const result = shouldUseDefault(null, 'default');
-  // Missing assertion — we never checked what result actually is!
-});
-\`\`\`
-
-RIGHT TEST (will be ACCEPTED — has meaningful assertion):
-\`\`\`typescript
-it('should use default when value is nullish', () => {
-  const result = shouldUseDefault(null, 'default');
-  expect(result).toBe('default');  // ← This is the assertion
-});
-\`\`\`
-
-### Assertion checklist:
-- [ ] Does the test have at least one \`expect(...).to...()\` or \`assert(...)\` call?
-- [ ] Does the assertion verify the behavior described in "What to test"?
-- [ ] Is the assertion checking actual behavior, not just existence (e.g., not ONLY \`toBeDefined()\`)?
-- [ ] Would the test FAIL if the production code was broken?
-
-If you cannot answer "yes" to all four, DO NOT generate that test — skip the gap entirely.
-
-### Why assertions matter:
-- Without assertions, the test never actually verifies the code works
-- A test that just calls a function (no assertion) is not a test — it's just code that runs
-- The production code could be broken and the test would still pass
-- These "empty" tests provide zero confidence that the code works correctly
-
-Your job is to generate REAL tests that verify behavior. Tests without assertions are not real tests and will be rejected.`
-  );
-
-  sections.push(
-    `## Task\nFor "${target.symbol}", generate exactly one test case per entry in "Coverage gaps to fill" above. CRITICAL: Use the import path provided in "Import path for tests (CRITICAL...)" — this is non-negotiable and has been mathematically calculated. ${componentsToMock.length > 0 ? `Also include vi.mock() statements for the components listed in "Components to stub" at the top of the file, before any describe() blocks.` : ""} \n\nIMPORTANT: DO NOT GENERATE IMPORTS FOR TEST FRAMEWORK GLOBALS. Never import it, expect, describe, vi, beforeEach, afterEach, beforeAll, afterAll, or test from vitest. These are always available in the test file. If you import them, they will be detected as duplicates and rejected during merge.\n\nReturn only the JSON object described in the system prompt.`
-  );
+Return ONLY the JSON object described in the system prompt.
+`);
 
   return sections.join("\n\n");
 }

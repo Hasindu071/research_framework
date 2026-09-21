@@ -1,5 +1,4 @@
-import * as ts from "typescript";
-import { Project, SyntaxKind } from "ts-morph";
+import { Project } from "ts-morph";
 import path from "path";
 
 /**
@@ -179,139 +178,246 @@ export function findSymbolRange(
 
 /**
  * Given a unified diff and a symbol's line range, extract only the diff
- * lines (hunks) that overlap with that symbol's source range.
+ * hunks that overlap with that symbol in the NEW version of the file.
  *
- * Returns a new unified diff containing only those hunks.
+ * IMPORTANT:
+ * - Only the exact target file is selected.
+ * - Only hunks overlapping the symbol's line range are returned.
+ * - Unrelated files/hunks are never included.
  */
 export function extractSymbolDiff(
   fullDiff: string,
   targetFile: string,
   symbolRange: SymbolRange
 ): string {
-  const fileSectionPattern = new RegExp(
-    `^diff --git a/.+? b/${escapeRegex(targetFile)}$.*?(?=^diff --git |$)`,
-    "ms"
+  const normalizedTarget = normalizePath(targetFile);
+
+  console.log(
+    `[SymbolDiffExtractor] Extracting diff for "${normalizedTarget}" ` +
+      `within lines ${symbolRange.startLine}–${symbolRange.endLine}`
   );
 
-  const fileMatch = fileSectionPattern.exec(fullDiff);
+  // ============================================================
+  // 1. Split the complete diff into individual file sections
+  // ============================================================
 
-  if (!fileMatch) {
+  const diffLines = fullDiff.split(/\r?\n/);
+  let targetSection: string[] = [];
+  let insideTargetFile = false;
+
+  for (const line of diffLines) {
+    if (!line) continue;
+
+    // A new file section starts here
+    if (line.startsWith("diff --git ")) {
+      // If we were already inside the target file, stop.
+      if (insideTargetFile) {
+        break;
+      }
+
+      const match = line.match(/^diff --git a\/(.+?) b\/(.+?)$/);
+      if (!match || !match[1] || !match[2]) {
+        continue;
+      }
+
+      const oldPath = normalizePath(match[1]);
+      const newPath = normalizePath(match[2]);
+
+      // Exact target-file match.
+      if (oldPath === normalizedTarget || newPath === normalizedTarget) {
+        insideTargetFile = true;
+        targetSection.push(line);
+      }
+
+      continue;
+    }
+
+    if (insideTargetFile) {
+      targetSection.push(line);
+    }
+  }
+
+  // ============================================================
+  // 2. Ensure the target file was actually found
+  // ============================================================
+
+  if (!insideTargetFile || targetSection.length === 0) {
     console.warn(
-      `[SymbolDiffExtractor] No diff section found for "${targetFile}"`
+      `[SymbolDiffExtractor] No diff section found for "${normalizedTarget}"`
     );
 
     return "";
   }
 
-  const fileDiff = fileMatch[0];
-  const lines = fileDiff.split("\n");
-  const relevantLines: string[] = [];
+  console.log(
+    `[SymbolDiffExtractor] Found exact diff section for "${normalizedTarget}" ` +
+      `(${targetSection.length} lines)`
+  );
 
-  let currentHunkStart = 0;
-  let currentHunkLines: string[] = [];
-  let newFileLineNumber = 0;
-  let inRelevantHunk = false;
+  // ============================================================
+  // 3. Process only the hunks belonging to the target file
+  // ============================================================
 
-  for (const line of lines) {
-    // ------------------------------------------------------------
-    // Git metadata
-    // ------------------------------------------------------------
+  const relevantHunks: string[] = [];
+  let currentHunk: string[] = [];
+  let currentHunkIsRelevant = false;
 
-    if (
-      line.startsWith("diff --git") ||
-      line.startsWith("index ") ||
-      line.startsWith("---") ||
-      line.startsWith("+++") ||
-      line.startsWith("new file") ||
-      line.startsWith("deleted file")
-    ) {
-      if (relevantLines.length === 0 || inRelevantHunk) {
-        relevantLines.push(line);
-      }
-
-      continue;
-    }
-
-    // ------------------------------------------------------------
+  for (const line of targetSection) {
+    // ------
     // Hunk header
-    // ------------------------------------------------------------
-
+    // ------
     if (line.startsWith("@@")) {
-      const match = line.match(
-        /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/
-      );
-
-      if (match?.[1]) {
-        currentHunkStart = parseInt(match[1]);
-        newFileLineNumber = currentHunkStart;
+      // Save previous hunk if it was relevant.
+      if (currentHunkIsRelevant && currentHunk.length > 0) {
+        relevantHunks.push(currentHunk.join("\n"));
       }
 
-      inRelevantHunk = checkHunkOverlap(
-        line,
+      currentHunk = [];
+      currentHunkIsRelevant = false;
+
+      const hunkRange = parseNewFileHunkRange(line);
+
+      if (!hunkRange) {
+        console.warn(
+          `[SymbolDiffExtractor] Could not parse hunk header: ${line}`
+        );
+        continue;
+      }
+
+      const overlaps = rangesOverlap(
+        hunkRange.startLine,
+        hunkRange.endLine,
         symbolRange.startLine,
         symbolRange.endLine
       );
 
-      if (inRelevantHunk) {
-        relevantLines.push(line);
-      }
+      console.log(
+        `[SymbolDiffExtractor] Hunk ${hunkRange.startLine}–${hunkRange.endLine} ` +
+          `→ ${overlaps ? "RELEVANT" : "ignored"}`
+      );
 
-      currentHunkLines = [];
+      if (overlaps) {
+        currentHunkIsRelevant = true;
+        currentHunk.push(line);
+      }
 
       continue;
     }
 
-    // ------------------------------------------------------------
-    // Diff content
-    // ------------------------------------------------------------
+    // ------
+    // File metadata (skip)
+    // ------
+    if (
+      line.startsWith("diff --git ") ||
+      line.startsWith("index ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("+++ ") ||
+      line.startsWith("new file") ||
+      line.startsWith("deleted file") ||
+      line.startsWith("similarity index") ||
+      line.startsWith("rename from") ||
+      line.startsWith("rename to")
+    ) {
+      continue;
+    }
 
-    if (inRelevantHunk) {
-      relevantLines.push(line);
-
-      if (line.startsWith("+")) {
-        newFileLineNumber++;
-      } else if (line.startsWith(" ")) {
-        newFileLineNumber++;
-      }
+    // ------
+    // Hunk content
+    // ------
+    if (currentHunkIsRelevant) {
+      currentHunk.push(line);
     }
   }
 
-  return relevantLines.join("\n");
+  // Save final hunk.
+  if (currentHunkIsRelevant && currentHunk.length > 0) {
+    relevantHunks.push(currentHunk.join("\n"));
+  }
+
+  // ============================================================
+  // 4. Nothing relevant
+  // ============================================================
+
+  if (relevantHunks.length === 0) {
+    console.warn(
+      `[SymbolDiffExtractor] No relevant hunks found for symbol ` +
+        `"${symbolRange.name}" (${symbolRange.startLine}–${symbolRange.endLine})`
+    );
+
+    return "";
+  }
+
+  // ============================================================
+  // 5. Build the final symbol-specific diff
+  // ============================================================
+
+  const header = targetSection
+    .filter(
+      (line) =>
+        line.startsWith("diff --git ") ||
+        line.startsWith("index ") ||
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ")
+    )
+    .join("\n");
+
+  const result = [header, ...relevantHunks].filter(Boolean).join("\n");
+
+  console.log(
+    `[SymbolDiffExtractor] Final symbol diff for "${symbolRange.name}": ` +
+      `${result.length} chars, ${relevantHunks.length} relevant hunk(s)`
+  );
+
+  return result;
 }
 
 /**
- * Check whether a hunk overlaps with the target symbol range.
+ * Parse the NEW-file range from a unified diff hunk header.
  *
- * Hunk example:
+ * Example:
+ *   @@ -20,5 +20,8 @@
  *
- * @@ -20,5 +20,8 @@
- *
- * The +20,8 part represents the NEW file range.
+ * means the changed hunk occupies lines 20–27
+ * in the NEW version of the file.
  */
-function checkHunkOverlap(
-  hunkHeader: string,
-  symbolStart: number,
-  symbolEnd: number
-): boolean {
-  const match = hunkHeader.match(
-    /@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/
-  );
+function parseNewFileHunkRange(hunkHeader: string): {
+  startLine: number;
+  endLine: number;
+} | null {
+  const match = hunkHeader.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
 
   if (!match || !match[1]) {
-    return false;
+    return null;
   }
 
-  const hunkStart = parseInt(match[1]);
-  const hunkCount = parseInt(match[2] ?? "1");
+  const startLine = parseInt(match[1], 10);
 
-  const hunkEnd = hunkStart + hunkCount - 1;
+  // If count is omitted, Git means one line.
+  const count = match[2] ? parseInt(match[2], 10) : 1;
 
-  return (
-    hunkStart <= symbolEnd &&
-    symbolStart <= hunkEnd
-  );
+  const endLine = count === 0 ? startLine : startLine + count - 1;
+
+  return {
+    startLine,
+    endLine,
+  };
 }
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Check whether two inclusive line ranges overlap.
+ */
+function rangesOverlap(
+  firstStart: number,
+  firstEnd: number,
+  secondStart: number,
+  secondEnd: number
+): boolean {
+  return firstStart <= secondEnd && secondStart <= firstEnd;
+}
+
+/**
+ * Normalize Windows/Linux path separators.
+ */
+function normalizePath(filePath: string): string {
+  return filePath.replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
 }

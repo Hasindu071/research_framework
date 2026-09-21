@@ -1,5 +1,5 @@
 import type { LLMContext } from "./context-builder.js";
-import type { LLMClient } from "./llm-client.js";
+import type { ILLMClient } from "./llm-client.js";
 import type { PrioritizedTest } from "./test-prioritizer.js";
 import type { TestMatch } from "./test-analyzer.js";
 import { resolveTargetTestFile } from "./test-file-writer.js";
@@ -324,7 +324,7 @@ Return the fixed test code:
 export async function buildGenerationTargets(
   prioritized: PrioritizedTest[],
   context: LLMContext,
-  llmClient: LLMClient,
+  llmClient: ILLMClient,
   rawDiff: string,
   repositoryRoot: string,
   options: { topN?: number } = {}
@@ -652,7 +652,7 @@ function checkSymbolExported(sourceContent: string, symbolName: string): boolean
 
 export async function generateTests(
   targets: TestGenerationTarget[],
-  llmClient: LLMClient
+  llmClient: ILLMClient
 ): Promise<TestGenerationBatchResult> {
   if (targets.length === 0) {
     console.log("[Test-Generator] No generation targets, skipping LLM calls");
@@ -688,7 +688,7 @@ export async function generateTests(
 
 async function generateTestsForTarget(
   target: TestGenerationTarget,
-  llmClient: LLMClient
+  llmClient: ILLMClient
 ): Promise<TestGenerationResult> {
   const userPrompt = buildTestGeneratorUserPrompt(target);
   console.log(

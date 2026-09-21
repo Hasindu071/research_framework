@@ -3,14 +3,11 @@ import express from "express";
 import path from "path";
 import { analyzeCommit } from "./repository/analyzer.js";
 import { buildLLMContext } from "./repository/context-builder.js";
-import { analyzeDependencyChanges } from "./repository/dependencyAnalyzer.js";
-import { LLMClient } from "./repository/llm-client.js";
+import { createLLMClient } from "./repository/llm-client.js";
 import { getPrompts } from "./repository/prompts.js";
-import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./repository/test-runner.js";
-import { prioritizeTests } from "./repository/test-prioritizer.js";
-import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
+import { runPrioritizedTests, enrichTestInputsWithContext } from "./repository/test-runner.js";
 import { analyzeAndTestCommit } from "./repository/commit-pipeline.js";
-import { connectMongoDB, disconnectMongoDB, saveAnalysisResult, getAnalysisResults, listRepositories } from "./repository/mongodb-service.js";
+import { connectMongoDB, saveAnalysisResult, getAnalysisResults, listRepositories } from "./repository/mongodb-service.js";
 
 const app = express();
 
@@ -72,7 +69,7 @@ app.post("/api/analyze-commit", async (req, res) => {
     let llmError = null;
 
     try {
-      const llmClient = new LLMClient();
+      const llmClient = createLLMClient();
       const prompts = getPrompts();
 
       console.log("[Step 3] LLM client created successfully");
@@ -492,7 +489,7 @@ app.post("/api/analyze-and-run", async (req, res) => {
     let llmError = null;
 
     try {
-      const llmClient = new LLMClient();
+      const llmClient = createLLMClient();
       const prompts = getPrompts();
 
       console.log("[Step 3] LLM client created successfully");

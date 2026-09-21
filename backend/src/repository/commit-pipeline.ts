@@ -2,11 +2,11 @@ import { simpleGit } from "simple-git";
 import { analyzeCommit } from "./analyzer.js";
 import { buildLLMContext } from "./context-builder.js";
 import { analyzeDependencyChanges } from "./dependencyAnalyzer.js";
-import { LLMClient } from "./llm-client.js";
+import { createLLMClient } from "./llm-client.js";
 import { prioritizeTests } from "./test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./test-generator.js";
 import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./test-runner.js";
-import { convertCommitResultToDatasetRow, type ResearchDatasetRow } from "./dataset-generator.js";
+import { convertCommitResultToDatasetRow } from "./dataset-generator.js";
 
 // ======================================================
 // TYPES
@@ -268,7 +268,7 @@ export async function analyzeAndTestCommit(
 
     console.log("[Pipeline] Step 2/6: Building LLM context and prioritizing tests...");
     const llmContext = buildLLMContext(analysis, repositoryPath);
-    const llmClient = new LLMClient();
+    const llmClient = createLLMClient();
 
     let prioritizationResult: any;
     const prioritizedStartTime = Date.now();
