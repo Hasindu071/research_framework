@@ -518,6 +518,12 @@ function detectTestCommandsForWorkspace(ws: WorkspacePackageInfo): DetectedTestC
 // TEST FILE DISCOVERY
 // ======================================================
 
+// STRICT pattern: only match files ending in .test.ts, .test.tsx, .spec.ts, .spec.tsx, etc.
+// This MUST NOT match regular utility files like utils.ts, helpers.ts, etc.
+// The pattern ensures:
+// 1. Must have literal ".test." or ".spec." before the file extension
+// 2. Extension must be one of: ts, tsx, js, jsx, mjs, cjs
+// 3. No false positives on utils.ts, helpers.ts, or other non-test files
 const TEST_FILE_NAME_PATTERN = /\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$/;
 const EXCLUDED_DIR_NAMES = new Set([
   "node_modules",

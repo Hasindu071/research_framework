@@ -1,7 +1,6 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import fs from "fs";
 import { analyzeCommit } from "./repository/analyzer.js";
 import { buildLLMContext } from "./repository/context-builder.js";
 import { analyzeDependencyChanges } from "./repository/dependencyAnalyzer.js";
@@ -10,6 +9,7 @@ import { getPrompts } from "./repository/prompts.js";
 import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./repository/test-runner.js";
 import { prioritizeTests } from "./repository/test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./repository/test-generator.js";
+import { analyzeAndTestCommit } from "./repository/commit-pipeline.js";
 import { connectMongoDB, disconnectMongoDB, saveAnalysisResult, getAnalysisResults, listRepositories } from "./repository/mongodb-service.js";
 
 const app = express();
@@ -28,7 +28,7 @@ async function initializeMongoDB() {
       mongoConnected = true;
       console.log("✓ MongoDB initialized successfully");
     } catch (error) {
-      console.error("❌ Failed to initialize MongoDB:", error);
+      console.error("⚠ Failed to initialize MongoDB:", error);
       mongoInitialized = true;
       mongoConnected = false;
       // Don't crash the server - continue without MongoDB
@@ -159,6 +159,7 @@ app.post("/api/analyze-commit", async (req, res) => {
   }
 });
 
+
 app.post("/api/analyze-prioritize-generate", async (req, res) => {
   try {
     await initializeMongoDB();
@@ -177,504 +178,22 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       });
     }
 
-    // ========================================
-    // Step 1: Analyze commit
-    // ========================================
-    console.log("[Step 1/5] Analyzing commit...");
-    const analysis = await analyzeCommit(repositoryPath, commitHash);
-    console.log(`[Step 1/5] ✓ Found ${analysis.summary.filesChanged} changed files`);
+    console.log("======================================");
+    console.log(`Starting analysis for commit: ${commitHash}`);
+    console.log("======================================");
 
-    // ========================================
-    // Step 1.5: Analyze dependency changes
-    // ========================================
-    console.log("[Step 1.5/5] Analyzing dependency changes...");
-    const dependencyChanges = analyzeDependencyChanges(analysis.rawDiff);
-    console.log(`[Step 1.5/5] ✓ Found ${dependencyChanges.length} dependency change(s)`);
+    // Use the pipeline as the single source of truth
+    const finalResponse = await analyzeAndTestCommit(repositoryPath, commitHash);
 
-    // ========================================
-    // Step 2: Build LLM context
-    // ========================================
-    console.log("[Step 2/5] Building LLM context...");
-    const llmContext = buildLLMContext(analysis, repositoryPath);
-    console.log(`[Step 2/5] ✓ Context built with ${llmContext.candidateTests.length} candidate tests`);
-
-    const llmClient = new LLMClient();
-
-    // ========================================
-    // Step 3: Prioritize tests
-    // ========================================
-    console.log("[Step 3/5] Prioritizing candidate tests with LLM...");
-    let prioritizationResult: any;
-
+    // Save everything to MongoDB (including enriched generated test metadata)
+    console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
     try {
-      prioritizationResult = await prioritizeTests(llmContext, llmClient);
-      console.log(`[Step 3/5] ✓ Prioritized ${prioritizationResult.tests.length} tests`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[Step 3/5] ❌ Prioritization failed: ${msg}`);
-      return res.status(500).json({
-        error: "Test prioritization failed",
-        details: msg,
-      });
-    }
-
-    if (!prioritizationResult.tests || prioritizationResult.tests.length === 0) {
-      console.log("[Step 3/5] No tests to prioritize, continuing with gap analysis...");
-      
-      // Continue to gap analysis even with no prioritized tests
-    } else {
-      console.log(`[Step 3/5] ✓ Prioritized ${prioritizationResult.tests.length} tests`);
-    }
-
-    // ========================================
-    // Step 4: Build generation targets
-    // ========================================
-    console.log("[Step 4/5] Building generation targets...");
-    const { targets: generationTargets, gapAnalyses } = await buildGenerationTargets(
-      prioritizationResult.tests,
-      llmContext,
-      llmClient,
-      analysis.rawDiff,
-      repositoryPath,
-      { topN: 5 }
-    );
-    console.log(`[Step 4/5] ✓ Built ${generationTargets.length} generation target(s) from ${gapAnalyses.length} analyzed symbol(s)`);
-
-    let generationResult: any = { results: [] };
-
-    if (generationTargets.length > 0) {
-      // ========================================
-      // Step 5: Generate tests
-      // ========================================
-      console.log("[Step 5/5] Generating test cases with LLM...");
-
-      try {
-        generationResult = await generateTests(generationTargets, llmClient);
-        const generatedCount = generationResult.results.reduce(
-          (sum: number, r: any) => sum + (r.generatedTests?.length ?? 0),
-          0
-        );
-        const failedCount = generationResult.results.filter(
-          (r: any) => r.error
-        ).length;
-        console.log(`[Step 5/5] ✓ Generated ${generatedCount} test cases (${failedCount} failed targets)`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[Step 5/5] ❌ Generation failed: ${msg}`);
-        return res.status(500).json({
-          error: "Test generation failed",
-          details: msg,
-        });
-      }
-    } else {
-      console.log("[Step 5/5] No generation targets, skipping generation");
-    }
-
-    // ========================================
-    // Step 5.5: Run prioritized existing tests
-    // ========================================
-    console.log("[Step 5.5/6] Running prioritized existing tests...");
-
-    const prioritizedTestInputs = prioritizationResult.tests.map((test: any) => ({
-      testFile: test.testFile,
-      priority: test.priority,
-    }));
-
-    // Enrich with TestFileContext before running
-    console.log("[Step 5.5/6] Mapping test suite context...");
-    const enrichedPrioritizedInputs = await enrichTestInputsWithContext(
-      prioritizedTestInputs,
-      repositoryPath
-    );
-
-    let prioritizedExecution: { testExecution: any[]; stoppedEarly: boolean } = {
-      testExecution: [],
-      stoppedEarly: false,
-    };
-
-    if (enrichedPrioritizedInputs.length > 0) {
-      prioritizedExecution = await runPrioritizedTests(enrichedPrioritizedInputs, {
-        repositoryRoot: repositoryPath,
-        stopOnFailure: false,
-        timeoutMs: 120_000,
-        keepGeneratedTests: false,
-      });
-
-      const prioritizedPassed = prioritizedExecution.testExecution.filter(
-        (r: any) => r.status === "passed"
-      ).length;
-      const prioritizedFailed = prioritizedExecution.testExecution.filter(
-        (r: any) => r.status === "failed"
-      ).length;
-
-      console.log(
-        `[Step 5.5/6] ✓ Executed ${prioritizedExecution.testExecution.length} prioritized test(s): ${prioritizedPassed} passed, ${prioritizedFailed} failed`
-      );
-    }
-
-    // ========================================
-    // Step 6: Materialize and execute generated tests
-    // ========================================
-    console.log("[Step 6/6] Executing generated test cases...");
-
-    const generatedTestInputs: GeneratedTestInput[] = [];
-
-    for (const result of generationResult.results as any[]) {
-      if (!result.generatedTests) continue;
-
-      // Find the corresponding generation target to get sourceFile and isNewTestFile
-      const target = generationTargets.find(
-        (t) => t.symbol === result.targetSymbol
-      );
-
-      for (const generatedTest of result.generatedTests) {
-        // Get source file content for repair context
-        const sourceFileAbsolute = path.isAbsolute(target?.sourceFile ?? "")
-          ? target?.sourceFile
-          : path.resolve(repositoryPath, target?.sourceFile ?? "");
-        let sourceContent = "";
-        if (sourceFileAbsolute) {
-          try {
-            sourceContent = fs.readFileSync(sourceFileAbsolute, "utf8");
-          } catch {
-            // Source file not readable, will skip repair context
-          }
-        }
-
-        generatedTestInputs.push({
-          testFile: result.testFile,
-          priority: 0,
-          testCode: generatedTest.testCode,
-          testName: generatedTest.name,
-          targetSymbol: generatedTest.targetSymbol ?? result.targetSymbol,
-          sourceFile: target?.sourceFile ?? "",
-          isNewTestFile: target?.isNewTestFile ?? false,
-          repairAttempt: 0,
-          sourceFileContent: sourceContent,
-        });
-      }
-    }
-
-    console.log(
-      `[Step 6/6] Prepared ${generatedTestInputs.length} generated test(s) for execution`
-    );
-
-    // Enrich generated test inputs with context before running
-    console.log("[Step 6/6] Mapping test suite context for generated tests...");
-    const enrichedGeneratedInputs = await enrichTestInputsWithContext(
-      generatedTestInputs,
-      repositoryPath
-    );
-
-    let generatedExecution: { testExecution: any[]; stoppedEarly: boolean } = {
-      testExecution: [],
-      stoppedEarly: false,
-    };
-
-    if (enrichedGeneratedInputs.length > 0) {
-      generatedExecution = await runPrioritizedTests(enrichedGeneratedInputs, {
-        repositoryRoot: repositoryPath,
-        stopOnFailure: false,
-        timeoutMs: 120_000,  // 2 min timeout (accounts for monorepo startup time)
-        keepGeneratedTests: true,  // Keep files for inspection
-      });
-
-      // ========================================
-      // Repair loop: retry failed tests with LLM fixes
-      // ========================================
-      console.log("[Step 6/6] Checking for tests that need repair...");
-      
-      const failedTests = generatedExecution.testExecution.filter(
-        (r: any) => (r as any).needsRepair === true
-      );
-      
-      if (failedTests.length > 0) {
-        console.log(`[Step 6/6] Found ${failedTests.length} test(s) that need repair. Requesting fixes from LLM...`);
-        
-        const repairBatch: GeneratedTestInput[] = [];
-        
-        for (const failedTest of failedTests) {
-          const originalInput = enrichedGeneratedInputs.find(
-            (t) => t.testFile === failedTest.testFile && t.testName === failedTest.generatedTestName
-          );
-          
-          if (originalInput) {
-            // Build repair request for LLM
-            const { buildTestRepairPrompt } = await import("./repository/test-generator.js");
-            
-            const repairPrompt = buildTestRepairPrompt({
-              failedTestCode: originalInput.testCode,
-              viestError: (failedTest as any).repairError || failedTest.stderr || "",
-              targetFunctionName: originalInput.targetSymbol,
-              sourceFileContent: originalInput.sourceFileContent ?? "",
-              testFileName: originalInput.testFile,
-              attemptNumber: ((originalInput.repairAttempt ?? 0) + 1),
-              maxAttempts: 3,
-            });
-            
-            console.log(`[Step 6/6] Sending repair request for "${originalInput.testName}" (attempt ${(originalInput.repairAttempt ?? 0) + 1}/3)`);
-            
-            // Add delay to respect rate limits (2 seconds between requests)
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            // Call LLM to repair the test
-            const repairResponse = await llmClient.generateJSON<{
-              repairedTestCode: string;
-            }>(
-              "You are a test repair assistant. Fix the failing test code based on the error message and context provided.",
-              repairPrompt
-            );
-            
-            if (repairResponse?.repairedTestCode) {
-              // Create new input with repaired code and incremented attempt counter
-              repairBatch.push({
-                ...originalInput,
-                testCode: repairResponse.repairedTestCode,
-                repairAttempt: (originalInput.repairAttempt ?? 0) + 1,
-              });
-              console.log(`[Step 6/6] ✓ Received repaired test code for "${originalInput.testName}"`);
-            }
-          }
-        }
-        
-        // Re-execute repaired tests
-        if (repairBatch.length > 0) {
-          console.log(`[Step 6/6] Re-executing ${repairBatch.length} repaired test(s)...`);
-          
-          const repairedExecution = await runPrioritizedTests(repairBatch, {
-            repositoryRoot: repositoryPath,
-            stopOnFailure: false,
-            timeoutMs: 120_000,
-            keepGeneratedTests: true,
-          });
-          
-          // Replace failed results with repair results in generatedExecution
-          for (const repaired of repairedExecution.testExecution) {
-            const failedIndex = generatedExecution.testExecution.findIndex(
-              (r: any) => r.testFile === repaired.testFile && r.generatedTestName === repaired.generatedTestName
-            );
-            if (failedIndex !== -1) {
-              generatedExecution.testExecution[failedIndex] = repaired;
-            }
-          }
-        }
-      }
-
-      // Calculate full breakdown instead of hiding other buckets
-      const genSummary = {
-        passed: generatedExecution.testExecution.filter((r: any) => r.status === "passed").length,
-        failed: generatedExecution.testExecution.filter((r: any) => r.status === "failed").length,
-        errors: generatedExecution.testExecution.filter((r: any) => r.status === "error").length,
-        not_found: generatedExecution.testExecution.filter((r: any) => r.status === "not_found").length,
-        skipped: generatedExecution.testExecution.filter((r: any) => r.status === "skipped").length,
-      };
-
-      console.log(
-        `[Step 6/6] ✓ Executed ${generatedExecution.testExecution.length} generated test(s): ` +
-        `${genSummary.passed} passed, ${genSummary.failed} failed, ${genSummary.errors} errors, ` +
-        `${genSummary.not_found} not_found, ${genSummary.skipped} skipped`
-      );
-
-      // Per-test verdict, matching the format you want to see
-      for (const r of generatedExecution.testExecution as any[]) {
-        const icon = r.status === "passed" ? "✓" : r.status === "failed" ? "✗" : "⚠";
-        console.log(`[Generated Test] ${r.generatedTestName}`);
-        console.log(`  ${icon} ${r.status.toUpperCase()} (${r.duration.toFixed(2)}s)`);
-        if (r.status !== "passed") {
-          console.log(`  notes: ${r.notes ?? "(none)"}`);
-          if (r.stderr) console.log(`  stderr (first 500 chars):\n${r.stderr.slice(0, 500)}`);
-        }
-      }
-    }
-
-    // ========================================
-    // Prepare response
-    // ========================================
-    const generatedCount = generationResult.results.reduce(
-      (sum: number, r: any) => sum + (r.generatedTests?.length ?? 0),
-      0
-    );
-    const failedCount = generationResult.results.filter(
-      (r: any) => r.error
-    ).length;
-
-    console.log("========================================");
-    console.log("Pipeline execution completed");
-    console.log("========================================");
-    console.log("");
-    console.log("EXISTING TEST RESULTS");
-    console.log("========================================");
-    const existingPassed = prioritizedExecution.testExecution.filter((r: any) => r.status === "passed").length;
-    const existingExecuted = prioritizedExecution.testExecution.length;
-    const existingPassRate = existingExecuted > 0 ? ((existingPassed / existingExecuted) * 100).toFixed(1) : "0.0";
-    console.log(
-      `Selected: ${prioritizedTestInputs.length}`
-    );
-    console.log(
-      `Executed: ${existingExecuted}`
-    );
-    console.log(
-      `Passed: ${existingPassed}`
-    );
-    console.log(
-      `Pass Rate: ${existingPassRate}%`
-    );
-    console.log(
-      `Failed: ${prioritizedExecution.testExecution.filter((r: any) => r.status === "failed").length}`
-    );
-    console.log("");
-    console.log("GENERATED TEST RESULTS");
-    console.log("========================================");
-    const totalGenerated = generationResult.results.reduce(
-      (sum: number, r: any) => sum + (r.generatedTests?.length ?? 0),
-      0
-    );
-    const validGenerated = enrichedGeneratedInputs.length; // Tests that passed validation and were written
-    const rejectedGenerated = totalGenerated - validGenerated; // Tests that were rejected during validation
-    const generatedPassed = generatedExecution.testExecution.filter((r: any) => r.status === "passed").length;
-    const generatedExecuted = generatedExecution.testExecution.length;
-    const generatedPassRate = generatedExecuted > 0 ? ((generatedPassed / generatedExecuted) * 100).toFixed(1) : "0.0";
-    const generationValidityRate = totalGenerated > 0 ? ((validGenerated / totalGenerated) * 100).toFixed(1) : "0.0";
-    
-    console.log(
-      `Generated: ${totalGenerated}`
-    );
-    console.log(
-      `Valid (passed validation): ${validGenerated}`
-    );
-    if (rejectedGenerated > 0) {
-      console.log(
-        `Rejected (failed validation): ${rejectedGenerated}`
-      );
-    }
-    console.log(
-      `Generation Validity Rate: ${generationValidityRate}%`
-    );
-    console.log(
-      `Executed: ${generatedExecuted}`
-    );
-    console.log(
-      `Passed: ${generatedPassed}`
-    );
-    console.log(
-      `Execution Success Rate: ${generatedPassRate}%`
-    );
-    console.log(
-      `Failed: ${generatedExecution.testExecution.filter((r: any) => r.status === "failed").length}`
-    );
-    console.log("========================================");
-
-    const finalResponse: any = {
-      success: true,
-      commit: {
-        hash: analysis.commit.hash,
-        message: analysis.commit.message,
-        author: analysis.commit.author,
-        date: analysis.commit.date,
-      },
-      analysis: {
-        filesChanged: analysis.summary.filesChanged,
-        totalInsertions: analysis.summary.totalInsertions,
-        totalDeletions: analysis.summary.totalDeletions,
-        changedSymbols: llmContext.changedSymbols,
-        dependencyChanges,
-      },
-      prioritization: {
-        candidateTests: llmContext.candidateTests.length,
-        prioritizedTests: prioritizationResult.tests,
-      },
-      gapAnalysis: {
-        results: gapAnalyses,
-        summary: {
-          analyzedSymbols: gapAnalyses.length,
-          totalChangedBehaviors: gapAnalyses.reduce((sum, g) => sum + g.changedBehaviors.length, 0),
-          totalVerifiedGaps: gapAnalyses.reduce((sum, g) => sum + g.coverageGaps.length, 0),
-        },
-        rawDiff: analysis.rawDiff,
-      },
-      generation: {
-        results: generationResult.results,
-        summary: {
-          targetCount: generationTargets.length,
-          generatedCount,
-          failedCount,
-          successRate:
-            generationTargets.length > 0
-              ? (((generationTargets.length - failedCount) /
-                  generationTargets.length) *
-                100).toFixed(1)
-              : 0,
-        },
-      },
-      existingTestExecution: {
-        results: prioritizedExecution.testExecution.map((r: any) => ({
-          testFile: r.testFile,
-          status: r.status,
-          passed: r.status === "passed",
-          failed: r.status === "failed",
-          duration: r.duration,
-          durationMs: Math.round(r.duration * 1000),
-          framework: r.framework,
-          notes: r.notes,
-          error: r.status === "error" ? r.stderr : undefined,
-        })),
-        summary: {
-          selected: prioritizedTestInputs.length,
-          executed: prioritizedExecution.testExecution.length,
-          passed: prioritizedExecution.testExecution.filter((r: any) => r.status === "passed").length,
-          failed: prioritizedExecution.testExecution.filter((r: any) => r.status === "failed").length,
-          errors: prioritizedExecution.testExecution.filter((r: any) => r.status === "error").length,
-          not_found: prioritizedExecution.testExecution.filter((r: any) => r.status === "not_found").length,
-          skipped: prioritizedExecution.testExecution.filter((r: any) => r.status === "skipped").length,
-        },
-        stoppedEarly: prioritizedExecution.stoppedEarly,
-      },
-      generatedTestExecution: {
-        results: generatedExecution.testExecution.map((r: any) => ({
-          testFile: r.testFile,
-          generatedTestName: r.generatedTestName,
-          status: r.status,
-          passed: r.status === "passed",
-          failed: r.status === "failed",
-          duration: r.duration,
-          durationMs: Math.round(r.duration * 1000),
-          framework: r.framework,
-          notes: r.notes,
-          error: r.status === "error" ? r.stderr : undefined,
-        })),
-        verdicts: generatedExecution.testExecution.map((r: any) => ({
-          name: r.generatedTestName,
-          result: r.status === "passed" ? "PASSED" : r.status === "failed" ? "FAILED" : r.status.toUpperCase(),
-          durationSeconds: r.duration,
-          error: r.status !== "passed" ? (r.notes ?? r.stderr?.slice(0, 500)) : undefined,
-        })),
-        summary: {
-          generated: generatedCount,
-          executed: generatedExecution.testExecution.length,
-          passed: generatedExecution.testExecution.filter((r: any) => r.status === "passed").length,
-          failed: generatedExecution.testExecution.filter((r: any) => r.status === "failed").length,
-          errors: generatedExecution.testExecution.filter((r: any) => r.status === "error").length,
-          not_found: generatedExecution.testExecution.filter((r: any) => r.status === "not_found").length,
-          skipped: generatedExecution.testExecution.filter((r: any) => r.status === "skipped").length,
-        },
-        stoppedEarly: generatedExecution.stoppedEarly,
-      },
-    };
-
-    // Save to MongoDB
-    if (mongoConnected) {
-      console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
-      try {
-        const documentId = await saveAnalysisResult(repoName, finalResponse);
-        finalResponse.mongoId = documentId;
-        console.log(`[MongoDB] ✓ Result saved with ID: ${documentId}`);
-      } catch (mongoError) {
-        console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
-        finalResponse.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
-      }
-    } else {
-      console.log("[MongoDB] ⚠ Skipping MongoDB save - MongoDB not connected");
-      finalResponse.mongoError = "MongoDB connection failed during initialization";
+      const documentId = await saveAnalysisResult(repoName, finalResponse);
+      finalResponse.mongoId = documentId;
+      console.log(`[MongoDB] ✓ Result saved with ID: ${documentId}`);
+    } catch (mongoError) {
+      console.error(`[MongoDB] ❌ Failed to save to MongoDB:`, mongoError);
+      finalResponse.mongoError = mongoError instanceof Error ? mongoError.message : String(mongoError);
     }
 
     res.json(finalResponse);
@@ -688,8 +207,121 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
   }
 });
 
+// ======================================================
+// FIX #7: DATASET GENERATION ENDPOINTS
+// ======================================================
+
+import { generateCSV, saveDataset, loadDataset, convertCommitResultToDatasetRow, type ResearchDatasetRow } from "./repository/dataset-generator.js";
+
+/**
+ * POST /api/dataset/generate
+ * Generate CSV from commit results
+ */
+app.post("/api/dataset/generate", async (req, res) => {
+  try {
+    const { results, repositoryName } = req.body;
+
+    if (!results || !Array.isArray(results)) {
+      return res.status(400).json({
+        error: "results array is required",
+      });
+    }
+
+    const repoName = repositoryName || "default-repository";
+    const rows: ResearchDatasetRow[] = results.map((result: any) =>
+      convertCommitResultToDatasetRow(result, repoName)
+    );
+
+    const csv = generateCSV(rows);
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="research-dataset-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Failed to generate dataset",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/**
+ * POST /api/dataset/save
+ * Generate and save dataset to disk
+ */
+app.post("/api/dataset/save", async (req, res) => {
+  try {
+    const { results, repositoryName, outputPath } = req.body;
+
+    if (!results || !Array.isArray(results)) {
+      return res.status(400).json({
+        error: "results array is required",
+      });
+    }
+
+    const repoName = repositoryName || "default-repository";
+    const savePath = outputPath || `./datasets/research-dataset-${Date.now()}.csv`;
+
+    const rows: ResearchDatasetRow[] = results.map((result: any) =>
+      convertCommitResultToDatasetRow(result, repoName)
+    );
+
+    await saveDataset(rows, savePath);
+
+    res.json({
+      success: true,
+      message: `Dataset saved to ${savePath}`,
+      rowCount: rows.length,
+      outputPath: savePath,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Failed to save dataset",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/**
+ * GET /api/dataset/export
+ * Serve a previously saved CSV file
+ */
+app.get("/api/dataset/export", (_req, res) => {
+  try {
+    const { filePath } = _req.query;
+
+    if (!filePath || typeof filePath !== "string") {
+      return res.status(400).json({
+        error: "filePath query parameter is required",
+      });
+    }
+
+    const rows = loadDataset(filePath);
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        error: "Dataset file not found or is empty",
+      });
+    }
+
+    const csv = generateCSV(rows);
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="${path.basename(filePath)}"`);
+    res.send(csv);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Failed to export dataset",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
 // Health check endpoint
-app.get("/api/health", (req, res) => {
+app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 

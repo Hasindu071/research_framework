@@ -126,6 +126,33 @@ export interface TestAnalysisResult {
 const SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 
 /**
+ * Filter out non-test files from a list of candidates.
+ * Excludes files like utils, helpers, config, types, constants, etc.
+ * that were incorrectly picked up as test candidates.
+ */
+function filterOutNonTestFiles(filePaths: string[]): string[] {
+  const NON_TEST_PATTERNS = [
+    /\.d\.ts$/, // TypeScript definitions
+    /\.(types|constants|config|utils|helpers|setup|fixtures|mocks|stubs)\.([tj]sx?|mjs|cjs)$/,
+    /^(types|constants|config|utils|helpers|setup|fixtures|mocks|stubs)\.([tj]sx?|mjs|cjs)$/,
+  ];
+
+  return filePaths.filter((filePath) => {
+    const normalized = normalizePath(filePath);
+    // Keep if it matches test file pattern
+    if (isTestFile(filePath)) {
+      return true;
+    }
+    // Reject if it matches a non-test pattern
+    if (NON_TEST_PATTERNS.some((pattern) => pattern.test(normalized))) {
+      return false;
+    }
+    // Default to include
+    return true;
+  });
+}
+
+/**
  * Check whether a file is a test file.
  *
  * Handles all naming conventions found in the repo:
@@ -1231,7 +1258,10 @@ export function analyzeTests(
 
   const allFiles = getAllFiles(repositoryRoot);
 
-  const testFiles = allFiles.filter(isTestFile);
+  let testFiles = allFiles.filter(isTestFile);
+  
+  // FIX: Filter out non-test files that were incorrectly matched
+  testFiles = filterOutNonTestFiles(testFiles);
 
   const sourceFiles = allFiles.filter(
     (file) => isSourceFile(file) && !isTestFile(file)

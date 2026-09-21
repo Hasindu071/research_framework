@@ -6,6 +6,16 @@ import {
 } from "./prompts.js";
 
 // ======================================================
+// CONSTANTS
+// ======================================================
+
+/**
+ * Only execute tests with a relevance score at or above this threshold.
+ * Tests below this are filtered out as not sufficiently relevant to the changes.
+ */
+const RELEVANCE_THRESHOLD = 0.3;
+
+// ======================================================
 // TYPES
 // ======================================================
 
@@ -19,6 +29,11 @@ export interface PrioritizedTest {
 
 export interface TestPrioritizationResult {
   tests: PrioritizedTest[];
+  /**
+   * Tests that were filtered out due to being below the relevance threshold.
+   * Included here for audit trail purposes.
+   */
+  filtered?: PrioritizedTest[];
 }
 
 /** Raw shape we ask the LLM for — see prompts.ts. */
@@ -99,6 +114,7 @@ function validateAndNormalize(
   const rawTests = raw.testPrioritization?.tests ?? [];
 
   const valid: PrioritizedTest[] = [];
+  const filtered: PrioritizedTest[] = [];
   const seen = new Set<string>();
 
   for (const test of rawTests) {
@@ -115,17 +131,28 @@ function validateAndNormalize(
 
     seen.add(test.testFile);
 
-    valid.push({
+    const prioritizedTest: PrioritizedTest = {
       testFile: test.testFile,
       score: clampScore(test.score),
       priority: 0, // reassigned below, once we know the final order
       reason: test.reason?.trim() || "No reason provided by the model.",
       evidence: Array.isArray(test.evidence) ? test.evidence : [],
-    });
+    };
+
+    // FIX #3: Apply relevance threshold filtering
+    if (prioritizedTest.score < RELEVANCE_THRESHOLD) {
+      filtered.push(prioritizedTest);
+      console.log(
+        `[Test-Prioritizer] Filtered test below relevance threshold (${RELEVANCE_THRESHOLD}): ` +
+        `${test.testFile} (score: ${prioritizedTest.score.toFixed(2)})`
+      );
+    } else {
+      valid.push(prioritizedTest);
+    }
   }
 
   // Any candidate the model silently dropped still gets ranked, at
-  // the bottom, so a caller iterating "all candidates in priority
+  // the bottom (if above threshold), so a caller iterating "all candidates in priority
   // order" never loses one — it just won't have an LLM-authored
   // reason.
   for (const candidate of context.candidateTests) {
@@ -133,14 +160,25 @@ function validateAndNormalize(
       continue;
     }
 
-    valid.push({
+    const fallbackTest: PrioritizedTest = {
       testFile: candidate.testFile,
       score: candidate.confidence,
       priority: 0,
       reason:
         "Not ranked by the model; falling back to static-analysis confidence.",
       evidence: [],
-    });
+    };
+
+    // FIX #3: Apply relevance threshold filtering to fallback tests too
+    if (fallbackTest.score < RELEVANCE_THRESHOLD) {
+      filtered.push(fallbackTest);
+      console.log(
+        `[Test-Prioritizer] Filtered test below relevance threshold (${RELEVANCE_THRESHOLD}): ` +
+        `${candidate.testFile} (score: ${fallbackTest.score.toFixed(2)})`
+      );
+    } else {
+      valid.push(fallbackTest);
+    }
   }
 
   valid.sort((a, b) => b.score - a.score);
@@ -149,7 +187,13 @@ function validateAndNormalize(
     test.priority = index + 1;
   });
 
-  return { tests: valid };
+  if (filtered.length > 0) {
+    console.log(
+      `[Test-Prioritizer] Filtered ${filtered.length} tests below relevance threshold (${RELEVANCE_THRESHOLD})`
+    );
+  }
+
+  return { tests: valid, filtered };
 }
 
 function clampScore(score: number | undefined): number {

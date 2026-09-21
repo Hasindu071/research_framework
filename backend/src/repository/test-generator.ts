@@ -357,7 +357,18 @@ export async function buildGenerationTargets(
     return true;
   });
 
+  console.log("\n========== GENERATION TARGETS DEBUG START ==========");
+  console.log(`[Test-Generator] Total symbols from context: ${context.changedSymbols.length}`);
+  console.log(`[Test-Generator] Relevant symbols (filtered): ${relevantSymbols.length}`);
+  console.log("[Test-Generator] Relevant symbols:");
   for (const symbol of relevantSymbols) {
+    console.log(`  - "${symbol.name}" in "${symbol.file}" (${symbol.changeType})`);
+  }
+  console.log("========== GENERATION TARGETS DEBUG END ==========\n");
+
+  for (const symbol of relevantSymbols) {
+    console.log(`\n[Test-Generator] Processing symbol: "${symbol.name}"`);
+    
     if (seenSymbols.has(symbol.name)) {
       console.log(
         `[Test-Generator] Skipping "${symbol.name}" — already built a target for this symbol`
@@ -372,7 +383,7 @@ export async function buildGenerationTargets(
 
     if (!fs.existsSync(sourceFileAbsolute)) {
       console.log(
-        `[Test-Generator] Skipping "${symbol.name}" — source file does not exist: ${sourceFileAbsolute}`
+        `[Test-Generator] ✗ SKIPPED "${symbol.name}" — source file does not exist: ${sourceFileAbsolute}`
       );
       continue;
     }
@@ -409,12 +420,26 @@ export async function buildGenerationTargets(
 
     const resolution = resolveTargetTestFile(symbol.file, matchesForFile);
 
+    console.log(`[Test-Generator]   Gap input created for "${symbol.name}"`);
+    
     const gapInputs = buildGapAnalysisInputsFromAnalysis(
       [symbol],
       rawDiff,
-      context
+      context,
+      repositoryRoot
     );
+    
+    console.log(`[Test-Generator]   ✓ Gap inputs: ${gapInputs.length} input(s) prepared`);
+    for (const input of gapInputs) {
+      console.log(`       - Symbol: ${input.symbol}, diffLength: ${input.diffText?.length ?? 0}, testCodeLength: ${input.existingTestCode?.length ?? 0}`);
+    }
+    
     const gapAnalyses = await analyzeCoverageGapsBatch(gapInputs, llmClient);
+
+    console.log(`[Test-Generator]   ✓ Gap analyses: ${gapAnalyses.length} result(s) returned`);
+    for (const analysis of gapAnalyses) {
+      console.log(`       - Symbol: ${analysis.targetSymbol}, gaps: ${analysis.coverageGaps.length}, behaviors: ${analysis.changedBehaviors.length}`);
+    }
 
     // Keep all gap analyses for reporting (regardless of whether gaps were found)
     allGapAnalyses.push(...gapAnalyses);
@@ -533,6 +558,16 @@ export async function buildGenerationTargets(
       coverageGaps: gapAnalysis.coverageGaps,
     } as TestGenerationTarget);
   }
+
+  console.log("\n========== GENERATION TARGETS FINAL SUMMARY ==========");
+  console.log(`[Test-Generator] Total targets created: ${targets.length}`);
+  console.log(`[Test-Generator] Total gap analyses collected: ${allGapAnalyses.length}`);
+  console.log(`[Test-Generator] Total verified gaps: ${allGapAnalyses.reduce((sum, g) => sum + g.coverageGaps.length, 0)}`);
+  console.log("[Test-Generator] Targets to generate:");
+  for (const target of targets) {
+    console.log(`  - ${target.symbol} (${target.coverageGaps.length} gaps, in ${target.testFile})`);
+  }
+  console.log("========== END FINAL SUMMARY ==========\n");
 
   return { targets, gapAnalyses: allGapAnalyses };
 }

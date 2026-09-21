@@ -641,7 +641,7 @@ async function runExistingTest(
       priority: test.priority,
       framework: null,
       command: "[SKIPPED] file not found",
-      status: "skipped",
+      status: "not_found",
       duration: 0,
       exitCode: null,
       stdout: "",

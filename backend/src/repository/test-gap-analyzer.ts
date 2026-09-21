@@ -1,5 +1,6 @@
 import type { LLMContext } from "./context-builder.js";
 import type { LLMClient } from "./llm-client.js";
+import { findSymbolRange, extractSymbolDiff } from "./symbol-diff-extractor.js";
 
 // ======================================================
 // TYPES
@@ -57,15 +58,6 @@ export interface ChangedBehavior {
    * (use `cases` for the partial picture in that situation).
    */
   overallStatus: CoverageStatus;
-  /**
-   * Clear behavioral description for test generation.
-   * Structured as: "Function X does Y when Z"
-   * Examples:
-   * - "Function getReplyHeader returns email when includeEmail is true"
-   * - "Function formatDate handles null dates by returning empty string"
-   * - "Function filterEvents filters when predicate is falsy"
-   */
-  behaviorDescription?: string;
 }
 
 /** A single, verified, addressable gap — this is what reaches the generator. */
@@ -77,15 +69,6 @@ export interface CoverageGap {
   evidence: string;
   /** The specific uncovered case, e.g. "value is nullish → falls back to true". */
   condition: string;
-  /**
-   * Clear description of WHAT behavior to test and HOW to verify it.
-   * Structured as: "When X, the function should Y"
-   * Examples:
-   * - "When value is nullish, shouldUseDefault should return the default value"
-   * - "When count is zero, shouldProcess should return false"
-   * - "When error is thrown, handleError should catch and log it"
-   */
-  testableAssertion?: string;
 }
 
 export interface GapAnalysisInput {
@@ -100,6 +83,14 @@ export interface GapAnalysisInput {
   existingTestFile?: string;
   existingTestCode?: string;
   notes?: string[];
+  /**
+   * Root path of the repository being analyzed.
+   * CRITICAL: Used to resolve relative file paths when reading files.
+   * Ensures gap analysis reads files from the actual repository being analyzed
+   * (e.g., Cal.com files from Cal.com repo, not framework backend).
+   * Do NOT omit this — file reads will fail or read wrong paths.
+   */
+  repositoryRoot: string;
 }
 
 export interface TestGapAnalysis {
@@ -120,16 +111,8 @@ export interface TestGapAnalysis {
 export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LLMClient): Promise<TestGapAnalysis> {
   const testCode = input.existingTestCode ?? "";
 
-  // Extract only the relevant diff section for this symbol
-  const symbolDiff = extractSymbolDiff(input.diffText, input.symbol);
-  
-  console.log(
-    `[GapAnalyzer] Extracted symbol-specific diff for "${input.symbol}": ` +
-    `${symbolDiff.length} chars (original diffText: ${input.diffText?.length ?? 0} chars)`
-  );
-
-  const fallbackBehaviors = await extractFallbackBehaviors(symbolDiff, input.symbol, testCode, llmClient);
-  const lexicalBehaviors = extractLexicalBehaviors(symbolDiff);
+  const fallbackBehaviors = await extractFallbackBehaviors(input.diffText, input.symbol, testCode, llmClient);
+  const lexicalBehaviors = extractLexicalBehaviors(input.diffText);
   const changedBehaviors = [...fallbackBehaviors, ...lexicalBehaviors];
 
   const existingCoverage = extractExistingCoverage(testCode);
@@ -142,74 +125,38 @@ export async function analyzeCoverageGaps(input: GapAnalysisInput, llmClient: LL
         kind: behavior.kind,
         evidence: behavior.evidence,
         condition: c.condition,
-        testableAssertion: generateTestableAssertion(
-          input.symbol,
-          behavior,
-          c.condition,
-          behavior.behaviorDescription
-        ),
       }))
   );
 
-  // If there's no existing test code, treat all lexical behaviors as gaps
-  // (they're definitely not covered since there are no tests at all)
-  if (testCode.trim().length === 0 && lexicalBehaviors.length > 0) {
-    for (const lexBehavior of lexicalBehaviors) {
-      coverageGaps.push({
-        label: lexBehavior.label,
-        kind: lexBehavior.kind,
-        evidence: lexBehavior.evidence,
-        condition: `Not covered — no existing test file to verify against`,
-        testableAssertion: generateLexicalTestableAssertion(input.symbol, lexBehavior),
-      });
-    }
-  }
-
   console.log(
     `[GapAnalyzer] Symbol: "${input.symbol}" | ` +
-      `symbolDiff length: ${symbolDiff?.length ?? 0} chars | ` +
+      `diffText length: ${input.diffText?.length ?? 0} chars | ` +
       `testCode length: ${testCode.length} chars | ` +
       `fallback behaviors: ${fallbackBehaviors.length} | ` +
       `lexical (unverified) behaviors: ${lexicalBehaviors.length} | ` +
       `verified coverage gaps: ${coverageGaps.length}`
   );
 
-  if (symbolDiff && symbolDiff.length > 0 && changedBehaviors.length === 0) {
+  if (input.diffText && input.diffText.length > 0 && changedBehaviors.length === 0) {
     console.warn(
-      `[GapAnalyzer] ⚠️ WARNING: Symbol diff extracted (${symbolDiff.length} chars) but no behaviors detected. ` +
+      `[GapAnalyzer] ⚠️ WARNING: Diff extracted (${input.diffText.length} chars) but no behaviors detected. ` +
         `Regex patterns may not match this diff format or structure.`
     );
-    console.warn(`[GapAnalyzer] DEBUG: Raw symbol diff for "${input.symbol}":\n${symbolDiff.substring(0, 500)}`);
-    const addedLines = getAddedLines(symbolDiff);
+    console.warn(`[GapAnalyzer] DEBUG: Raw diffText for "${input.symbol}":\n${input.diffText.substring(0, 500)}`);
+    const addedLines = getAddedLines(input.diffText);
     console.warn(`[GapAnalyzer] DEBUG: Added lines (${addedLines.length}): ${JSON.stringify(addedLines.slice(0, 10))}`);
   }
 
-  if (fallbackBehaviors.length > 0 && coverageGaps.filter(g => g.kind === "fallback").length === 0) {
+  if (fallbackBehaviors.length > 0 && coverageGaps.length === 0) {
     console.log(
       `[GapAnalyzer] ℹ️ All fallback behaviors for "${input.symbol}" are covered by existing tests.`
     );
   }
 
-  if (lexicalBehaviors.length > 0 && testCode.trim().length > 0) {
-    // OPTION 1: Convert unverified lexical behaviors to gaps (more aggressive test generation)
-    // Uncomment the code below to enable this mode and generate tests for all code changes
-    
-    // for (const lexBehavior of lexicalBehaviors) {
-    //   coverageGaps.push({
-    //     label: lexBehavior.label,
-    //     kind: lexBehavior.kind,
-    //     evidence: lexBehavior.evidence,
-    //     condition: `Modified behavior (unverified) — existing tests may not cover all scenarios`,
-    //   });
-    // }
-    // console.log(
-    //   `[GapAnalyzer] ℹ️ Added ${lexicalBehaviors.length} unverified behavior(s) to gaps for generation.`
-    // );
-
-    // OPTION 2: Keep current conservative approach (existing behavior)
+  if (lexicalBehaviors.length > 0) {
     console.log(
       `[GapAnalyzer] ℹ️ ${lexicalBehaviors.length} Tier-2 (unverified) behavior(s) detected for ` +
-        `"${input.symbol}" — not sent to generator (existing tests present), coverage status unknown by design.`
+        `"${input.symbol}" — not sent to generator, coverage status unknown by design.`
     );
   }
 
@@ -241,12 +188,10 @@ export async function analyzeCoverageGapsBatch(inputs: GapAnalysisInput[], llmCl
 // required — a call with no assertion proves nothing, and an assertion
 // with no matching call proves nothing either.
 
-// More robust patterns that handle nested parentheses/brackets
-// (Kept for reference but now using algorithm-based extraction instead)
-// const FALLBACK_PROPERTY_PATTERN =
-//   /^\s*([a-zA-Z_$][\w$]*)\s*:\s*(.+)\s+(\?\?|\|\|)\s+([^,]*?)(?:,\s*)?$/;
-// const FALLBACK_VARIABLE_PATTERN =
-//   /^\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+)\s+(\?\?|\|\|)\s+(.+?)\s*;?\s*$/;
+const FALLBACK_PROPERTY_PATTERN =
+  /^\s*([a-zA-Z_$][\w$]*)\s*:\s*(.+?)\s*(\?\?|\|\|)\s*(.+?),?\s*$/;
+const FALLBACK_VARIABLE_PATTERN =
+  /^\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+?)\s*(\?\?|\|\|)\s*(.+?)\s*;?\s*$/;
 
 interface FallbackExpr {
   /** The value that receives the result.
@@ -273,99 +218,51 @@ interface FallbackExpr {
 }
 
 function extractFallbackExpr(trimmed: string): FallbackExpr | null {
-  // Check if line has any fallback operators
-  if (!trimmed.includes("??") && !trimmed.includes("||")) {
-    return null;
-  }
-
-  // CRITICAL: Only extract top-level fallbacks. Skip lines where the operator
-  // is deeply nested (e.g., inside function calls or complex array literals).
-  // We'll use a simple heuristic: count parens/braces. If the operator is inside
-  // a nested context (paren depth > 0), skip it to avoid mangling complex expressions.
-
-  let operatorPos = -1;
-  let foundOperator: "??" | "||" | null = null;
-
-  // Find FIRST operator (we'll check its nesting depth)
-  const qqIdx = trimmed.indexOf("??");
-  const orIdx = trimmed.indexOf("||");
-
-  if (qqIdx !== -1 && (orIdx === -1 || qqIdx < orIdx)) {
-    operatorPos = qqIdx;
-    foundOperator = "??";
-  } else if (orIdx !== -1) {
-    operatorPos = orIdx;
-    foundOperator = "||";
-  }
-
-  if (operatorPos === -1 || !foundOperator) {
-    return null;
-  }
-
-  // Check nesting depth at operator position
-  let parenDepth = 0;
-  let braceDepth = 0;
-  for (let i = 0; i < operatorPos; i++) {
-    if (trimmed[i] === "(") parenDepth++;
-    else if (trimmed[i] === ")") parenDepth--;
-    else if (trimmed[i] === "{") braceDepth++;
-    else if (trimmed[i] === "}") braceDepth--;
-  }
-
-  // If operator is nested inside parens or braces, skip it (too complex)
-  if (parenDepth > 0 || braceDepth > 0) {
-    return null;
-  }
-
-  const beforeOp = trimmed.substring(0, operatorPos).trim();
-  const afterOp = trimmed.substring(operatorPos + 2).trim();
-
   // --------------------------------------------------
-  // Case 1: property: value ?? fallback
+  // Case 1:
+  // property: value ?? fallback
+  // property: value || fallback
   // --------------------------------------------------
-  const propertyMatch = /^([a-zA-Z_$][\w$]*)\s*:\s*(.+)$/.exec(beforeOp);
-  if (propertyMatch && propertyMatch[1] && propertyMatch[2]) {
+  const propertyMatch = FALLBACK_PROPERTY_PATTERN.exec(trimmed);
+  if (propertyMatch &&
+      propertyMatch[1] &&
+      propertyMatch[2] &&
+      propertyMatch[3] &&
+      propertyMatch[4]) {
     return {
       property: propertyMatch[1],
       sourceExpr: propertyMatch[2].trim(),
-      operator: foundOperator,
-      fallbackExpr: afterOp.replace(/,\s*$/, ""), // Remove trailing comma
+      operator: propertyMatch[3] === "??" ? "??" : "||",
+      fallbackExpr: propertyMatch[4].trim(),
       isVariableAssignment: false,
     };
   }
 
   // --------------------------------------------------
-  // Case 2: const x = value ?? fallback
+  // Case 2:
+  // const x = value ?? fallback
+  // const x = value || fallback
   // --------------------------------------------------
-  const variableMatch = /^(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.+)$/.exec(beforeOp);
-  if (variableMatch && variableMatch[1] && variableMatch[2]) {
+  const variableMatch = FALLBACK_VARIABLE_PATTERN.exec(trimmed);
+  if (variableMatch &&
+      variableMatch[1] &&
+      variableMatch[2] &&
+      variableMatch[3] &&
+      variableMatch[4]) {
     return {
       property: variableMatch[1],
       sourceExpr: variableMatch[2].trim(),
-      operator: foundOperator,
-      fallbackExpr: afterOp.replace(/[;,]\s*$/, ""), // Remove trailing semicolon or comma
+      operator: variableMatch[3] === "??" ? "??" : "||",
+      fallbackExpr: variableMatch[4].trim(),
       isVariableAssignment: true,
     };
   }
 
-  // --------------------------------------------------
-  // Case 3: value={expr ?? fallback} (JSX attribute)
-  // --------------------------------------------------
-  const jsxMatch = /^value=\{(.+)\}/.exec(beforeOp);
-  if (jsxMatch && jsxMatch[1]) {
-    // The entire expression before the operator is the source
-    const fullJsxSource = jsxMatch[1].trim();
-    return {
-      property: "value",
-      sourceExpr: fullJsxSource,
-      operator: foundOperator,
-      fallbackExpr: afterOp.replace(/\}\s*$/, "").trim(), // Remove closing brace
-      isVariableAssignment: false,
-    };
+  // Debug information
+  if (trimmed.includes("??") || trimmed.includes("||")) {
+    console.log(`[GapAnalyzer-Fallback] Line contains ?? or || but didn't match either fallback pattern: "${trimmed}"`);
   }
 
-  // If no specific case matched, skip this line
-  // (it's likely a complex nested fallback we can't safely extract)
   return null;
 }
 
@@ -445,7 +342,7 @@ Determine coverage for these two cases based on the test code provided.`;
     const response = await llmClient.generateJSON<LLMCoverageResponse>(systemPrompt, userPrompt);
 
     console.log(
-      `[GapAnalyzer-LLM] Coverage verification for symbol "${symbolName}", property "${fb.property}": ` +
+      `[GapAnalyzer-LLM] Coverage verification for "${fb.property}": ` +
         `${response.cases?.length ?? 0} verdict(s) provided`
     );
 
@@ -602,9 +499,6 @@ async function extractFallbackBehaviors(
     const passThroughCondition = `${fb.property} is provided and not ${nullishOrFalsy}`;
     const fallbackCondition = `${fb.property} is ${nullishOrFalsy} → falls back to \`${truncate(fb.fallbackExpr, 30)}\``;
 
-    // Generate clear behavioral description
-    const behaviorDesc = `When ${fb.property} is ${nullishOrFalsy}, ${symbolName} should use ${truncate(fb.fallbackExpr, 40)} as fallback`;
-
     // If there's no existing test code, both cases are not-covered without asking the model
     if (!testCode || testCode.trim().length === 0) {
       const cases: BehaviorCase[] = [
@@ -626,7 +520,6 @@ async function extractFallbackBehaviors(
         evidence: line,
         cases,
         overallStatus: "not-covered",
-        behaviorDescription: behaviorDesc,
       });
       continue;
     }
@@ -651,7 +544,6 @@ async function extractFallbackBehaviors(
       evidence: line,
       cases,
       overallStatus: allCovered ? "covered" : noneCovered ? "not-covered" : allUnknown ? "unknown" : "unknown",
-      behaviorDescription: behaviorDesc,
     });
   }
 
@@ -862,214 +754,194 @@ function extractAddedTestLinesForFile(rawDiff: string, testFile: string): string
 export function buildGapAnalysisInputsFromAnalysis(
   changedSymbols: Array<{ name: string; file: string; changeType: string }>,
   rawDiff: string,
-  context: LLMContext
+  context: LLMContext,
+  repositoryRoot: string
 ): GapAnalysisInput[] {
+  console.log("\n========== GAP INPUT DEBUG START ==========");
+  console.log(`[GapAnalysisBuilder] Building inputs for ${changedSymbols.length} symbol(s)`);
   console.log(`[GapAnalysisBuilder] rawDiff received: ${rawDiff?.length ?? 0} chars`);
+  console.log(`[GapAnalysisBuilder] repositoryRoot: ${repositoryRoot}`);
 
-  return changedSymbols.map((symbol) => {
-    const fileDiff = extractFileDiffFromRaw(rawDiff, symbol.file);
+  const inputs: GapAnalysisInput[] = [];
 
-    console.log(`[GapAnalysisBuilder] Extracted diff for "${symbol.file}": ${fileDiff.length} chars`);
+  for (const symbol of changedSymbols) {
+    console.log(`\n[GapAnalysisBuilder] Processing symbol: "${symbol.name}"`);
+    
+    const symbolRange = findSymbolRange(symbol.file, symbol.name);
+    console.log(`[GapAnalysisBuilder]   Symbol range: lines ${symbolRange?.startLine ?? "unknown"}–${symbolRange?.endLine ?? "unknown"}`);
+    
+    const symbolDiff = symbolRange
+      ? extractSymbolDiff(rawDiff, symbol.file, symbolRange)
+      : "";
 
-    const candidateForSymbol = context.candidateTests.find(
-      (c: any) => c.changedFile === symbol.file
+    console.log(
+      `[GapAnalysisBuilder]   Extracted diff: ${symbolDiff.length} chars`
     );
-    const testCodeExcerpt = candidateForSymbol
-      ? context.testCode.find((tc: any) => tc.file === candidateForSymbol.testFile)
-      : undefined;
+
+    const allCandidatesForSymbol = context.candidateTests.filter(
+      (candidate: any) => candidate.changedFile === symbol.file
+    );
+
+    console.log(`[GapAnalysisBuilder]   Found ${allCandidatesForSymbol.length} related test file(s)`);
+    if (allCandidatesForSymbol.length > 0) {
+      allCandidatesForSymbol.forEach((c: any) => {
+        console.log(`[GapAnalysisBuilder]     - ${c.testFile}`);
+      });
+    }
+
+    const allTestCode = allCandidatesForSymbol
+      .map((candidate: any) => {
+        const testCodeExcerpt = context.testCode.find(
+          (tc: any) => tc.file === candidate.testFile
+        );
+        return testCodeExcerpt?.content ?? "";
+      })
+      .filter((code: string) => code.length > 0)
+      .join("\n\n// ===== Next test file =====\n\n");
+
+    console.log(`[GapAnalysisBuilder]   Combined test code: ${allTestCode.length} chars`);
 
     const input: GapAnalysisInput = {
       symbol: symbol.name,
       sourceFile: symbol.file,
-      diffText: fileDiff || "",
-      notes: [`Symbol ${symbol.changeType}`],
+      diffText: symbolDiff || "",
+      repositoryRoot,
+      notes: [
+        `Symbol ${symbol.changeType}`,
+        `Checking coverage across ${allCandidatesForSymbol.length} related test file(s)`,
+      ],
     };
 
-    if (candidateForSymbol?.testFile) {
-      input.existingTestFile = candidateForSymbol.testFile;
+    if (allCandidatesForSymbol.length > 0) {
+      input.existingTestFile = allCandidatesForSymbol.map((c: any) => c.testFile).join(" | ");
 
-      // See extractAddedTestLinesForFile: this commit may have added a test
-      // for this exact symbol, and the snapshot in context.testCode may not
-      // reflect that yet. Splice the diff's own added test lines in so the
-      // coverage check sees them regardless.
-      const addedTestLines = extractAddedTestLinesForFile(rawDiff, candidateForSymbol.testFile);
-      const baseTestCode = testCodeExcerpt?.content ?? "";
+      const allAddedTestLines: string[] = [];
+      for (const candidate of allCandidatesForSymbol) {
+        const addedTestLines = extractAddedTestLinesForFile(rawDiff, candidate.testFile);
+        if (addedTestLines) {
+          allAddedTestLines.push(addedTestLines);
+        }
+      }
 
-      if (addedTestLines) {
-        const alreadyPresent = baseTestCode.includes(addedTestLines);
+      const addedTestLinesStr = allAddedTestLines.join("\n\n// ===== Added in next file =====\n\n");
+
+      const combinedTestCode = allTestCode
+        ? addedTestLinesStr
+          ? `${allTestCode}\n\n// ===== Added in this commit =====\n\n${addedTestLinesStr}`
+          : allTestCode
+        : addedTestLinesStr;
+
+      if (combinedTestCode) {
         console.log(
-          `[GapAnalysisBuilder] Test file "${candidateForSymbol.testFile}": ` +
-            `${addedTestLines.split("\n").length} added line(s) found in this commit's diff` +
-            (alreadyPresent
-              ? " (already present in the provided testCode snapshot — no merge needed)."
-              : " — NOT found in the provided testCode snapshot. Merging them in before analysis " +
-                "so a same-commit test isn't mistaken for a coverage gap.")
+          `[GapAnalysisBuilder]   Final test code for gap analysis: ${combinedTestCode.length} chars`
         );
+        input.existingTestCode = combinedTestCode;
+      }
+    }
 
-        input.existingTestCode = alreadyPresent
-          ? baseTestCode
-          : baseTestCode
-          ? `${baseTestCode}\n${addedTestLines}`
-          : addedTestLines;
-      } else if (baseTestCode) {
-        input.existingTestCode = baseTestCode;
+    inputs.push(input);
+    
+    console.log(`[GapAnalysisBuilder]   ✓ Input prepared: diffLength=${input.diffText?.length ?? 0}, testCodeLength=${input.existingTestCode?.length ?? 0}`);
+  }
+
+  console.log(`\n[GapAnalysisBuilder] TOTAL INPUTS CREATED: ${inputs.length}`);
+  console.log("========== GAP INPUT DEBUG END ==========\n");
+
+  return inputs;
+}
+
+// OLD IMPLEMENTATION BELOW (COMMENTED OUT FOR REFERENCE)
+/*
+export function buildGapAnalysisInputsFromAnalysis_OLD(
+  changedSymbols: Array<{ name: string; file: string; changeType: string }>,
+  rawDiff: string,
+  context: LLMContext,
+  repositoryRoot: string
+): GapAnalysisInput[] {
+  console.log(`[GapAnalysisBuilder] rawDiff received: ${rawDiff?.length ?? 0} chars`);
+  console.log(`[GapAnalysisBuilder] repositoryRoot: ${repositoryRoot}`);
+
+  return changedSymbols.map((symbol) => {
+    // Use symbol-specific diff extraction
+    const symbolRange = findSymbolRange(symbol.file, symbol.name);
+    const symbolDiff = symbolRange
+      ? extractSymbolDiff(rawDiff, symbol.file, symbolRange)
+      : "";
+
+    console.log(
+      `[GapAnalysisBuilder] Symbol "${symbol.name}" (lines ${symbolRange?.startLine}–${symbolRange?.endLine}): ${symbolDiff.length} chars`
+    );
+
+    // FIXED: Collect ALL related test files, not just the first one
+    // Reason: If createStore has multiple test files (store.test.tsx, internals.test.tsx,
+    // createStore.test.ts), we need to check coverage across ALL of them, not just one.
+    // A behavior might be untested in store.test.tsx but covered in internals.test.tsx.
+    const allCandidatesForSymbol = context.candidateTests.filter(
+      (candidate: any) => candidate.changedFile === symbol.file
+    );
+
+    // Combine test code from ALL related test files
+    const allTestCode = allCandidatesForSymbol
+      .map((candidate: any) => {
+        const testCodeExcerpt = context.testCode.find(
+          (tc: any) => tc.file === candidate.testFile
+        );
+        return testCodeExcerpt?.content ?? "";
+      })
+      .filter((code: string) => code.length > 0)
+      .join("\n\n// ===== Next test file =====\n\n");
+
+    // Log which test files are being analyzed for this symbol
+    if (allCandidatesForSymbol.length > 0) {
+      console.log(
+        `[GapAnalysisBuilder] Symbol "${symbol.name}" has ${allCandidatesForSymbol.length} related test file(s): ` +
+          allCandidatesForSymbol.map((c: any) => c.testFile).join(", ")
+      );
+    }
+
+    const input: GapAnalysisInput = {
+      symbol: symbol.name,
+      sourceFile: symbol.file,
+      diffText: symbolDiff || "",
+      repositoryRoot,
+      notes: [
+        `Symbol ${symbol.changeType}`,
+        `Checking coverage across ${allCandidatesForSymbol.length} related test file(s)`,
+      ],
+    };
+
+    if (allCandidatesForSymbol.length > 0) {
+      // List all related test files for reference
+      input.existingTestFile = allCandidatesForSymbol.map((c: any) => c.testFile).join(" | ");
+
+      // Merge added test lines from ALL related test files
+      const allAddedTestLines: string[] = [];
+      for (const candidate of allCandidatesForSymbol) {
+        const addedTestLines = extractAddedTestLinesForFile(rawDiff, candidate.testFile);
+        if (addedTestLines) {
+          allAddedTestLines.push(addedTestLines);
+        }
+      }
+
+      const addedTestLinesStr = allAddedTestLines.join("\n\n// ===== Added in next file =====\n\n");
+
+      // Combine existing + newly added test code
+      const combinedTestCode = allTestCode
+        ? addedTestLinesStr
+          ? `${allTestCode}\n\n// ===== Added in this commit =====\n\n${addedTestLinesStr}`
+          : allTestCode
+        : addedTestLinesStr;
+
+      if (combinedTestCode) {
+        console.log(
+          `[GapAnalysisBuilder] Combined test code for "${symbol.name}": ${combinedTestCode.length} chars ` +
+            `(from ${allCandidatesForSymbol.length} file(s))`
+        );
+        input.existingTestCode = combinedTestCode;
       }
     }
 
     return input;
   });
 }
-
-
-// ======================================================
-// ENHANCEMENT: Generate testable assertions from gaps
-// ======================================================
-
-/**
- * Generate a clear, actionable assertion description for a fallback behavior gap.
- * This describes WHAT the test should verify in plain English.
- * Format: "When X, assert that Y happens"
- */
-export function generateTestableAssertion(
-  symbolName: string,
-  behavior: ChangedBehavior,
-  condition: string,
-  behaviorDescription?: string
-): string {
-  if (behaviorDescription) {
-    return `Assert that: ${behaviorDescription}`;
-  }
-  
-  // Fallback descriptions based on condition
-  if (condition.includes("nullish")) {
-    return `Assert that: ${symbolName} correctly uses fallback when value is nullish`;
-  }
-  if (condition.includes("falsy")) {
-    return `Assert that: ${symbolName} correctly uses fallback when value is falsy`;
-  }
-  return `Assert that: ${symbolName} correctly implements ${truncate(behavior.label, 50)}`;
-}
-
-/**
- * Generate a testable assertion for lexical behavior gaps.
- * These are more general behavioral descriptions.
- */
-export function generateLexicalTestableAssertion(symbolName: string, behavior: ChangedBehavior): string {
-  switch (behavior.kind) {
-    case "branch":
-      return `Assert that: ${symbolName} handles all conditional branches correctly`;
-    case "loop":
-      return `Assert that: ${symbolName} correctly iterates over collections`;
-    case "error-handling":
-      return `Assert that: ${symbolName} properly catches and handles errors`;
-    case "return":
-      return `Assert that: ${symbolName} returns the correct value`;
-    case "param":
-      return `Assert that: ${symbolName} correctly uses all required parameters`;
-    default:
-      return `Assert that: ${symbolName} implements ${truncate(behavior.label, 50)}`;
-  }
-}
-
-/**
- * Convert a CoverageGap to a format optimized for test generation.
- * Ensures testable assertions are included.
- */
-export interface TestableGap {
-  symbol: string;
-  kind: BehaviorKind;
-  condition: string;
-  assertion: string;
-  evidence: string;
-  sourceFile: string;
-}
-
-export function gapToTestableFormat(gap: CoverageGap, symbol: string, sourceFile: string): TestableGap {
-  return {
-    symbol,
-    kind: gap.kind,
-    condition: gap.condition,
-    assertion: gap.testableAssertion || gap.label,
-    evidence: gap.evidence,
-    sourceFile,
-  };
-}
-
-
-// ======================================================
-// SYMBOL-SPECIFIC DIFF EXTRACTION
-// ======================================================
-
-/**
- * Extract only the relevant diff section for a specific symbol.
- * Returns the changed function/method/declaration with surrounding context,
- * not just isolated added lines.
- *
- * Strategy:
- * 1. Find all "@@" hunk headers (these mark sections of the diff)
- * 2. For each hunk, check if it contains changes related to this symbol
- * 3. Return only the hunks that affect this symbol
- * 4. Include surrounding context lines (unchanged lines near the changes)
- *
- * This ensures the analyzer sees:
- *   function isAtomStateInitialized(atomState) {
- *     const key = ...
- * -   const value = atomState[key]
- * +   const value = atomState[key] ?? defaultValue
- *     return !!value
- *   }
- *
- * NOT just:
- * +   const value = atomState[key] ?? defaultValue
- */
-export function extractSymbolDiff(diffText: string, symbolName: string): string {
-  if (!diffText || diffText.trim().length === 0) {
-    return "";
-  }
-
-  // Split by hunk headers (@@  -START,COUNT +START,COUNT @@)
-  const hunkRegex = /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/m;
-  const hunks = diffText.split(hunkRegex).slice(1); // skip text before first hunk
-
-  if (hunks.length === 0) {
-    // No hunks found, return original (might be a unified diff without hunk markers)
-    return diffText;
-  }
-
-  const relevantHunks: string[] = [];
-
-  for (const hunk of hunks) {
-    // Check if this hunk mentions the symbol name
-    // Look for:
-    // - function/const/class declarations: "function symbolName" or "const symbolName ="
-    // - method names: ".symbolName" or " symbolName("
-    // - variable/property usage: " symbolName"
-    const symbolDeclRegex = new RegExp(
-      `\\b(?:function|const|let|var|class|async)\\s+${escapeRegex(symbolName)}\\b` +  // declaration
-      `|\\b${escapeRegex(symbolName)}\\s*[=(\\{]` +                                      // assignment or call
-      `|\\w\\.${escapeRegex(symbolName)}\\b` +                                           // method call
-      `|\\s${escapeRegex(symbolName)}\\b`,                                               // standalone usage
-      'g'
-    );
-
-    if (symbolDeclRegex.test(hunk)) {
-      relevantHunks.push(hunk);
-    }
-  }
-
-  // If no hunks match the symbol, return empty (symbol not in this diff)
-  if (relevantHunks.length === 0) {
-    return "";
-  }
-
-  // Reconstruct the diff hunks
-  const result = relevantHunks
-    .map((hunk) => {
-      // Trim leading/trailing whitespace but preserve the content structure
-      const trimmed = hunk.trim();
-      return trimmed;
-    })
-    .join("\n\n");
-
-  return result;
-}
+*/
