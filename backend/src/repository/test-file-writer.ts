@@ -649,6 +649,30 @@ export interface MergeResult {
   originalContent: string | null;
 }
 
+/**
+ * Helper function to check if an import statement already exists in the file.
+ * Compares normalized versions to handle whitespace variations.
+ */
+function existingImportMatches(
+  existingContent: string | null,
+  importStatement: string
+): boolean {
+  if (!existingContent) {
+    return false;
+  }
+
+  const normalize = (value: string) =>
+    value.replace(/\s+/g, " ").replace(/;\s*$/, "").trim();
+
+  const target = normalize(importStatement);
+  const existingImports =
+    existingContent.match(
+      /^\s*import\s+.+?\s+from\s+["'][^"']+["'];?\s*$/gm
+    ) || [];
+
+  return existingImports.some((existing) => normalize(existing) === target);
+}
+
 export function mergeGeneratedTests(
   repositoryRoot: string,
   testFile: string,
@@ -660,6 +684,21 @@ export function mergeGeneratedTests(
   console.log("[Test-File-Writer] MERGE CALLED - isNewFile:", isNewFile, "testFile:", testFile);
   const testFileAbsolute = path.resolve(repositoryRoot, testFile);
 
+  // ============================================================
+  // 0. Read existing test file (if it exists) for deduplication checks
+  // ============================================================
+  let existingTestContent: string | null = null;
+  if (fs.existsSync(testFileAbsolute)) {
+    try {
+      existingTestContent = fs.readFileSync(testFileAbsolute, "utf8");
+    } catch {
+      existingTestContent = null;
+    }
+  }
+
+  // ============================================================
+  // 1. Clean all generated test code
+  // ============================================================
   const cleanedTests = generatedTests.map((t) => ({
     ...t,
     testCode: cleanGeneratedTestCode(t.testCode, testFile),
@@ -667,6 +706,9 @@ export function mergeGeneratedTests(
 
   console.log("[Test-File-Writer] MERGE: Cleaned", generatedTests.length, "test(s), testFile parameter:", testFile);
 
+  // ============================================================
+  // 2. Detect Prisma import style from source file
+  // ============================================================
   const sourceFileAbsolute = path.isAbsolute(sourceFile)
     ? sourceFile
     : path.resolve(repositoryRoot, sourceFile);
@@ -682,13 +724,17 @@ export function mergeGeneratedTests(
     ? detectPrismaImportStyleFromSource(sourceFileContent)
     : null;
 
+  // ============================================================
+  // 3. Initialize import and mock collections
+  // ============================================================
   const allImports = new Set<string>();
   const allMocks: string[] = [];
 
+  // ============================================================
+  // 4. Extract imports and mocks from generated tests
+  // ============================================================
   for (const t of cleanedTests) {
-    let code = t.testCode;
-
-    const lines = code.split("\n");
+    const lines = t.testCode.split("\n");
     const mockLines: string[] = [];
     let i = 0;
 
@@ -697,6 +743,9 @@ export function mergeGeneratedTests(
       const trimmed = line?.trim() ?? "";
 
       if (trimmed.startsWith("vi.mock(")) {
+        // ====================================================
+        // Extract multi-line mock statement
+        // ====================================================
         let mockCode = line || "";
         let depth = 0;
         let bracketDepth = 0;
@@ -734,6 +783,9 @@ export function mergeGeneratedTests(
         mockLines.push(mockCode);
         i++;
       } else if (trimmed.startsWith("import ")) {
+        // ====================================================
+        // Extract import statement
+        // ====================================================
         const normalizedImport = trimmed.endsWith(';') ? trimmed : trimmed + ';';
         allImports.add(normalizedImport);
         i++;
@@ -744,21 +796,31 @@ export function mergeGeneratedTests(
       }
     }
 
+    // Add collected mocks to global collection
     for (const mock of mockLines) {
       allMocks.push(mock);
     }
   }
 
-  // Belt-and-suspenders: sanitize allMocks again here (cleanGeneratedTestCode
+  // ============================================================
+  // 5. Sanitize Prisma enum mocks from all collected mocks
+  // ============================================================
+  // Belt-and-suspenders: sanitize allMocks here (cleanGeneratedTestCode
   // already ran the sanitizer per-test, but this second pass guarantees
   // safety regardless of how allMocks was assembled).
   for (let m = 0; m < allMocks.length; m++) {
     const { code: sanitized, rewrittenCount } = sanitizeProblemPrismaEnumMocks(allMocks[m]!);
     if (rewrittenCount > 0) {
       allMocks[m] = sanitized;
+      console.log(
+        `[Test-File-Writer] ✓ Sanitized Prisma enum mock (rewritten: ${rewrittenCount})`
+      );
     }
   }
 
+  // ============================================================
+  // 6. Filter test framework imports (CRITICAL safety layer)
+  // ============================================================
   // CRITICAL: Filter out test framework imports from generated code.
   // These are always provided by the test file and should NEVER be re-imported.
   // This is a critical safety net to prevent duplicate imports that break the merge.
@@ -789,19 +851,27 @@ export function mergeGeneratedTests(
   for (const imp of allImports) {
     if (TEST_FRAMEWORK_IMPORTS.has(imp)) {
       removedFrameworkImports++;
-      console.log(`[Test-File-Writer] ⚠️ Filtered out test framework import (already provided): ${imp}`);
+      console.log(
+        `[Test-File-Writer] ⚠️ Filtered out test framework import (already provided): ${imp}`
+      );
     } else {
       filteredImports.add(imp);
     }
   }
-  
+
   if (removedFrameworkImports > 0) {
-    console.log(`[Test-File-Writer] ✓ Removed ${removedFrameworkImports} duplicate test framework import(s)`);
+    console.log(
+      `[Test-File-Writer] ✓ Removed ${removedFrameworkImports} duplicate test framework import(s)`
+    );
   }
+  // ============================================================
+  // 7. Auto-detect and inject missing imports
+  // ============================================================
   try {
     for (const t of cleanedTests) {
       const code = t.testCode;
 
+      // Define all symbols that can be auto-imported with their statements
       const symbolImportMap = new Map<string, string>([
         ['React', "import React from 'react';"],
         ['StrictMode', "import { StrictMode } from 'react';"],
@@ -831,6 +901,7 @@ export function mergeGeneratedTests(
         // They are handled separately by the TEST_FRAMEWORK_IMPORTS filter above.
       ]);
 
+      // For each symbol, check if it's used in the test code
       for (const [symbol, importStatement] of symbolImportMap) {
         const symbolPatterns = [
           new RegExp(`\\b${symbol}\\s*\\(`),
@@ -849,18 +920,35 @@ export function mergeGeneratedTests(
 
         const isUsed = symbolPatterns.some(pattern => pattern.test(code));
 
-        if (isUsed && !filteredImports.has(importStatement)) {
+        if (
+          isUsed &&
+          !filteredImports.has(importStatement) &&
+          !existingImportMatches(existingTestContent, importStatement)
+        ) {
           filteredImports.add(importStatement);
-          console.log(`[Test-File-Writer] Auto-added missing import for ${symbol}`);
+          console.log(
+            `[Test-File-Writer] ✓ Auto-added missing import for ${symbol}`
+          );
+        } else if (
+          isUsed &&
+          existingImportMatches(existingTestContent, importStatement)
+        ) {
+          console.log(
+            `[Test-File-Writer] ✓ Existing import already present for ${symbol}: ${importStatement}`
+          );
         }
       }
 
-      // prisma-specific auto-import (varies by export style, so it isn't
-      // in the generic map above).
+      // ========================================================
+      // Prisma-specific auto-import (varies by export style)
+      // ========================================================
       const referencesPrisma = /\bprisma\s*\./.test(code);
-      const alreadyHasPrismaImport = Array.from(filteredImports).some((imp) =>
-        /@calcom\/prisma|@prisma\/client/.test(imp)
-      );
+      const alreadyHasPrismaImport =
+        Array.from(filteredImports).some((imp) =>
+          /@calcom\/prisma|@prisma\/client/.test(imp)
+        ) ||
+        (!!existingTestContent &&
+          /@calcom\/prisma|@prisma\/client/.test(existingTestContent));
 
       if (referencesPrisma && !alreadyHasPrismaImport) {
         if (prismaImportStyle) {
@@ -869,13 +957,20 @@ export function mergeGeneratedTests(
               ? `import ${prismaImportStyle.name} from '${prismaImportStyle.source}';`
               : `import { ${prismaImportStyle.name} } from '${prismaImportStyle.source}';`;
           filteredImports.add(stmt);
-          console.log(`[Test-File-Writer] ✓ Auto-added missing prisma import (${prismaImportStyle.style}): ${stmt}`);
+          console.log(
+            `[Test-File-Writer] ✓ Auto-added missing prisma import (${prismaImportStyle.style}): ${stmt}`
+          );
         } else {
           filteredImports.add(`import { prisma } from '@calcom/prisma';`);
-          console.log(`[Test-File-Writer] ⚠️ Auto-added fallback named prisma import — could not detect source import style`);
+          console.log(
+            `[Test-File-Writer] ⚠️ Auto-added fallback named prisma import — could not detect source import style`
+          );
         }
       }
 
+      // ========================================================
+      // Detect function calls and add missing imports
+      // ========================================================
       const functionCallRegex = /\b(\w+)\s*\(/g;
       let funcMatch;
       const localFunctionsAndImports = new Set<string>();
@@ -897,24 +992,108 @@ export function mergeGeneratedTests(
         if (funcName && !localFunctionsAndImports.has(funcName)) {
           if (symbolImportMap.has(funcName)) {
             const importStatement = symbolImportMap.get(funcName);
-            if (importStatement && !filteredImports.has(importStatement)) {
+            if (
+              importStatement &&
+              !filteredImports.has(importStatement) &&
+              !existingImportMatches(existingTestContent, importStatement)
+            ) {
               filteredImports.add(importStatement);
-              console.log(`[Test-File-Writer] Auto-added missing import for function ${funcName}`);
+              console.log(
+                `[Test-File-Writer] ✓ Auto-added missing import for function ${funcName}`
+              );
             }
           }
         }
       }
     }
   } catch (err) {
-    console.log(`[Test-File-Writer] Auto-import safety net skipped: ${err instanceof Error ? err.message : String(err)}`);
+    console.log(
+      `[Test-File-Writer] Auto-import safety net skipped: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
+  // ============================================================
+  // 7b. HELPER FUNCTIONS FOR IMPORT DEDUPLICATION
+  // ============================================================
+  const normalizeImportStatement = (importStatement: string): string => {
+    return importStatement.replace(/\s+/g, " ").replace(/;\s*$/, "").trim();
+  };
+
+  /**
+   * Checks whether a specific symbol is already imported from a module.
+   * Example:
+   *   Existing: import { atom, createStore } from '../../src/vanilla/store'
+   *   Requested: import { createStore } from '../../src/vanilla/store';
+   *   Returns true.
+   */
+  const existingSymbolImportMatches = (
+    existingContent: string | null,
+    symbol: string,
+    modulePath: string
+  ): boolean => {
+    if (!existingContent) {
+      return false;
+    }
+
+    const normalizedModulePath = modulePath
+      .replace(/\\/g, "/")
+      .replace(/["']/g, "")
+      .replace(/;$/, "")
+      .trim();
+
+    const importRegex =
+      /import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']\s*;?/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = importRegex.exec(existingContent)) !== null) {
+      const importClause = match[1]!.trim();
+      const importedModule = match[2]!.replace(/\\/g, "/").trim();
+
+      // Only inspect imports from the target module.
+      if (
+        importedModule !== normalizedModulePath &&
+        !importedModule.endsWith(normalizedModulePath) &&
+        !normalizedModulePath.endsWith(importedModule)
+      ) {
+        continue;
+      }
+
+      // Named import:
+      // import { atom, createStore } from '../../src/vanilla/store'
+      const namedMatch = importClause.match(/\{([\s\S]*?)\}/);
+      if (namedMatch) {
+        const names = namedMatch[1]!
+          .split(",")
+          .map((name) => {
+            const parts = name.trim().split(/\s+as\s+/);
+            return parts[parts.length - 1]!.trim();
+          })
+          .filter(Boolean);
+        if (names.includes(symbol)) {
+          return true;
+        }
+      }
+
+      // Default import:
+      // import createStore from '../../src/vanilla/store'
+      const defaultMatch = importClause.match(/^([A-Za-z_$][\w$]*)/);
+      if (defaultMatch && defaultMatch[1] === symbol) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  // ============================================================
+  // 8. Add target function import
+  // ============================================================
+  let relativeImportPath = "";
   if (targetSymbol && sourceFile) {
     const testDir = path.dirname(testFile);
     const sourceDir = path.dirname(sourceFile);
     const sourceBaseName = path.basename(sourceFile, path.extname(sourceFile));
 
-    let relativeImportPath: string;
     if (testDir === sourceDir) {
       relativeImportPath = `./${sourceBaseName}`;
     } else {
@@ -926,12 +1105,30 @@ export function mergeGeneratedTests(
     }
 
     const targetImportStatement = `import { ${targetSymbol} } from '${relativeImportPath}';`;
-    if (!filteredImports.has(targetImportStatement)) {
+    
+    const targetImportAlreadyExists = (() => {
+      if (!existingTestContent) {
+        return false;
+      }
+      const escapedSymbol = targetSymbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`import\\s*\\{[^}]*\\b${escapedSymbol}\\b[^}]*\\}\\s*from`, "m").test(existingTestContent);
+    })();
+    
+    const targetImportAlreadyInGeneratedImports = Array.from(filteredImports).some((imp) =>
+      normalizeImportStatement(imp) === normalizeImportStatement(targetImportStatement)
+    );
+    
+    if (!targetImportAlreadyExists && !targetImportAlreadyInGeneratedImports) {
       filteredImports.add(targetImportStatement);
       console.log(`[Test-File-Writer] ✓ Added target function import: ${targetImportStatement}`);
+    } else {
+      console.log(`[Test-File-Writer] ✓ Target function import already exists: ${targetSymbol}`);
     }
   }
 
+  // ============================================================
+  // 9. Inject generic Prisma auto-mock (safety net)
+  // ============================================================
   // Generic Prisma auto-mock safety net (does not affect enum mocks —
   // those are handled entirely by sanitizeProblemPrismaEnumMocks above).
   if (prismaImportStyle) {
@@ -945,11 +1142,16 @@ export function mergeGeneratedTests(
       );
       if (genericMock) {
         allMocks.push(genericMock);
-        console.log(`[Test-File-Writer] ✓ Injected generic Prisma auto-mock (safety net): ${genericMock.slice(0, 120)}...`);
+        console.log(
+          `[Test-File-Writer] ✓ Injected generic Prisma auto-mock (safety net): ${genericMock.slice(0, 120)}...`
+        );
       }
     }
   }
 
+  // ============================================================
+  // 10. Build top-level import and mock block
+  // ============================================================
   let topLevelBlock = "";
   if (filteredImports.size > 0) {
     topLevelBlock += Array.from(filteredImports).join("\n") + "\n\n";
@@ -958,6 +1160,9 @@ export function mergeGeneratedTests(
     topLevelBlock += allMocks.join("\n\n") + "\n\n";
   }
 
+  // ============================================================
+  // 11. Deduplicate and validate tests
+  // ============================================================
   const seenTestContent = new Set<string>();
   const uniqueTests = cleanedTests.filter((t) => {
     const normalized = t.testCode
@@ -1003,6 +1208,9 @@ export function mergeGeneratedTests(
     return true;
   });
 
+  // ============================================================
+  // 12. Build final test body (strip imports/mocks from body)
+  // ============================================================
   const generatedBlock = uniqueTests
     .map((t) => {
       const lines = t.testCode.split("\n");
@@ -1014,6 +1222,9 @@ export function mergeGeneratedTests(
         const trimmed = line?.trim() ?? "";
 
         if (trimmed.startsWith("vi.mock(")) {
+          // ====================================================
+          // Skip multi-line mock statements in test body
+          // ====================================================
           let depth = 0;
           let bracketDepth = 0;
           let foundEnd = false;
@@ -1045,6 +1256,9 @@ export function mergeGeneratedTests(
           }
           i++;
         } else if (trimmed.startsWith("import ")) {
+          // ====================================================
+          // Skip import statements in test body
+          // ====================================================
           i++;
         } else if (trimmed.length > 0) {
           testOnlyLines.push(line || "");
@@ -1061,13 +1275,23 @@ export function mergeGeneratedTests(
     })
     .join("\n");
 
+  // ============================================================
+  // 13. Report test validation results
+  // ============================================================
   const rejectedCount = cleanedTests.length - uniqueTests.length;
   if (rejectedCount > 0) {
-    console.log(`[Test-File-Writer] ℹ️ REJECTION SUMMARY: ${rejectedCount} test(s) rejected during validation, ${uniqueTests.length} test(s) accepted`);
+    console.log(
+      `[Test-File-Writer] ℹ️ REJECTION SUMMARY: ${rejectedCount} test(s) rejected during validation, ${uniqueTests.length} test(s) accepted`
+    );
   }
 
+  // ============================================================
+  // 14. Early exit if no valid tests
+  // ============================================================
   if (uniqueTests.length === 0) {
-    console.log(`[Test-File-Writer] ⚠️ ALL TESTS REJECTED: No valid tests to write. Skipping merge.`);
+    console.log(
+      `[Test-File-Writer] ⚠️ ALL TESTS REJECTED: No valid tests to write. Skipping merge.`
+    );
     return {
       testFileAbsolute: path.resolve(repositoryRoot, testFile),
       finalContent: "",
@@ -1075,6 +1299,9 @@ export function mergeGeneratedTests(
     };
   }
 
+  // ============================================================
+  // 15. Handle new file creation
+  // ============================================================
   if (isNewFile || !fs.existsSync(testFileAbsolute)) {
     const relativeImport = toRelativeImportSpecifier(
       testFileAbsolute,
@@ -1085,9 +1312,10 @@ export function mergeGeneratedTests(
       .replace(/\.(ts|tsx|js|jsx)$/, "");
 
     console.log(
-      `[Test-File-Writer] Creating new test file with import: ${relativeImport} (from ${testFileAbsolute} to ${sourceFileAbsolute})`
+      `[Test-File-Writer] ✓ Creating new test file with import: ${relativeImport} (from ${testFileAbsolute} to ${sourceFileAbsolute})`
     );
 
+    // Build test file scaffold with imports, mocks, and describe block
     const scaffold =
       topLevelBlock +
       `import * as ${toIdentifier(symbolBase)} from "${relativeImport}";\n\n` +
@@ -1097,12 +1325,15 @@ export function mergeGeneratedTests(
     fs.writeFileSync(testFileAbsolute, scaffold, "utf8");
 
     console.log(
-      `[Test-File-Writer] Created new test file: ${testFileAbsolute}`
+      `[Test-File-Writer] ✓ Successfully created new test file: ${testFileAbsolute}`
     );
 
     return { testFileAbsolute, finalContent: scaffold, originalContent: null };
   }
 
+  // ============================================================
+  // 16. Handle existing file merge
+  // ============================================================
   // Read the existing file, then IMMEDIATELY heal any unsafe prisma-enum
   // mock that may have been merged in during an earlier round. This is
   // what fixes files that are already poisoned on disk, not just newly
@@ -1118,6 +1349,9 @@ export function mergeGeneratedTests(
     );
   }
 
+  // ============================================================
+  // 17. Merge imports into existing file
+  // ============================================================
   let finalContent: string;
   if (topLevelBlock.trim().length > 0 || filteredImports.size > 0 || allMocks.length > 0) {
     const existingImportsRaw = originalContent.match(/^import .+$/gm) || [];
@@ -1125,10 +1359,31 @@ export function mergeGeneratedTests(
       existingImportsRaw.map((imp) => (imp.trim().endsWith(';') ? imp.trim() : imp.trim() + ';'))
     );
 
-    const newImports = Array.from(filteredImports).filter(
-      (imp) => !existingImports.has(imp)
-    );
+    const newImports = Array.from(filteredImports).filter((imp) => {
+      if (existingImports.has(imp)) {
+        return false;
+      }
 
+      // Prevent duplicate target-symbol imports even when
+      // the existing import combines multiple named imports.
+      if (
+        targetSymbol &&
+        existingSymbolImportMatches(originalContent, targetSymbol, relativeImportPath)
+      ) {
+        const normalizedTargetImport = normalizeImportStatement(
+          `import { ${targetSymbol} } from '${relativeImportPath}';`
+        );
+        if (normalizeImportStatement(imp) === normalizedTargetImport) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+
+    // ========================================================
+    // Filter mocks that aren't already in the file
+    // ========================================================
     const newMocks = allMocks.filter((mock) => {
       const sourceMatch = mock.match(/vi\.mock\(\s*['"]([^'"]+)['"]/);
       if (!sourceMatch) return true;
@@ -1168,6 +1423,9 @@ export function mergeGeneratedTests(
     finalContent = originalContent;
   }
 
+  // ============================================================
+  // 18. Append generated tests to file
+  // ============================================================
   const insertionIdxForTests = findOuterBlockInsertionPoint(finalContent);
   if (insertionIdxForTests === -1) {
     finalContent = `${finalContent}\n${generatedBlock}\n`;
@@ -1180,10 +1438,16 @@ export function mergeGeneratedTests(
       finalContent.slice(insertionIdxForTests);
   }
 
+  // ============================================================
+  // 19. Write merged file to disk
+  // ============================================================
   fs.writeFileSync(testFileAbsolute, finalContent, "utf8");
 
   console.log(
-    `[Test-File-Writer] Extended existing test file with ${generatedTests.length} test(s): ${testFileAbsolute}`
+    `[Test-File-Writer] ✓ Successfully merged generated tests into ${testFileAbsolute}`
+  );
+  console.log(
+    `[Test-File-Writer] ✓ Added ${uniqueTests.length} test(s) from ${generatedTests.length} generated test(s)`
   );
 
   // originalContent returned here is the HEALED version (post-sanitize),

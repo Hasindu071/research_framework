@@ -202,7 +202,8 @@ function generateRichGeneratedTestMetadata(
  */
 export async function analyzeAndTestCommit(
   repositoryPath: string,
-  commitHash: string
+  commitHash: string,
+  testCommand?: string
 ): Promise<any> {
   const git = simpleGit(repositoryPath);
 
@@ -371,6 +372,7 @@ export async function analyzeAndTestCommit(
     if (enrichedPrioritizedInputs.length > 0) {
       prioritizedExecution = await runPrioritizedTests(enrichedPrioritizedInputs, {
         repositoryRoot: repositoryPath,
+        ...(testCommand && { testCommand }), // Include testCommand only if provided
         stopOnFailure: false,
         timeoutMs: 120_000,
         keepGeneratedTests: false,
@@ -427,6 +429,7 @@ export async function analyzeAndTestCommit(
     if (enrichedGeneratedInputs.length > 0) {
       generatedExecution = await runPrioritizedTests(enrichedGeneratedInputs, {
         repositoryRoot: repositoryPath,
+        ...(testCommand && { testCommand }), // Include testCommand only if provided
         stopOnFailure: false,
         timeoutMs: 120_000,
         keepGeneratedTests: false,  // Don't keep in repo — save to MongoDB instead

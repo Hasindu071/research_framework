@@ -809,6 +809,39 @@ expect(result).toBe(...);
 `);
 
   // ====================================================
+  // EXTRACT VERIFIED IDENTIFIERS FROM SOURCE
+  // ====================================================
+  
+  // Extract all function/method names from the changed code to provide verified identifiers
+  const verifiedIdentifiersRegex = /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?:\(|\.|\s*:)/g;
+  const verifiedIdentifiers = new Set<string>();
+  let match;
+  while ((match = verifiedIdentifiersRegex.exec(target.changedCode)) !== null) {
+    const identifier = match[1];
+    if (identifier && !['function', 'const', 'let', 'var', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default', 'break', 'continue', 'throw', 'try', 'catch', 'finally', 'import', 'export', 'class', 'interface', 'type', 'enum', 'namespace', 'async', 'await', 'new', 'this', 'super', 'static', 'private', 'protected', 'public', 'readonly', 'abstract'].includes(identifier)) {
+      verifiedIdentifiers.add(identifier);
+    }
+  }
+
+  // Also extract from source file content if available
+  if (target.sourceFileContent) {
+    const sourceIdentifiersRegex = /\b(dev_[a-zA-Z_$][a-zA-Z0-9_$]*|get[A-Z]\w*|set[A-Z]\w*)\s*(?:\(|:)/g;
+    let sourceMatch;
+    while ((sourceMatch = sourceIdentifiersRegex.exec(target.sourceFileContent)) !== null) {
+      const identifier = sourceMatch[1];
+      if (identifier) {
+        verifiedIdentifiers.add(identifier);
+      }
+    }
+  }
+
+  const verifiedIdentifiersList = Array.from(verifiedIdentifiers)
+    .filter(id => id.match(/^[a-z]/)) // Prefer lowercase identifiers
+    .slice(0, 20) // Limit to 20 items
+    .map(id => `- \`${id}\``)
+    .join('\n');
+
+  // ====================================================
   // PRODUCTION SYMBOL LOCATION
   // ====================================================
 
@@ -830,20 +863,106 @@ This path is provided only as context so you understand where the production sym
 DO NOT generate an import statement.
 
 The existing test file already handles imports.
+`);
 
+  // ====================================================
+  // CRITICAL API ACCURACY RULES
+  // ====================================================
+
+  sections.push(`
+## CRITICAL API ACCURACY RULES
+
+1. You MUST use only functions, methods, properties, variables,
+   types, and APIs that actually appear in the provided source code,
+   diff, or existing test code.
+
+2. NEVER invent an API name.
+
+3. NEVER modify an existing API name by adding prefixes, suffixes,
+   version numbers, or arbitrary text.
+
+4. If the source code contains:
+   \`dev_get_atom_state\`
+   
+   you MUST use:
+   \`dev_get_atom_state\`
+   
+   You MUST NOT generate:
+   \`dev3_get_atom_state\`
+   \`dev_rev3_get_atom_state\`
+   \`dev_get_atom_state_rev3\`
+   \`dev_get_atom_state35\`
+
+5. Treat identifiers in the source code as exact identifiers.
+   Copy them exactly.
+
+6. Before generating each test, verify that every function or
+   property used by the test exists in the provided source code
+   or existing test code.
+
+7. Do not infer an API merely from a variable name, commit message,
+   diff description, or version/revision label.
+
+8. If an API cannot be verified from the provided evidence,
+   do not use it in the generated test.
+`);
+
+  // ====================================================
+  // VERIFIED SOURCE IDENTIFIERS
+  // ====================================================
+
+  if (verifiedIdentifiersList.length > 0) {
+    sections.push(`
+## VERIFIED SOURCE IDENTIFIERS
+
+The following identifiers were extracted directly from the
+repository and are verified to exist:
+
+${verifiedIdentifiersList}
+
+RULE:
+
+Use these identifiers exactly as written.
+
+Do NOT rename them.
+
+Do NOT add revision numbers.
+
+Do NOT create alternative names.
+
+Do NOT use camelCase variations if the source uses snake_case.
+
+Do NOT use snake_case variations if the source uses camelCase.
+
+Example:
+
+If source has: \`dev_get_atom_state()\`
+Use: \`dev_get_atom_state()\`
+
+❌ WRONG: \`dev3_get_atom_state()\`
+❌ WRONG: \`devGetAtomState()\`
+❌ WRONG: \`getAtomState()\`
+`);
+  }
+
+  // ====================================================
+  // KNOWN API METHODS - MORE SPECIFIC
+  // ====================================================
+
+  sections.push(`
 ## Known API Methods in Production
 
-These are the actual APIs available in the production code. Use EXACTLY these names:
+Based on the source code analysis:
 
-- \`dev_subscribe_store(listener, 2)\` - NOT "dev3_subscribe_store"
+${verifiedIdentifiersList.length > 0 
+  ? verifiedIdentifiersList 
+  : `- \`dev_subscribe_store(listener, 2)\` - NOT "dev3_subscribe_store"
 - \`dev_get_mounted_atoms()\` - NOT "devGetMountedAtoms" or "dev_get_atoms"  
-- \`dev_get_atom_state(atom)\` - NOT "getAtomState"
+- \`dev_get_atom_state(atom)\` - NOT "getAtomState"`}
 
-If the production code uses different APIs, verify them in the source before using.
+Do NOT invent API names.
 
-DO NOT invent API names.
-
-DO NOT use variations like:
+Do NOT use variations like:
 - ❌ dev3_subscribe_store
 - ❌ devGetMountedAtoms
 - ❌ dev_get_atoms

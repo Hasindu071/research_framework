@@ -135,6 +135,14 @@ export interface TestExecutionResult {
 export interface TestRunnerOptions {
   repositoryRoot: string;
   /**
+   * Optional: The test command to use (e.g., "pnpm run test").
+   * If provided, this will be used directly for baseline and prioritized tests
+   * instead of auto-detecting the framework.
+   * For prioritized tests, the test file is appended to this command.
+   * Example: "pnpm run test" -> "pnpm run test path/to/test.ts"
+   */
+  testCommand?: string;
+  /**
    * Mode B: stop the run as soon as a test doesn't pass.
    * Default: false (Mode A — run every prioritized test, per the
    * design doc's "you need complete results for evaluation").
@@ -459,6 +467,76 @@ async function runGeneratedTest(
 
     console.log(`[Test-Writer] ✓ Test successfully written to ${generated.testFile}`);
 
+    // ======================================================
+    // IF CUSTOM TEST COMMAND PROVIDED, USE IT DIRECTLY
+    // ======================================================
+    if (options.testCommand) {
+      console.log(`[test-runner] Using custom test command for generated test`);
+      const testFileAbs = merge.testFileAbsolute;
+      const testPathRelativeToRoot = path.relative(
+        options.repositoryRoot,
+        testFileAbs
+      );
+      
+      const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      const fullCommand = `${options.testCommand} ${testPathRelativeToRoot}`;
+      
+      console.log(`[test-runner] Executing: ${fullCommand}`);
+      
+      // Parse the command to get the executable and args
+      const cmdParts = options.testCommand.split(/\s+/);
+      const executable = cmdParts[0]!;
+      const baseArgs = cmdParts.slice(1);
+      const args = [...baseArgs, testPathRelativeToRoot];
+      
+      const result = await spawnTestProcess(
+        executable,
+        args,
+        options.repositoryRoot,
+        timeoutMs
+      );
+      
+      const executionResult = buildExecutionResult(result, fullCommand, {
+        framework: null,
+        packageManager: "unknown",
+        workspaceDir: options.repositoryRoot,
+        workspaceRelative: ".",
+        configFile: null,
+        testPathRelativeToWorkspace: testPathRelativeToRoot,
+        confidence: 1.0,
+        evidence: ["Using custom test command from user"],
+        configVerified: false,
+        configIsWorkspace: false,
+        testScripts: [],
+      }, timeoutMs);
+
+      // Keep generated tests if:
+      // 1. They passed
+      // 2. They errored (environment issue, not test failure) — allows debugging
+      // 3. keepGeneratedTests option is set
+      const keep = executionResult.status === "passed" || executionResult.status === "error" || !!options.keepGeneratedTests;
+
+      if (!keep) {
+        console.log(
+          `[Test-Writer] Reverting "${generated.testName}" — test did not pass and keepGeneratedTests is false`
+        );
+        revertMerge(merge);
+      }
+
+      return {
+        ...executionResult,
+        testFile: generated.testFile,
+        priority: generated.priority,
+        generated: true,
+        generatedTestName: generated.testName,
+        keptInTestFile: keep,
+      } as TestExecutionResult;
+    }
+
+    // ======================================================
+    // FRAMEWORK DETECTION (fallback if no testCommand provided)
+    // ======================================================
+
     const resolution = resolveFrameworkForMergedFile(generated, options);
 
     if (!resolution.framework) {
@@ -652,6 +730,63 @@ async function runExistingTest(
     };
   }
 
+  // ======================================================
+  // CUSTOM TEST COMMAND SUPPORT
+  // ======================================================
+  // If testCommand is provided, use it directly without framework detection
+  if (options.testCommand) {
+    const testPathRelativeToRoot = path.relative(
+      options.repositoryRoot,
+      testFileAbs
+    );
+    
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    
+    // Build command: append the test file to the provided command
+    // E.g., "pnpm run test" -> "pnpm run test tests/vanilla/store.test.tsx"
+    const fullCommand = `${options.testCommand} ${testPathRelativeToRoot}`;
+    
+    console.log(`[test-runner] Using custom test command for existing test: ${fullCommand}`);
+    console.log(`[test-runner] Executing in: ${options.repositoryRoot}`);
+    
+    // Parse the command to get the executable and args
+    const cmdParts = options.testCommand.split(/\s+/);
+    const executable = cmdParts[0]!;
+    const baseArgs = cmdParts.slice(1);
+    const args = [...baseArgs, testPathRelativeToRoot];
+    
+    const result = await spawnTestProcess(
+      executable,
+      args,
+      options.repositoryRoot,
+      timeoutMs
+    );
+    
+    const executionPartial = buildExecutionResult(result, fullCommand, {
+      framework: null,
+      packageManager: "unknown",
+      workspaceDir: options.repositoryRoot,
+      workspaceRelative: ".",
+      configFile: null,
+      testPathRelativeToWorkspace: testPathRelativeToRoot,
+      confidence: 1.0,
+      evidence: ["Using custom test command from user"],
+      configVerified: false,
+      configIsWorkspace: false,
+      testScripts: [],
+    }, timeoutMs);
+
+    return {
+      ...executionPartial,
+      testFile: test.testFile,
+      priority: test.priority,
+    } as TestExecutionResult;
+  }
+
+  // ======================================================
+  // FRAMEWORK DETECTION (fallback if no testCommand provided)
+  // ======================================================
+  
   // If we have mapped context, use it directly without invoking the legacy resolver
   if (test.context) {
     if (!test.context.framework) {
@@ -1021,6 +1156,45 @@ async function executeTestFile(
     };
   }
 
+  // ======================================================
+  // CUSTOM TEST COMMAND SUPPORT
+  // ======================================================
+  // If testCommand is provided, use it directly instead of framework detection
+  if (options.testCommand) {
+    const testPathRelativeToWorkspace = path.relative(
+      resolution.workspaceDir,
+      testFilePath
+    );
+    
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    
+    // Build command: append the test file to the provided command
+    // E.g., "pnpm run test" -> "pnpm run test path/to/test.ts"
+    const fullCommand = `${options.testCommand} ${testPathRelativeToWorkspace}`;
+    
+    console.log(`[test-runner] Using custom test command: ${fullCommand}`);
+    console.log(`[test-runner] Executing in: ${resolution.workspaceDir}`);
+    
+    // Parse the command to get the executable and args
+    const cmdParts = options.testCommand.split(/\s+/);
+    const executable = cmdParts[0]!; // Non-null assertion (we know testCommand is not empty)
+    const baseArgs = cmdParts.slice(1);
+    const args = [...baseArgs, testPathRelativeToWorkspace];
+    
+    const result = await spawnTestProcess(
+      executable,
+      args,
+      resolution.workspaceDir,
+      timeoutMs
+    );
+    
+    return buildExecutionResult(result, fullCommand, resolution, timeoutMs);
+  }
+
+  // ======================================================
+  // FRAMEWORK DETECTION (fallback if no testCommand provided)
+  // ======================================================
+  
   // Convert absolute testFilePath to workspace-relative path
   let testPathRelativeToWorkspace = path.relative(
     resolution.workspaceDir,

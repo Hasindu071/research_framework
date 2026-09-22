@@ -161,7 +161,7 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
   try {
     await initializeMongoDB();
 
-    const { repositoryPath, commitHash, repoName } = req.body;
+    const { repositoryPath, commitHash, repoName, testCommand } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
@@ -175,12 +175,19 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
       });
     }
 
+    if (!testCommand) {
+      return res.status(400).json({
+        error: "testCommand is required (e.g., 'pnpm run test' or 'npm test')",
+      });
+    }
+
     console.log("======================================");
     console.log(`Starting analysis for commit: ${commitHash}`);
+    console.log(`Test command: ${testCommand}`);
     console.log("======================================");
 
-    // Use the pipeline as the single source of truth
-    const finalResponse = await analyzeAndTestCommit(repositoryPath, commitHash);
+    // Use the pipeline as the single source of truth, pass testCommand
+    const finalResponse = await analyzeAndTestCommit(repositoryPath, commitHash, testCommand);
 
     // Save everything to MongoDB (including enriched generated test metadata)
     console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
@@ -372,7 +379,7 @@ app.post("/api/run-generated-tests", async (req, res) => {
   try {
     await initializeMongoDB();
 
-    const { repositoryPath, generatedTests, repoName } = req.body;
+    const { repositoryPath, generatedTests, repoName, testCommand } = req.body;
 
     if (!repositoryPath || !generatedTests || !Array.isArray(generatedTests)) {
       return res.status(400).json({
@@ -386,7 +393,13 @@ app.post("/api/run-generated-tests", async (req, res) => {
       });
     }
 
-    console.log(`[Test Execution] Running ${generatedTests.length} generated test(s)...`);
+    if (!testCommand) {
+      return res.status(400).json({
+        error: "testCommand is required (e.g., 'pnpm run test' or 'npm test')",
+      });
+    }
+
+    console.log(`[Test Execution] Running ${generatedTests.length} generated test(s) using command: ${testCommand}`);
 
     // Convert to GeneratedTestInput format
     const inputs = generatedTests.map((test: any) => ({
@@ -397,10 +410,11 @@ app.post("/api/run-generated-tests", async (req, res) => {
       targetSymbol: test.targetSymbol || "unknown",
     }));
 
-    // Run the tests with materialization
+    // Run the tests with materialization using the provided testCommand
     // keepGeneratedTests: true so you can inspect the generated files
     const results = await runPrioritizedTests(inputs, {
       repositoryRoot: repositoryPath,
+      testCommand, // Use the provided test command
       stopOnFailure: false,
       timeoutMs: 120_000, // 2 min timeout (accounts for monorepo startup time)
       keepGeneratedTests: true,  // Keep files for inspection
@@ -420,6 +434,7 @@ app.post("/api/run-generated-tests", async (req, res) => {
 
     const finalResponse: any = {
       success: true,
+      testCommand, // Include in response for reference
       testExecution: results.testExecution.map(result => ({
         testFile: result.testFile,
         generatedTestName: result.generatedTestName,
@@ -461,7 +476,7 @@ app.post("/api/analyze-and-run", async (req, res) => {
   try {
     await initializeMongoDB();
 
-    const { repositoryPath, commitHash, repoName } = req.body;
+    const { repositoryPath, commitHash, repoName, testCommand } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
@@ -475,6 +490,12 @@ app.post("/api/analyze-and-run", async (req, res) => {
       });
     }
 
+    if (!testCommand) {
+      return res.status(400).json({
+        error: "testCommand is required (e.g., 'pnpm run test' or 'npm test')",
+      });
+    }
+
     // Step 1: Analyze the commit
     console.log("[Step 1] Analyzing commit...");
     const analysis = await analyzeCommit(repositoryPath, commitHash);
@@ -483,7 +504,7 @@ app.post("/api/analyze-and-run", async (req, res) => {
     console.log("[Step 2] Building LLM context...");
     const llmContext = buildLLMContext(analysis, repositoryPath);
 
-    // Step 3: Send to LLM and get prioritized tests
+    // Step 3: Send to LLM for test prioritization
     console.log("[Step 3] Sending to LLM for test prioritization...");
     let llmResponse = null;
     let llmError = null;
@@ -540,8 +561,8 @@ app.post("/api/analyze-and-run", async (req, res) => {
       });
     }
 
-    // Step 4: Extract tests from LLM response and run them
-    console.log("[Step 4] Running prioritized tests...");
+    // Step 4: Extract tests from LLM response and run them with the provided testCommand
+    console.log(`[Step 4] Running prioritized tests using command: ${testCommand}`);
     const prioritizedTests = (llmResponse as any).testPrioritization?.tests || [];
 
     if (prioritizedTests.length === 0) {
@@ -590,9 +611,10 @@ app.post("/api/analyze-and-run", async (req, res) => {
       repositoryPath
     );
 
-    // Run tests in priority order
+    // Run tests in priority order using the provided testCommand
     const testRunResults = await runPrioritizedTests(enrichedTestInputs, {
       repositoryRoot: repositoryPath,
+      testCommand, // Pass the custom test command
       stopOnFailure: false,
     });
 
