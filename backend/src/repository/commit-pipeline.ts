@@ -8,6 +8,7 @@ import { buildGenerationTargets, generateTests } from "./test-generator.js";
 import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./test-runner.js";
 import { convertCommitResultToDatasetRow } from "./dataset-generator.js";
 import { revertMerge, type MergeResult } from "./test-file-writer.js";
+import { validateTsConfig, formatValidationResult, suggestFixes } from "./ts-config-validator.js";
 import fs from "fs";
 import path from "path";
 
@@ -307,6 +308,32 @@ export async function analyzeAndTestCommit(
   console.log("Full commit pipeline started");
   console.log(`Commit: ${commitHash}`);
   console.log("======================================");
+
+  // ==================================================
+  // 0. Validate TypeScript configuration
+  // ==================================================
+
+  console.log("[Pipeline] Validating TypeScript configuration...");
+  const tsConfigValidation = validateTsConfig(repositoryPath);
+  
+  for (const line of formatValidationResult(tsConfigValidation)) {
+    console.log(line);
+  }
+
+  if (!tsConfigValidation.canProceed) {
+    console.error("[Pipeline] ❌ TypeScript configuration is invalid");
+    console.log("[Pipeline] Suggested fixes:");
+    for (const suggestion of suggestFixes(tsConfigValidation)) {
+      console.log(suggestion);
+    }
+    
+    return {
+      success: false,
+      error: "TypeScript configuration validation failed",
+      details: tsConfigValidation.issues,
+      suggestions: suggestFixes(tsConfigValidation),
+    };
+  }
 
   // ==================================================
   // 1. Save current HEAD state

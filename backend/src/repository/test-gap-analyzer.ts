@@ -682,16 +682,29 @@ function extractLexicalBehaviors(
     }
 
     if (/\breturn\b/.test(trimmed)) {
-      signals.push(
-        generationCandidate(
-          `returns \`${truncate(
-            trimmed.replace(/^return\s*/, ""),
-            40
-          )}\``,
-          "return",
-          trimmed
-        )
-      );
+      // ===================================================
+      // FILTER: Skip returns that reference internal state
+      // ===================================================
+      // Don't create test gaps for returns that involve:
+      // - Direct state property access (.v, .d, .e)
+      // - Internal dev_ APIs that expose state
+      // - Wrapped/proxy object manipulation
+      const isInternalStateReturn = /\.(v|d|e)\b|dev_get_atom_state|wrapped|proxy|toPrimitive|\[INTERNAL\]/i.test(trimmed);
+      
+      if (!isInternalStateReturn) {
+        signals.push(
+          generationCandidate(
+            `returns \`${truncate(
+              trimmed.replace(/^return\s*/, ""),
+              40
+            )}\``,
+            "return",
+            trimmed
+          )
+        );
+      } else {
+        console.log(`[Gap-Analyzer] Skipping internal-state return: ${truncate(trimmed, 50)}`);
+      }
     }
   }
 

@@ -997,7 +997,13 @@ The existing test file already handles imports.
 5. Treat identifiers in the source code as exact identifiers.
    Copy them exactly.
 
-6. Before generating each test, verify that every function or
+6. NEVER access internal properties or private state. Only use public APIs.
+   For example:
+   - NEVER access \`.d\`, \`.v\`, \`.e\` on state objects
+   - NEVER access internal memoization or cache properties
+   - Only use public getter/setter methods or documented APIs
+
+7. Before generating each test, verify that every function or
    property used by the test exists in the provided source code
    or existing test code.
 
@@ -1337,6 +1343,43 @@ addressesGap label:
   // ====================================================
   // OLD SECTION - REPLACED ABOVE
   // ====================================================
+
+  // ====================================================
+  // INTERNAL STATE ACCESS WARNING
+  // ====================================================
+
+  sections.push(`
+## ⚠️ CRITICAL: DO NOT ACCESS INTERNAL STATE PROPERTIES
+
+The following patterns will cause TypeScript compilation errors and test failures:
+
+NEVER access these internal properties on state objects:
+- ❌ state.v (internal value storage)
+- ❌ state.d (internal dependencies)
+- ❌ state.e (internal error storage)
+- ❌ state.dev_* (internal development APIs)
+
+Instead, use only:
+- Public methods and getters
+- Exported public APIs
+- Standard expect() assertions
+
+WRONG - WILL FAIL:
+
+it('accesses internal state', () => {
+  const state = store.get(atom);
+  expect(state.v).toBe(123);  // ❌ Property 'v' doesn't exist on AtomState
+});
+
+RIGHT - USE PUBLIC APIs:
+
+it('gets the atom value', () => {
+  const value = store.get(atom);
+  expect(value).toBe(123);
+});
+
+If you cannot write a test using only public APIs, skip the gap and do not generate a test.
+`);
 
   // ====================================================
   // ASSERTION RULES

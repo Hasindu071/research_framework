@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { TestMatch, TestRelationship } from "./test-analyzer.js";
+import { validateAndRepairTestCode } from "./test-validator.js";
 
 // ======================================================
 // PRISMA IMPORT / MOCK DETECTION
@@ -707,6 +708,34 @@ export function mergeGeneratedTests(
   console.log("[Test-File-Writer] MERGE: Cleaned", generatedTests.length, "test(s), testFile parameter:", testFile);
 
   // ============================================================
+  // 1.5 Validate and repair generated test code
+  // ============================================================
+  const validatedTests = cleanedTests.map((t) => {
+    const testFileAbsolute = path.isAbsolute(testFile)
+      ? testFile
+      : path.resolve(repositoryRoot, testFile);
+    
+    const validation = validateAndRepairTestCode(t.testCode, testFileAbsolute, repositoryRoot);
+    
+    if (!validation.valid && validation.errors.length > 0) {
+      console.log(`[Test-File-Writer] ⚠️ Validation errors found in test: "${t.name}"`);
+      for (const err of validation.errors) {
+        console.log(`  Line ${err.line}, Col ${err.column}: ${err.code} - ${err.message}`);
+      }
+    }
+    
+    if (validation.code !== t.testCode) {
+      console.log(`[Test-File-Writer] ✓ Test code was repaired for: "${t.name}"`);
+    }
+    
+    return {
+      ...t,
+      testCode: validation.code,
+      validationErrors: validation.errors,
+    };
+  });
+
+  // ============================================================
   // 2. Detect Prisma import style from source file
   // ============================================================
   const sourceFileAbsolute = path.isAbsolute(sourceFile)
@@ -733,7 +762,7 @@ export function mergeGeneratedTests(
   // ============================================================
   // 4. Extract imports and mocks from generated tests
   // ============================================================
-  for (const t of cleanedTests) {
+  for (const t of validatedTests) {
     const lines = t.testCode.split("\n");
     const mockLines: string[] = [];
     let i = 0;

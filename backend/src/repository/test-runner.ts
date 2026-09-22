@@ -200,6 +200,9 @@ const CONFIG_ERROR_PATTERNS = [
   /Timed out waiting.*from config\./i, // Playwright webServer or other config timeout
   /Error: Can't resolve config/i,
   /Invalid config/i,
+  /TS5110/i, // TypeScript: module/moduleResolution mismatch
+  /Option 'module' must be set/i, // TypeScript config error
+  /error TS5\d+:/i, // Any TypeScript 5.x config error
 ];
 
 function detectNoTestsExecuted(
@@ -1412,9 +1415,17 @@ function buildExecutionResult(
   if (spawnResult.timedOut) {
     status = "error";
   } else if (detectConfigError(spawnResult.stdout, spawnResult.stderr)) {
-    // Configuration/environment error (e.g., Playwright webServer timeout)
+    // Configuration/environment error (e.g., Playwright webServer timeout, TS config issues)
     status = "error";
-    notes = "Test execution failed due to configuration or environment error — no actual test assertions ran";
+    const combined = `${spawnResult.stdout}\n${spawnResult.stderr}`;
+    
+    if (combined.includes("TS5110") || combined.includes("Option 'module' must be set")) {
+      notes = "TypeScript configuration error: 'module' option must match 'moduleResolution' in tsconfig.json — fix the configuration and retry";
+      console.log("[test-runner] ⚠️ TypeScript config mismatch detected (TS5110)");
+      console.log("[test-runner] Fix: Ensure tsconfig.json has matching 'module' and 'moduleResolution' options");
+    } else {
+      notes = "Test execution failed due to configuration or environment error — no actual test assertions ran";
+    }
   } else if (detectImportOrSetupError(spawnResult.stdout, spawnResult.stderr)) {
     // Test couldn't execute due to import/setup/environment error
     status = "error";
