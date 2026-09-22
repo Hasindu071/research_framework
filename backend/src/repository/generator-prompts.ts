@@ -547,6 +547,94 @@ Make sure:
 - no fake APIs are introduced
 
 ======================================================
+TYPESCRIPT TYPE SAFETY
+======================================================
+
+The generated test MUST compile successfully as TypeScript.
+
+Respect the actual TypeScript types shown in the provided source
+code and existing test file.
+
+If a value has a union type, you MUST narrow the type before
+accessing properties that are not available on every member.
+
+For example, if a result may contain either \`v\` or \`e\`:
+
+CORRECT:
+
+if (result && 'v' in result) {
+  expect(result.v).toBe(expectedValue);
+}
+
+CORRECT:
+
+if (result && 'e' in result) {
+  expect(result.e).toBe(expectedError);
+}
+
+WRONG:
+
+expect(result.v).toBe(expectedValue);
+
+WRONG:
+
+expect(result.e).toBe(expectedError);
+
+Do NOT access a property directly if TypeScript reports that the
+property does not exist on the value's type.
+
+Do NOT invent properties.
+
+Do NOT use arbitrary type casts such as \`as any\` just to bypass
+TypeScript errors.
+
+If the required behavior cannot be tested without violating the
+actual TypeScript types, SKIP that coverage gap.
+
+======================================================
+CONTROL-FLOW AND BEHAVIOR ACCURACY
+======================================================
+
+The coverage gap describes an internal production-code behavior,
+not necessarily the direct action that should be asserted.
+
+Before generating a test, trace the relevant production code
+control flow and determine the exact sequence of inputs, API calls,
+state changes, subscriptions, or events required to reach the
+specified branch.
+
+Do NOT assume that calling an API automatically triggers the
+behavior described by the coverage gap.
+
+For example, if the production code contains:
+
+if (action.type === 'unsub') {...}
+
+DO NOT simply expect an \`unsub\` action to occur.
+
+First determine from the actual source code:
+
+- what creates the \`unsub\` action
+- what API call causes it
+- what state or subscription must exist first
+- what arguments are required
+- what event causes the action to be dispatched
+- what observable behavior proves that the branch was executed
+
+The generated test MUST reproduce the real conditions required to
+reach the target branch.
+
+Do NOT invent an event, callback, action, or state transition.
+
+If the exact control flow required to reach the coverage gap cannot
+be established from the provided source code and existing test file,
+SKIP the gap rather than guessing.
+
+The assertion must verify the actual observable behavior produced by
+the production implementation, not merely the expected internal
+condition.
+
+======================================================
 COVERAGE GAP REQUIREMENT
 ======================================================
 
@@ -562,7 +650,16 @@ The test MUST directly exercise the behavior described in:
 
 "What to test"
 
-The test should fail if the changed production behavior is broken.
+Trace the production control flow before writing the test.
+
+The test must perform the real sequence of operations required to
+reach the target branch or behavior.
+
+Do NOT assert that an internal action/event occurred unless the
+source code shows exactly how that action/event is produced.
+
+The test should fail if the changed production behavior is broken,
+while passing against the current implementation.
 
 ======================================================
 ADDRESSES GAP
@@ -647,6 +744,10 @@ Before returning the JSON, verify:
 [ ] all variables are defined
 [ ] syntax is valid
 [ ] addressesGap exactly matches the supplied label
+[ ] TypeScript types are respected
+[ ] union-type properties are narrowed before access
+[ ] no \`as any\` or unsafe casts are used to bypass type errors
+[ ] generated test should compile successfully
 
 If any requirement cannot be satisfied, skip that gap instead of inventing code.
 `;
