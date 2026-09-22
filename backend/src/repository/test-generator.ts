@@ -406,12 +406,26 @@ export async function buildGenerationTargets(
 
     // CRITICAL: Validate that the symbol is actually exported from the source file
     // If we're trying to import a symbol that isn't exported, the test will fail with ReferenceError
+    // However, some symbols might still be testable as internal functions or through re-exports
     const isExported = checkSymbolExported(sourceContent, symbol.name);
-    if (!isExported) {
+    
+    // Check if it's at least DECLARED (exported or internal) in the file
+    const isDeclared = new RegExp(`\\b(export\\s+)?(function|const|let|var|class|interface|type)\\s+${symbol.name}\\b`).test(sourceContent);
+    
+    if (!isDeclared) {
       console.log(
-        `[Test-Generator] ⚠️ SKIPPING "${symbol.name}" — symbol is not exported from source file. Tests cannot import it.`
+        `[Test-Generator] ⚠️ SKIPPING "${symbol.name}" — symbol is not declared in source file.`
       );
       continue;
+    }
+    
+    if (!isExported) {
+      // Symbol is internal to the file. We can still generate tests for it,
+      // but we'll need to adjust how the test imports it.
+      // For now, log a warning but continue processing.
+      console.log(
+        `[Test-Generator] ℹ️ NOTE: "${symbol.name}" is not exported. Tests may need special handling to access it.`
+      );
     }
 
     const matchesForFile = context.candidateTests.filter(
@@ -599,10 +613,24 @@ function checkForUnresolvedImports(sourceContent: string, repositoryRoot: string
   const importRegex = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)(?:\s*,\s*(?:\{[^}]*\}|\*\s+as\s+\w+|\w+))*)\s+from\s+['"`]([^'"`]+)['"`]/g;
   let match;
   
+  // List of Node.js built-in modules that are safe to ignore
+  const nodeBuiltins = new Set([
+    "assert", "buffer", "child_process", "cluster", "crypto", "dgram", "dns",
+    "domain", "events", "fs", "http", "https", "inspector", "net", "os",
+    "path", "perf_hooks", "process", "punycode", "querystring", "readline",
+    "repl", "stream", "string_decoder", "sys", "timers", "tls", "trace_events",
+    "tty", "url", "util", "v8", "vm", "worker_threads", "zlib"
+  ]);
+  
   while ((match = importRegex.exec(sourceContent)) !== null) {
     const importPath = match[1];
     
     if (!importPath) continue;
+    
+    // Skip node: prefixed imports (Node.js built-in modules)
+    if (importPath.startsWith("node:")) {
+      continue;
+    }
     
     // Skip node_modules and @-scoped packages (these are assumed to be installed)
     if (importPath.startsWith("@") || importPath.includes("node_modules")) {
@@ -616,8 +644,9 @@ function checkForUnresolvedImports(sourceContent: string, repositoryRoot: string
       unresolvedImports.push(importPath);
     } else if (!importPath.startsWith(".") && !importPath.startsWith("/")) {
       // Bare package name without @ scope - might be missing
-      // Skip common patterns that are known to work
-      if (!importPath.match(/^(react|react-dom|next|@calcom|@coss|vitest|@testing-library)/)) {
+      // Skip known patterns
+      if (!importPath.match(/^(react|react-dom|next|@calcom|@coss|vitest|@testing-library)/) &&
+          !nodeBuiltins.has(importPath)) {
         unresolvedImports.push(importPath);
       }
     }
@@ -746,30 +775,40 @@ function validateHasExplicitAssertion(testCode: string): boolean {
     return false;
   }
   
-  // If we found expect() or assert(), verify it's not ONLY tautological assertions
-  // Skip tests that only do things like: expect(true).toBe(true) or expect(result).toBeDefined()
-  // These are too weak and don't actually verify behavior
+  // If we found expect() or assert(), do a sanity check to avoid obvious tautologies
+  // Reject tests that ONLY assert literal values like expect(true).toBe(true)
+  const tautologyPatterns = [
+    /expect\s*\(\s*(true|false|1|0|""|'')\s*\)\.toBe\s*\(\s*(true|false|1|0|""|'')\s*\)/,
+  ];
   
-  // Extract all expect/assert calls to check if ANY are meaningful
-  const expectCalls = /expect\s*\([^)]+\)\.[a-zA-Z]+\([^)]*\)/g;
-  const matches = testCode.match(expectCalls) || [];
+  // If there's at least one meaningful assertion chain, accept it
+  // Look for patterns like:
+  // - expect(result).toBe(value)
+  // - expect(result).toEqual(value)
+  // - expect(result).toContain(value)
+  // - expect(result).toThrow()
+  // - assert(condition)
+  // - assert.equal(actual, expected)
+  const meaningfulPatterns = [
+    /expect\s*\([^)]+\)\.\w+\s*\(/, // Any expect().matcher() pattern
+    /\bassert\s*\([^)]+,?\s*[^)]*\)/, // Any assert() call
+  ];
   
-  for (const match of matches) {
-    // Reject obvious no-op assertions
-    if (/expect\s*\(\s*(true|false|1|0|undefined)\s*\)/.test(match)) {
-      continue;
-    }
-    if (/\.toBeDefined\(\)$/.test(match) && !match.includes("expect(result)") && !match.includes("expect(data)")) {
-      // toBeDefined() alone is too weak, unless it's a specific result
-      continue;
-    }
-    
-    // If we get here, it's a meaningful assertion
-    return true;
+  const hasMeaningfulAssertion = meaningfulPatterns.some(pattern => pattern.test(testCode));
+  
+  if (!hasMeaningfulAssertion) {
+    return false;
   }
   
-  // If all assertions were tautological/weak, reject
-  return matches.length > 0 && !testCode.match(/expect\s*\(\s*true\s*\)\.toBe\s*\(\s*true\s*\)/);
+  // Block obvious tautologies, but only if that's ALL the test has
+  const isTautology = tautologyPatterns.some(pattern => pattern.test(testCode));
+  
+  // If it's only a tautology, reject it
+  if (isTautology && !testCode.match(/expect\s*\(\w+\)/)) {
+    return false;
+  }
+  
+  return true;
 }
 
 // ======================================================

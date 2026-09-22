@@ -160,15 +160,6 @@ export function detectPackageManager(
     const packageManagerValue =
       String(rootPkg.packageManager).trim();
 
-    /*
-     * Examples:
-     *
-     * pnpm@11.3.0
-     * yarn@1.22.22
-     * npm@10.0.0
-     * bun@1.1.0
-     */
-
     const match = packageManagerValue.match(
       /^(pnpm|yarn|npm|bun)(?:@|$)/
     );
@@ -306,7 +297,6 @@ export function resolvePackageContext(
       "package.json"
     );
 
-  // Read package.json
   const pkg =
     readPkgJson(packageDir) || {};
 
@@ -1038,7 +1028,7 @@ function configMatchesTest(
         path.sep
       )
       .join("/");
-  
+
   if (
     relToConfig.startsWith("..")
   ) {
@@ -1294,7 +1284,7 @@ function frameworkFromImports(
       "jest",
       [
         'from "jest"',
-        "from \'jest\'",
+        "from 'jest'",
       ],
     ],
 
@@ -1712,7 +1702,32 @@ export function resolveFramework(
 }
 
 // ======================================================
-// COMMAND BUILDING
+// PATH NORMALIZATION
+// ======================================================
+
+/**
+ * Convert Windows paths to POSIX-style paths before passing
+ * them to Jest/Vitest/Playwright/Mocha.
+ *
+ * Example:
+ *
+ * src\index.test.ts
+ *
+ * becomes:
+ *
+ * src/index.test.ts
+ */
+function normalizeTestPath(
+  testPath: string
+): string {
+
+  return testPath
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "");
+}
+
+// ======================================================
+// COMMAND PREFIX
 // ======================================================
 
 function execPrefix(
@@ -1736,20 +1751,6 @@ function execPrefix(
       };
 
     case "yarn":
-      // On Windows, yarn exec has issues with backslashes in file paths
-      // Use npm run to call the test script from package.json instead
-      if (process.platform === "win32" && (bin === "vitest" || bin === "jest")) {
-        // Check if there's a test script in package.json
-        // If not, fall back to yarn exec
-        return {
-          command: "npm",
-          args: [
-            "run",
-            "test",
-            "--",
-          ],
-        };
-      }
 
       return {
         command: "yarn",
@@ -1803,6 +1804,22 @@ export function buildTestCommand(
     targetFileRelativeToWorkspace ||
     testPathRelativeToWorkspace;
 
+  // IMPORTANT:
+  // Always normalize the test path before putting it
+  // into a command.
+  const normalizedTestPath =
+    normalizeTestPath(
+      testPath
+    );
+
+  console.log(
+    `[test-command] raw test path: ${testPath}`
+  );
+
+  console.log(
+    `[test-command] normalized test path: ${normalizedTestPath}`
+  );
+
   // ----------------------------------------------------
   // No framework
   // ----------------------------------------------------
@@ -1838,7 +1855,7 @@ export function buildTestCommand(
         return buildPackageManagerCommand(
           packageManager,
           firstScript,
-          [testPath]
+          [normalizedTestPath]
         );
       }
     }
@@ -1846,7 +1863,7 @@ export function buildTestCommand(
     return buildPackageManagerCommand(
       packageManager,
       "test",
-      [testPath]
+      [normalizedTestPath]
     );
   }
 
@@ -1885,7 +1902,7 @@ export function buildTestCommand(
         return buildPackageManagerCommand(
           packageManager,
           scriptName,
-          [testPath]
+          [normalizedTestPath]
         );
       }
     }
@@ -1913,7 +1930,7 @@ export function buildTestCommand(
           args: [
             ...base.args,
             "run",
-            testPath,
+            normalizedTestPath,
           ],
         };
       }
@@ -1931,7 +1948,7 @@ export function buildTestCommand(
 
           args: [
             ...base.args,
-            testPath,
+            normalizedTestPath,
           ],
         };
       }
@@ -1950,7 +1967,7 @@ export function buildTestCommand(
           args: [
             ...base.args,
             "test",
-            testPath,
+            normalizedTestPath,
           ],
         };
       }
@@ -1968,7 +1985,7 @@ export function buildTestCommand(
 
           args: [
             ...base.args,
-            testPath,
+            normalizedTestPath,
           ],
         };
       }
@@ -2003,10 +2020,12 @@ export function buildTestCommand(
 
       configArgs = [
         "--config",
-        configRelativeToWorkspace ||
+        normalizeTestPath(
+          configRelativeToWorkspace ||
           path.basename(
             configFile
-          ),
+          )
+        ),
       ];
     }
   }
@@ -2032,7 +2051,7 @@ export function buildTestCommand(
           ...base.args,
           "run",
           ...configArgs,
-          testPath,
+          normalizedTestPath,
         ],
       };
     }
@@ -2051,7 +2070,7 @@ export function buildTestCommand(
         args: [
           ...base.args,
           ...configArgs,
-          testPath,
+          normalizedTestPath,
         ],
       };
     }
@@ -2071,7 +2090,7 @@ export function buildTestCommand(
           ...base.args,
           "test",
           ...configArgs,
-          testPath,
+          normalizedTestPath,
         ],
       };
     }
@@ -2089,11 +2108,17 @@ export function buildTestCommand(
 
         args: [
           ...base.args,
-          testPath,
+          ...configArgs,
+          normalizedTestPath,
         ],
       };
     }
   }
+
+  // Should never happen if framework is a valid TestFramework.
+  throw new Error(
+    `Unsupported test framework: ${framework}`
+  );
 }
 
 // ======================================================
@@ -2109,6 +2134,12 @@ function buildPackageManagerCommand(
   args: string[];
 } {
 
+  const normalizedArgs =
+    extraArgs.map(
+      (arg) =>
+        normalizeTestPath(arg)
+    );
+
   switch (packageManager) {
 
     case "yarn":
@@ -2119,7 +2150,7 @@ function buildPackageManagerCommand(
         args: [
           "run",
           scriptName,
-          ...extraArgs,
+          ...normalizedArgs,
         ],
       };
 
@@ -2131,7 +2162,7 @@ function buildPackageManagerCommand(
         args: [
           "run",
           scriptName,
-          ...extraArgs,
+          ...normalizedArgs,
         ],
       };
 
@@ -2144,7 +2175,7 @@ function buildPackageManagerCommand(
           "run",
           scriptName,
           "--",
-          ...extraArgs,
+          ...normalizedArgs,
         ],
       };
 
@@ -2156,7 +2187,7 @@ function buildPackageManagerCommand(
         args: [
           "run",
           scriptName,
-          ...extraArgs,
+          ...normalizedArgs,
         ],
       };
 
@@ -2169,7 +2200,7 @@ function buildPackageManagerCommand(
           "run",
           scriptName,
           "--",
-          ...extraArgs,
+          ...normalizedArgs,
         ],
       };
   }
