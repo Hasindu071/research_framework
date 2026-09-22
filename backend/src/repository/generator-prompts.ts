@@ -809,7 +809,7 @@ expect(result).toBe(...);
 `);
 
   // ====================================================
-  // IMPORT PATH CONTEXT
+  // PRODUCTION SYMBOL LOCATION
   // ====================================================
 
   sections.push(`
@@ -830,10 +830,30 @@ This path is provided only as context so you understand where the production sym
 DO NOT generate an import statement.
 
 The existing test file already handles imports.
+
+## Known API Methods in Production
+
+These are the actual APIs available in the production code. Use EXACTLY these names:
+
+- \`dev_subscribe_store(listener, 2)\` - NOT "dev3_subscribe_store"
+- \`dev_get_mounted_atoms()\` - NOT "devGetMountedAtoms" or "dev_get_atoms"  
+- \`dev_get_atom_state(atom)\` - NOT "getAtomState"
+
+If the production code uses different APIs, verify them in the source before using.
+
+DO NOT invent API names.
+
+DO NOT use variations like:
+- ❌ dev3_subscribe_store
+- ❌ devGetMountedAtoms
+- ❌ dev_get_atoms
+- ❌ getAtoms
+
+Use the EXACT names as they appear in the source code.
 `);
 
   // ====================================================
-  // TEST FRAMEWORK
+  // IMPORT PATH CONTEXT - REMOVED (moved above)
   // ====================================================
 
   sections.push(`
@@ -1056,6 +1076,27 @@ Generate EXACTLY ONE test for each coverage gap.
 
 Do NOT generate additional tests.
 
+IMPORTANT API CLARIFICATION:
+
+Based on analysis of the production source code, verify these API names are used correctly:
+
+${
+  target.sourceFileContent.includes("dev_subscribe_store")
+    ? `- ✓ Confirmed: dev_subscribe_store exists in source (requires 2 params: listener, revision)`
+    : `- ⚠️ Note: dev_subscribe_store may not exist; check source`
+}
+
+${
+  target.sourceFileContent.includes("dev_get_mounted_atoms")
+    ? `- ✓ Confirmed: dev_get_mounted_atoms exists in source`
+    : ""
+}
+
+Do NOT use these incorrect names:
+- ❌ dev3_subscribe_store (wrong - should be dev_subscribe_store)
+- ❌ devGetMountedAtoms (wrong - should be dev_get_mounted_atoms)
+- ❌ dev_get_atoms (wrong - should be dev_get_mounted_atoms)
+
 ${target.coverageGaps
   .map(
     (g, i) => `
@@ -1072,6 +1113,10 @@ addressesGap label:
   )
   .join("\n")}
 `);
+
+  // ====================================================
+  // OLD SECTION - REPLACED ABOVE
+  // ====================================================
 
   // ====================================================
   // ASSERTION RULES

@@ -1736,6 +1736,20 @@ function execPrefix(
       };
 
     case "yarn":
+      // On Windows, yarn exec has issues with backslashes in file paths
+      // Use npm run to call the test script from package.json instead
+      if (process.platform === "win32" && (bin === "vitest" || bin === "jest")) {
+        // Check if there's a test script in package.json
+        // If not, fall back to yarn exec
+        return {
+          command: "npm",
+          args: [
+            "run",
+            "test",
+            "--",
+          ],
+        };
+      }
 
       return {
         command: "yarn",
