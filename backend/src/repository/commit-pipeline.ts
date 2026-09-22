@@ -7,6 +7,9 @@ import { prioritizeTests } from "./test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./test-generator.js";
 import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./test-runner.js";
 import { convertCommitResultToDatasetRow } from "./dataset-generator.js";
+import { revertMerge, type MergeResult } from "./test-file-writer.js";
+import fs from "fs";
+import path from "path";
 
 // ======================================================
 // TYPES
@@ -194,6 +197,98 @@ function generateRichGeneratedTestMetadata(
 }
 
 /**
+ * Revert all uncommitted changes to test files by using git.
+ * This ensures that any test merges from the generation/execution phase
+ * are cleaned up before returning to the original commit.
+ */
+async function revertGeneratedTestChanges(git: any, repositoryPath: string): Promise<void> {
+  try {
+    // Get list of uncommitted changes
+    const status = await git.status();
+    
+    if (status.modified.length === 0 && status.created.length === 0) {
+      console.log(`[Pipeline] No uncommitted test changes to revert`);
+      return;
+    }
+
+    // Identify test files (assuming they're in __tests__, .test.ts, .spec.ts patterns)
+    const testFilePattern = /\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$|__tests__|\.e2e\.|\.integration-test\./i;
+    const changedTestFiles = [
+      ...status.modified,
+      ...status.created,
+    ].filter((file: string) => testFilePattern.test(file));
+
+    if (changedTestFiles.length === 0) {
+      console.log(`[Pipeline] No uncommitted test file changes to revert`);
+      return;
+    }
+
+    console.log(`[Pipeline] Reverting ${changedTestFiles.length} test file change(s)...`);
+    
+    // Revert modified test files
+    const modifiedTestFiles = status.modified.filter((file: string) => testFilePattern.test(file));
+    if (modifiedTestFiles.length > 0) {
+      await git.checkout(modifiedTestFiles);
+      console.log(`[Pipeline] ✓ Reverted ${modifiedTestFiles.length} modified test file(s)`);
+    }
+
+    // Remove newly created test files
+    const createdTestFiles = status.created.filter((file: string) => testFilePattern.test(file));
+    if (createdTestFiles.length > 0) {
+      for (const file of createdTestFiles) {
+        const filePath = path.resolve(repositoryPath, file);
+        try {
+          fs.unlinkSync(filePath);
+        } catch (err) {
+          console.warn(
+            `[Pipeline] ⚠️ Failed to delete created test file ${file}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+      console.log(`[Pipeline] ✓ Removed ${createdTestFiles.length} newly created test file(s)`);
+    }
+
+    console.log(`[Pipeline] ✓ Reverted all generated test changes`);
+  } catch (error) {
+    console.warn(
+      `[Pipeline] ⚠️ Failed to revert test changes via git: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    // Don't throw — continue with checkout attempt, but log the warning
+  }
+}
+
+/**
+ * Revert all accumulated test merges from the pipeline.
+ * This is called before checking out the original commit to ensure
+ * all generated test modifications are cleaned up.
+ */
+function revertAccumulatedMerges(merges: MergeResult[]): void {
+  if (merges.length === 0) {
+    return;
+  }
+
+  console.log(`[Pipeline] Reverting ${merges.length} accumulated test merge(s)...`);
+  
+  for (const merge of merges) {
+    try {
+      revertMerge(merge);
+    } catch (error) {
+      console.warn(
+        `[Pipeline] ⚠️ Failed to revert merge for ${merge.testFileAbsolute}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+  
+  console.log(`[Pipeline] ✓ Reverted all test merges`);
+}
+
+/**
  * Full analysis pipeline for a specific commit.
  * Wraps the entire workflow: analyze → prioritize → generate → execute
  * with proper checkout/restore of the repository state.
@@ -206,6 +301,7 @@ export async function analyzeAndTestCommit(
   testCommand?: string
 ): Promise<any> {
   const git = simpleGit(repositoryPath);
+  const accumulatedMerges: MergeResult[] = []; // Track all test merges for cleanup
 
   console.log("======================================");
   console.log("Full commit pipeline started");
@@ -591,10 +687,15 @@ export async function analyzeAndTestCommit(
     return finalResponse;
   } finally {
     // ==================================================
-    // ALWAYS restore original HEAD state
+    // CLEANUP: Revert all generated test changes
     // ==================================================
 
     if (originalCommit) {
+      console.log(`[Pipeline] Step 7/7: Cleaning up generated test modifications...`);
+      await revertGeneratedTestChanges(git, repositoryPath);
+      
+      // ALWAYS restore original HEAD state
+      // ==================================================
       console.log(`[Pipeline] Restoring repository to original commit: ${originalCommit}...`);
       try {
         await git.checkout(originalCommit);
