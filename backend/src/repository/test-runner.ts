@@ -1392,7 +1392,7 @@ function injectAutoMockForUnresolvedImport(
 // SPAWN TEST PROCESS
 // ======================================================
 
-async function spawnTestProcess(
+export async function spawnTestProcess(
   command: string,
   args: string[],
   cwd: string,

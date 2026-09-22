@@ -5,7 +5,7 @@ import { analyzeDependencyChanges } from "./dependencyAnalyzer.js";
 import { createLLMClient } from "./llm-client.js";
 import { prioritizeTests } from "./test-prioritizer.js";
 import { buildGenerationTargets, generateTests } from "./test-generator.js";
-import { runPrioritizedTests, enrichTestInputsWithContext, type GeneratedTestInput } from "./test-runner.js";
+import { runPrioritizedTests, enrichTestInputsWithContext, spawnTestProcess, type GeneratedTestInput } from "./test-runner.js";
 import { convertCommitResultToDatasetRow } from "./dataset-generator.js";
 import { revertMerge, type MergeResult } from "./test-file-writer.js";
 import { validateTsConfig, formatValidationResult, suggestFixes } from "./ts-config-validator.js";
@@ -299,7 +299,8 @@ function revertAccumulatedMerges(merges: MergeResult[]): void {
 export async function analyzeAndTestCommit(
   repositoryPath: string,
   commitHash: string,
-  testCommand?: string
+  testCommand?: string,
+  buildCommand?: string
 ): Promise<any> {
   const git = simpleGit(repositoryPath);
   const accumulatedMerges: MergeResult[] = []; // Track all test merges for cleanup
@@ -373,7 +374,7 @@ export async function analyzeAndTestCommit(
     // 3. Analyze the commit
     // ==================================================
 
-    console.log("[Pipeline] Step 1/6: Analyzing commit...");
+    console.log("[Pipeline] Step 1/7: Analyzing commit...");
     const baselineStartTime = Date.now();
     const analysis = await analyzeCommit(repositoryPath, commitHash);
     const baselineTime = (Date.now() - baselineStartTime) / 1000;
@@ -390,7 +391,7 @@ export async function analyzeAndTestCommit(
     // 4. Build LLM context and prioritize tests
     // ==================================================
 
-    console.log("[Pipeline] Step 2/6: Building LLM context and prioritizing tests...");
+    console.log("[Pipeline] Step 2/7: Building LLM context and prioritizing tests...");
     const llmContext = buildLLMContext(analysis, repositoryPath);
     const llmClient = createLLMClient();
 
@@ -412,7 +413,7 @@ export async function analyzeAndTestCommit(
     // 5. Build generation targets and analyze gaps
     // ==================================================
 
-    console.log("[Pipeline] Step 3/6: Analyzing coverage gaps...");
+    console.log("[Pipeline] Step 3/7: Analyzing coverage gaps...");
     
     // DEBUG: Log generation target context before gap analysis
     console.log("========== GAP ANALYSIS DEBUG START ==========");
@@ -450,7 +451,7 @@ export async function analyzeAndTestCommit(
     // 6. Generate tests
     // ==================================================
 
-    console.log("[Pipeline] Step 4/6: Generating tests...");
+    console.log("[Pipeline] Step 4/7: Generating tests...");
     let generationResult: any = { results: [] };
     const generationStartTime = Date.now();
 
@@ -473,10 +474,48 @@ export async function analyzeAndTestCommit(
     }
 
     // ==================================================
-    // 7. Run prioritized existing tests
+    // 7. Build repository (if buildCommand provided)
     // ==================================================
 
-    console.log("[Pipeline] Step 5/6: Running prioritized existing tests...");
+    let buildResult: any = null;
+    let buildStatus: "success" | "partial_failure" | null = null;
+
+    if (buildCommand) {
+      console.log(`[Pipeline] Step 5/7: Building repository: ${buildCommand}`);
+      
+      // Parse the build command into executable and args
+      const buildParts = buildCommand!.trim().split(/\s+/);
+      const buildExecutable = buildParts[0]!;
+      const buildArgs = buildParts.slice(1);
+
+      buildResult = await spawnTestProcess(
+        buildExecutable,
+        buildArgs,
+        repositoryPath,
+        600000 // 10 minute timeout for build
+      );
+
+      if (buildResult.exitCode === 0) {
+        console.log("[Pipeline] ✓ Build completed successfully");
+        buildStatus = "success";
+      } else {
+        console.warn(
+          `[Pipeline] ⚠ Build exited with code ${buildResult.exitCode}`
+        );
+        console.warn(
+          "[Pipeline] Continuing to test execution because the build may have produced usable artifacts."
+        );
+        buildStatus = "partial_failure";
+      }
+    } else {
+      console.log("[Pipeline] Step 5/7: No build command provided, skipping build step");
+    }
+
+    // ==================================================
+    // 8. Run prioritized existing tests
+    // ==================================================
+
+    console.log("[Pipeline] Step 6/7: Running prioritized existing tests...");
     const prioritizedTestInputs = prioritizationResult.tests.map((test: any) => ({
       testFile: test.testFile,
       priority: test.priority,
@@ -515,10 +554,10 @@ export async function analyzeAndTestCommit(
     }
 
     // ==================================================
-    // 8. Run generated tests
+    // 9. Run generated tests
     // ==================================================
 
-    console.log("[Pipeline] Step 6/6: Running generated tests...");
+    console.log("[Pipeline] Step 7/7: Running generated tests...");
     const generatedTestInputs: GeneratedTestInput[] = [];
 
     for (const result of generationResult.results as any[]) {
@@ -635,6 +674,16 @@ export async function analyzeAndTestCommit(
               : 0,
         },
       },
+      // Build status and details
+      build: buildResult
+        ? {
+            buildStatus,
+            buildExitCode: buildResult.exitCode,
+            buildDuration: buildResult.duration,
+            buildStdout: buildResult.stdout ? buildResult.stdout.slice(0, 2000) : "",
+            buildStderr: buildResult.stderr ? buildResult.stderr.slice(0, 2000) : "",
+          }
+        : null,
       existingTestExecution: {
         results: prioritizedExecution.testExecution.map((r: any) => ({
           testFile: r.testFile,
@@ -718,7 +767,7 @@ export async function analyzeAndTestCommit(
     // ==================================================
 
     if (originalCommit) {
-      console.log(`[Pipeline] Step 7/7: Cleaning up generated test modifications...`);
+      console.log(`[Pipeline] Step 8/8: Cleaning up generated test modifications...`);
       await revertGeneratedTestChanges(git, repositoryPath);
       
       // ALWAYS restore original HEAD state

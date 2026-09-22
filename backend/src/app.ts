@@ -161,7 +161,7 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
   try {
     await initializeMongoDB();
 
-    const { repositoryPath, commitHash, repoName, testCommand } = req.body;
+    const { repositoryPath, commitHash, repoName, testCommand, buildCommand } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
@@ -184,10 +184,13 @@ app.post("/api/analyze-prioritize-generate", async (req, res) => {
     console.log("======================================");
     console.log(`Starting analysis for commit: ${commitHash}`);
     console.log(`Test command: ${testCommand}`);
+    if (buildCommand) {
+      console.log(`Build command: ${buildCommand}`);
+    }
     console.log("======================================");
 
-    // Use the pipeline as the single source of truth, pass testCommand
-    const finalResponse = await analyzeAndTestCommit(repositoryPath, commitHash, testCommand);
+    // Use the pipeline as the single source of truth, pass testCommand and buildCommand
+    const finalResponse = await analyzeAndTestCommit(repositoryPath, commitHash, testCommand, buildCommand);
 
     // Save everything to MongoDB (including enriched generated test metadata)
     console.log(`[MongoDB] Saving analysis result to collection '${repoName}'...`);
@@ -476,7 +479,7 @@ app.post("/api/analyze-and-run", async (req, res) => {
   try {
     await initializeMongoDB();
 
-    const { repositoryPath, commitHash, repoName, testCommand } = req.body;
+    const { repositoryPath, commitHash, repoName, testCommand, buildCommand } = req.body;
 
     if (!repositoryPath || !commitHash) {
       return res.status(400).json({
